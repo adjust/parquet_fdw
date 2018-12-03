@@ -24,6 +24,7 @@ extern "C"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/var.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 }
 
 /*
@@ -32,6 +33,7 @@ extern "C"
 struct ParquetFdwPlanState
 {
     char       *filename;
+    Bitmapset  *attrs_sorted;
     Bitmapset  *attrs_used; /* attributes actually used in query */
 };
 
@@ -122,6 +124,24 @@ release_parquet_state(void *handler)
  * C interface functions
  */
 
+static Bitmapset *
+parse_attributes_list(char *start, Oid relid)
+{
+    Bitmapset *attrs = NULL;
+    char      *token;
+    const char *delim = std::string(" ").c_str(); /* to satisfy g++ compiler */
+    AttrNumber attnum;
+
+    while ((token = strtok(start, delim)) != NULL)
+    {
+        attnum = get_attnum(relid, token);
+        attrs = bms_add_member(attrs, attnum);
+        start = NULL;
+    }
+
+    return attrs;
+}
+
 static void
 get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
 {
@@ -136,6 +156,11 @@ get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
 
         if (strcmp(def->defname, "filename") == 0)
             fdw_private->filename = defGetString(def);
+        else if (strcmp(def->defname, "sorted") == 0)
+        {
+            fdw_private->attrs_sorted =
+                parse_attributes_list(defGetString(def), relid);
+        }
         else
             elog(ERROR, "unknown option '%s'", def->defname);
     }
@@ -191,6 +216,8 @@ parquetGetForeignPaths(PlannerInfo *root,
 	ParquetFdwPlanState *fdw_private;
 	Cost		startup_cost;
 	Cost		total_cost;
+    List       *pathkeys = NIL;
+    ListCell   *lc;
 
 	/* Estimate costs */
 	estimate_costs(root, baserel, &startup_cost, &total_cost);
@@ -200,6 +227,40 @@ parquetGetForeignPaths(PlannerInfo *root,
      */
     fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
     extract_used_attributes(baserel, &fdw_private->attrs_used);
+
+    /* Figure out if pathkeys match parquet ordering */
+    foreach(lc, root->query_pathkeys)
+    {
+        PathKey *pathkey = (PathKey *) lfirst(lc);
+        EquivalenceClass *eclass = pathkey->pk_eclass;
+        ListCell *lc2;
+
+        /* Only ascending ordering is currently supported */
+        if (pathkey->pk_strategy != BTLessStrategyNumber)
+            continue;
+
+        /* Is our relation listed in pathkey relids? */
+        if (!bms_is_member(baserel->relid, eclass->ec_relids))
+            continue;
+
+        /* Looking for matching equivalence member */
+        foreach(lc2, eclass->ec_members)
+        {
+            EquivalenceMember *eq_member = (EquivalenceMember *) lfirst(lc2);
+            Var *var;
+
+            /* Only consider trivial expressions consisting of a single Var */
+            if (!IsA(eq_member->em_expr, Var))
+                continue;
+
+            var = (Var *) eq_member->em_expr;
+            if (var->varno == baserel->relid
+                    && bms_is_member(var->varattno, fdw_private->attrs_sorted))
+            {
+                pathkeys = lappend(pathkeys, pathkey);
+            }
+        }
+    }
 
 	/*
 	 * Create a ForeignPath node and add it as only possible path.  We use the
@@ -212,7 +273,7 @@ parquetGetForeignPaths(PlannerInfo *root,
 									 baserel->rows,
 									 startup_cost,
 									 total_cost,
-									 NIL,	/* TODO: add pathkeys */
+									 pathkeys,	/* TODO: add pathkeys */
 									 NULL,	/* no outer rel either */
 									 NULL,	/* no extra plan */
 									 (List *) fdw_private));
