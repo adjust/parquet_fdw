@@ -6,6 +6,11 @@ RETURNS fdw_handler
 AS 'MODULE_PATHNAME'
 LANGUAGE C STRICT;
 
-CREATE FOREIGN DATA WRAPPER parquet_fdw
-  HANDLER parquet_fdw_handler;
+CREATE FUNCTION parquet_fdw_validator(text[], oid)
+RETURNS void
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT;
 
+CREATE FOREIGN DATA WRAPPER parquet_fdw
+  HANDLER parquet_fdw_handler
+  VALIDATOR parquet_fdw_validator;

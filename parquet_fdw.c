@@ -1,34 +1,15 @@
 #include "postgres.h"
 #include "fmgr.h"
 
-#include "access/htup_details.h"
 #include "access/reloptions.h"
-#include "access/sysattr.h"
 #include "catalog/pg_foreign_table.h"
-#include "commands/copy.h"
-#include "commands/defrem.h"
-#include "commands/explain.h"
-#include "commands/vacuum.h"
 #include "foreign/fdwapi.h"
-#include "foreign/foreign.h"
-#include "miscadmin.h"
-#include "nodes/makefuncs.h"
-#include "optimizer/cost.h"
-#include "optimizer/pathnode.h"
 #include "optimizer/planmain.h"
-#include "optimizer/restrictinfo.h"
-#include "optimizer/var.h"
-#include "utils/memutils.h"
-#include "utils/rel.h"
-#include "utils/sampling.h"
+#include "utils/elog.h"
 
-//#include "parquet_common.h"
 
 PG_MODULE_MAGIC;
 
-
-//void *create_parquet_state(ForeignScanState *scanstate, const char *filename);
-//void release_parquet_state(void *handler);
 
 /* FDW routines */
 extern void parquetGetForeignRelSize(PlannerInfo *root,
@@ -49,11 +30,6 @@ extern void parquetBeginForeignScan(ForeignScanState *node, int eflags);
 extern void parquetEndForeignScan(ForeignScanState *node);
 extern void parquetReScanForeignScan(ForeignScanState *node);
 
-//static void parquetBeginForeignScan(ForeignScanState *node, int eflags);
-//static TupleTableSlot *parquetIterateForeignScan(ForeignScanState *node);
-//static void parquetEndForeignScan(ForeignScanState *node);
-
-
 PG_FUNCTION_INFO_V1(parquet_fdw_handler);
 Datum
 parquet_fdw_handler(PG_FUNCTION_ARGS)
@@ -63,14 +39,39 @@ parquet_fdw_handler(PG_FUNCTION_ARGS)
 	fdwroutine->GetForeignRelSize = parquetGetForeignRelSize;
 	fdwroutine->GetForeignPaths = parquetGetForeignPaths;
 	fdwroutine->GetForeignPlan = parquetGetForeignPlan;
-	//fdwroutine->ExplainForeignScan = parquetExplainForeignScan;
 	fdwroutine->BeginForeignScan = parquetBeginForeignScan;
 	fdwroutine->IterateForeignScan = parquetIterateForeignScan;
 	fdwroutine->ReScanForeignScan = parquetReScanForeignScan;
 	fdwroutine->EndForeignScan = parquetEndForeignScan;
-	//fdwroutine->AnalyzeForeignTable = parquetAnalyzeForeignTable;
-	//fdwroutine->IsForeignScanParallelSafe = parquetIsForeignScanParallelSafe;
 
 	PG_RETURN_POINTER(fdwroutine);
+}
+
+PG_FUNCTION_INFO_V1(parquet_fdw_validator);
+Datum
+parquet_fdw_validator(PG_FUNCTION_ARGS)
+{
+    List       *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
+    Oid         catalog = PG_GETARG_OID(1);
+    ListCell   *lc;
+
+    /* Only check table options */
+    if (catalog != ForeignTableRelationId)
+        PG_RETURN_VOID();
+
+    foreach(lc, options_list)
+    {
+        DefElem    *def = (DefElem *) lfirst(lc);
+
+        if (strcmp(def->defname, "filename") != 0
+            && strcmp(def->defname, "sorted") != 0)
+        {
+            ereport(ERROR,
+                    (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                     errmsg("invalid option \"%s\"", def->defname)));
+        }
+    }
+
+    PG_RETURN_VOID();
 }
 
