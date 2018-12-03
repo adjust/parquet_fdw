@@ -1,6 +1,6 @@
 # parquet_fdw
 
-Parquet Foreign Data Wrapper for PostgreSQL.
+Parquet foreign data wrapper for PostgreSQL.
 
 ## Installation
 
@@ -25,9 +25,11 @@ create server parquet_srv foreign data wrapper parquet_fdw;
 create user user mapping postgres server parquet_srv options (user 'postgres');
 ```
 Now you should be able to create foreign table from Parquet files. Currently `parquet_fdw` supports the following column [types](https://github.com/apache/arrow/blob/master/cpp/src/arrow/type.h) (to be extended shortly):
-* INT32
-* INT64
-* STRING
+| Parquet type | SQL type |
+|--------------|----------|
+|        INT32 |     INT4 |
+|        INT64 |     INT8 |
+|       STRING |     TEXT |
 
 Following options are supported:
 * **filename** - path to Parquet file to read;
