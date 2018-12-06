@@ -339,8 +339,12 @@ populate_slot(ParquetFdwExecutionState *festate, TupleTableSlot *slot)
          * */
         if (festate->map[i] >= 0)
         {
-            std::shared_ptr<arrow::Column> column = festate->table->column(festate->map[i]);
-            std::shared_ptr<arrow::Array> array = column->data()->chunk(0); /* TODO multiple chunks */
+            auto column = festate->table->column(festate->map[i]);
+            /*
+             * Each row group contains only one chunk so no reason to iterate 
+             * over chunks
+             */
+            auto array = column->data()->chunk(0);
             int type_id = column->type()->id();
 
             if (array->IsNull(festate->row))
@@ -421,7 +425,6 @@ populate_slot(ParquetFdwExecutionState *festate, TupleTableSlot *slot)
             slot->tts_isnull[i] = true;
         }
     }
-
 }
 
 extern "C" TupleTableSlot *
@@ -460,5 +463,10 @@ parquetEndForeignScan(ForeignScanState *node)
 extern "C" void
 parquetReScanForeignScan(ForeignScanState *node)
 {
+    ParquetFdwExecutionState   *festate = (ParquetFdwExecutionState *) node->fdw_state;
+
+    festate->row = 0;
+    festate->row_num = 0;
+    festate
 }
 
