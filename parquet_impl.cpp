@@ -18,11 +18,14 @@ extern "C"
 #include "executor/tuptable.h"
 #include "foreign/foreign.h"
 #include "nodes/execnodes.h"
+#include "nodes/makefuncs.h"
 #include "nodes/relation.h"
 #include "optimizer/pathnode.h"
+#include "optimizer/paths.h"
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/var.h"
+#include "parser/parse_oper.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/lsyscache.h"
@@ -230,39 +233,31 @@ parquetGetForeignPaths(PlannerInfo *root,
     fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
     extract_used_attributes(baserel, &fdw_private->attrs_used);
 
-    /* TODO: build our own pathkeys instead of copying from query */
-    /* Figure out if pathkeys match parquet ordering */
-    foreach(lc, root->query_pathkeys)
+    /* Build pathkeys based on attrs_sorted */
+    int attnum = -1;
+    while ((attnum = bms_next_member(fdw_private->attrs_sorted, attnum)) >= 0)
     {
-        PathKey *pathkey = (PathKey *) lfirst(lc);
-        EquivalenceClass *eclass = pathkey->pk_eclass;
-        ListCell *lc2;
+        Oid         relid = root->simple_rte_array[baserel->relid]->relid;
+        Oid         typid,
+                    collid;
+        int32       typmod;
+        Oid         sort_op;
+        Var        *var;
+        List       *attr_pathkey;
 
-        /* Only ascending ordering is currently supported */
-        if (pathkey->pk_strategy != BTLessStrategyNumber)
-            continue;
+        /* Build an expression (simple var) */
+        get_atttypetypmodcoll(relid, attnum, &typid, &typmod, &collid);
+        var = makeVar(baserel->relid, attnum, typid, typmod, collid, 0);
 
-        /* Is our relation listed in pathkey relids? */
-        if (!bms_is_member(baserel->relid, eclass->ec_relids))
-            continue;
+        /* Lookup sorting operator for the attribute type */
+        get_sort_group_operators(typid,
+                                 true, false, false,
+                                 &sort_op, NULL, NULL,
+                                 NULL);
 
-        /* Looking for matching equivalence member */
-        foreach(lc2, eclass->ec_members)
-        {
-            EquivalenceMember *eq_member = (EquivalenceMember *) lfirst(lc2);
-            Var *var;
-
-            /* Only consider trivial expressions consisting of a single Var */
-            if (!IsA(eq_member->em_expr, Var))
-                continue;
-
-            var = (Var *) eq_member->em_expr;
-            if (var->varno == baserel->relid
-                    && bms_is_member(var->varattno, fdw_private->attrs_sorted))
-            {
-                pathkeys = lappend(pathkeys, pathkey);
-            }
-        }
+        attr_pathkey = build_expression_pathkey(root, (Expr *) var, NULL, sort_op,
+                                           baserel->relids, true);
+        pathkeys = list_concat(pathkeys, attr_pathkey);
     }
 
 	/*
@@ -276,7 +271,7 @@ parquetGetForeignPaths(PlannerInfo *root,
 									 baserel->rows,
 									 startup_cost,
 									 total_cost,
-									 pathkeys,	/* TODO: add pathkeys */
+									 pathkeys,
 									 NULL,	/* no outer rel either */
 									 NULL,	/* no extra plan */
 									 (List *) fdw_private));
@@ -465,8 +460,8 @@ parquetReScanForeignScan(ForeignScanState *node)
 {
     ParquetFdwExecutionState   *festate = (ParquetFdwExecutionState *) node->fdw_state;
 
+    festate->row_group = 0;
     festate->row = 0;
     festate->row_num = 0;
-    festate
 }
 
