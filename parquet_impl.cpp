@@ -14,6 +14,7 @@ extern "C"
 #include "postgres.h"
 
 #include "access/sysattr.h"
+#include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "executor/tuptable.h"
 #include "foreign/foreign.h"
@@ -25,6 +26,7 @@ extern "C"
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/var.h"
+#include "parser/parse_coerce.h"
 #include "parser/parse_oper.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
@@ -53,19 +55,24 @@ public:
     /* Mapping between slot attributes and parquet columns */
     std::vector<int> map;
 
+    std::vector<FmgrInfo *> castfuncs;
+
     /* Current row group */
     std::shared_ptr<arrow::Table> table;
+
+    bool     initialized;
 
     uint32_t row_group;  /* current row group index */
     uint32_t row;        /* current row within row group */
     uint32_t row_num;    /* total rows in row group */
 
     ParquetFdwExecutionState(const char *filename)
-        : row_group(0), row(0), row_num(0)
+        : row_group(0), row(0), row_num(0), initialized(false)
     {
-        /* TODO: add exception handling */
-        reader.reset(new parquet::arrow::FileReader(arrow::default_memory_pool(),
-                                                    parquet::ParquetFileReader::OpenFile(filename)));
+        reader.reset(
+                new parquet::arrow::FileReader(
+                        arrow::default_memory_pool(),
+                        parquet::ParquetFileReader::OpenFile(filename)));
     }
 };
 
@@ -73,18 +80,9 @@ static void *
 create_parquet_state(ForeignScanState *scanstate,
                      ParquetFdwPlanState *fdw_private)
 {
-    /* TODO: try/catch */
     ParquetFdwExecutionState *festate;
 
-    try
-    {
-        festate = new ParquetFdwExecutionState(fdw_private->filename);
-    }
-    catch(const std::exception& e)
-    {
-        elog(ERROR, "Parquet initialization failed: %s", e.what());
-    }
-
+    festate = new ParquetFdwExecutionState(fdw_private->filename);
     scanstate->fdw_state = festate;
     auto schema = festate->reader->parquet_reader()->metadata()->schema();
  
@@ -116,13 +114,6 @@ create_parquet_state(ForeignScanState *scanstate,
     }
 
     return festate;
-}
-
-static void
-release_parquet_state(void *handler)
-{
-    if (handler)
-        delete (ParquetFdwExecutionState *) handler;
 }
 
 /*
@@ -312,11 +303,99 @@ extern "C" void
 parquetBeginForeignScan(ForeignScanState *node, int eflags)
 {
 	ForeignScan *plan = (ForeignScan *) node->ss.ps.plan;
-
-    node->fdw_state = create_parquet_state(node,
-                                           (ParquetFdwPlanState *) plan->fdw_private);
+    
+    try
+    {
+        node->fdw_state = create_parquet_state(node,
+                (ParquetFdwPlanState *) plan->fdw_private);
+    }
+    catch(const std::exception& e)
+    {
+        elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
+    }
 }
 
+/*
+ * initialize_castfuncs
+ *      Check wether implicit cast will be required and prepare cast function
+ *      call.
+ */
+static void
+initialize_castfuncs(ForeignScanState *node)
+{
+    ParquetFdwExecutionState *festate = (ParquetFdwExecutionState *) node->fdw_state;
+	TupleTableSlot     *slot = node->ss.ss_ScanTupleSlot;
+
+    festate->castfuncs.resize(festate->map.size());
+
+    for (int i = 0; i < festate->map.size(); ++i)
+    {
+        if (festate->map[i] < 0)
+        {
+            /* Null column */
+            festate->castfuncs[i] = NULL;
+            continue;
+        }
+
+        auto    column = festate->table->column(festate->map[i]);
+        int     type_id = column->type()->id();
+        int     src_type,
+                dst_type;
+        Oid     funcid;
+        TupleDesc tupleDesc = slot->tts_tupleDescriptor;
+        CoercionPathType ct;
+
+        dst_type = TupleDescAttr(tupleDesc, i)->atttypid;
+
+        switch (type_id)
+        {
+            case arrow::Type::INT32:
+                src_type = INT4OID;
+                break;
+            case arrow::Type::INT64:
+                src_type = INT8OID;
+                break;
+            case arrow::Type::STRING:
+                src_type = TEXTOID;
+                break;
+            case arrow::Type::BINARY:
+                src_type = BYTEAOID;
+                break;
+            case arrow::Type::TIMESTAMP:
+                src_type = TIMESTAMPTZOID;
+                break;
+            default:
+                elog(ERROR,
+                     "parquet_fdw: unsupported column type: %d",
+                     type_id);
+        }
+
+        if (IsBinaryCoercible(src_type, dst_type))
+        {
+            festate->castfuncs[i] = NULL;
+            continue;
+        }
+
+        ct = find_coercion_pathway(dst_type,
+                                   src_type,
+                                   COERCION_EXPLICIT,
+                                   &funcid);
+        switch (ct)
+        {
+            case COERCION_PATH_FUNC:
+                festate->castfuncs[i] = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
+                fmgr_info(funcid, festate->castfuncs[i]);
+                break;
+            case COERCION_PATH_RELABELTYPE:
+                /* Cast is not needed */
+                festate->castfuncs[i] = NULL;
+                break;
+            default:
+                elog(ERROR, "parquet_fdw: cast function is not found");
+        }
+    }
+    festate->initialized = true;
+}
 
 /*
  * populate_slot
@@ -340,7 +419,7 @@ populate_slot(ParquetFdwExecutionState *festate, TupleTableSlot *slot)
              * over chunks
              */
             auto array = column->data()->chunk(0);
-            int type_id = column->type()->id();
+            int  type_id = column->type()->id();
 
             if (array->IsNull(festate->row))
             {
@@ -354,39 +433,36 @@ populate_slot(ParquetFdwExecutionState *festate, TupleTableSlot *slot)
                 case arrow::Type::INT32:
                 {
                     arrow::Int32Array* intarray = (arrow::Int32Array *) array.get();
-
                     int value = intarray->Value(festate->row);
+
                     slot->tts_values[i] = Int32GetDatum(value);
                     break;
                 }
                 case arrow::Type::INT64:
                 {
                     arrow::Int64Array* intarray = (arrow::Int64Array *) array.get();
-
                     int64 value = intarray->Value(festate->row);
+
                     slot->tts_values[i] = Int64GetDatum(value);
                     break;
                 }
                 case arrow::Type::STRING:
                 {
                     arrow::StringArray* stringarray = (arrow::StringArray *) array.get();
-
                     std::string value = stringarray->GetString(festate->row);
-                    /* TODO: convert to postgres column type (TEXT, CSTRING, etc.) */
+
                     slot->tts_values[i] = CStringGetTextDatum(value.c_str());
                     break;
                 }
                 case arrow::Type::BINARY:
                 {
                     arrow::BinaryArray* binarray = (arrow::BinaryArray *) array.get();
-                    bytea *result;
-
                     std::string value = binarray->GetString(festate->row);
 
                     /* Build bytea */
-                    result = cstring_to_text_with_len(value.data(), value.size());
+                    bytea *b = cstring_to_text_with_len(value.data(), value.size());
 
-                    slot->tts_values[i] = PointerGetDatum(result);
+                    slot->tts_values[i] = PointerGetDatum(b);
                     break;
                 }
                 case arrow::Type::TIMESTAMP:
@@ -402,8 +478,8 @@ populate_slot(ParquetFdwExecutionState *festate, TupleTableSlot *slot)
                 case arrow::Type::DATE32:
                 {
                     arrow::Date32Array* tsarray = (arrow::Date32Array *) array.get();
-
                     int32 d = tsarray->Value(festate->row);
+
                     slot->tts_values[i] = DateADTGetDatum(d);
                     break;
                 }
@@ -412,6 +488,13 @@ populate_slot(ParquetFdwExecutionState *festate, TupleTableSlot *slot)
                     elog(ERROR,
                          "parquet_fdw: unsupported column type: %d",
                          column->type()->id());
+            }
+
+            /* Call cast function if needed */
+            if (festate->castfuncs[i] != NULL)
+            {
+                slot->tts_values[i] = FunctionCall1(festate->castfuncs[i],
+                                                    slot->tts_values[i]);
             }
             slot->tts_isnull[i] = false;
         }
@@ -436,10 +519,23 @@ parquetIterateForeignScan(ForeignScanState *node)
         if (festate->row_group >= festate->reader->num_row_groups())
             return slot;
 
-        festate->reader->RowGroup(festate->row_group)->ReadTable(festate->indices, &festate->table);
-        festate->row = 0;
-        festate->row_num = festate->table->num_rows();
-        festate->row_group++;
+        try
+        {
+            festate->reader->RowGroup(festate->row_group)->ReadTable(festate->indices, &festate->table);
+            festate->row = 0;
+            festate->row_num = festate->table->num_rows();
+            festate->row_group++;
+        }
+        catch(const std::exception& e)
+        {
+            elog(ERROR,
+                 "parquet_fdw: failed to read row group %d: %s",
+                 festate->row_group, e.what());
+        }
+
+        /* Lookup cast funcs */
+        if (!festate->initialized)
+            initialize_castfuncs(node);
     }
 
     populate_slot(festate, slot);
@@ -452,7 +548,7 @@ parquetIterateForeignScan(ForeignScanState *node)
 extern "C" void
 parquetEndForeignScan(ForeignScanState *node)
 {
-    release_parquet_state(node->fdw_state);
+    delete (ParquetFdwExecutionState *) node->fdw_state;
 }
 
 extern "C" void
