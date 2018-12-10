@@ -387,6 +387,8 @@ initialize_castfuncs(ForeignScanState *node)
                 fmgr_info(funcid, festate->castfuncs[i]);
                 break;
             case COERCION_PATH_RELABELTYPE:
+            case COERCION_PATH_COERCEVIAIO:  /* TODO: double check that we
+                                              * shouldn't do anything here*/
                 /* Cast is not needed */
                 festate->castfuncs[i] = NULL;
                 break;
