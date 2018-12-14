@@ -31,6 +31,7 @@ extern "C"
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/timestamp.h"
 }
 
@@ -315,6 +316,28 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
     }
 }
 
+static Oid
+to_postgres_type(int arrow_type)
+{
+    switch (arrow_type)
+    {
+        case arrow::Type::INT32:
+            return INT4OID;
+        case arrow::Type::INT64:
+            return INT8OID;
+        case arrow::Type::STRING:
+            return TEXTOID;
+        case arrow::Type::BINARY:
+            return BYTEAOID;
+        case arrow::Type::TIMESTAMP:
+            return TIMESTAMPTZOID;
+        default:
+            elog(ERROR,
+                 "parquet_fdw: unsupported column type: %d",
+                 arrow_type);
+    }
+}
+
 /*
  * initialize_castfuncs
  *      Check wether implicit cast will be required and prepare cast function
@@ -345,30 +368,8 @@ initialize_castfuncs(ForeignScanState *node)
         TupleDesc tupleDesc = slot->tts_tupleDescriptor;
         CoercionPathType ct;
 
+        src_type = to_postgres_type(type_id);
         dst_type = TupleDescAttr(tupleDesc, i)->atttypid;
-
-        switch (type_id)
-        {
-            case arrow::Type::INT32:
-                src_type = INT4OID;
-                break;
-            case arrow::Type::INT64:
-                src_type = INT8OID;
-                break;
-            case arrow::Type::STRING:
-                src_type = TEXTOID;
-                break;
-            case arrow::Type::BINARY:
-                src_type = BYTEAOID;
-                break;
-            case arrow::Type::TIMESTAMP:
-                src_type = TIMESTAMPTZOID;
-                break;
-            default:
-                elog(ERROR,
-                     "parquet_fdw: unsupported column type: %d",
-                     type_id);
-        }
 
         if (IsBinaryCoercible(src_type, dst_type))
         {
@@ -383,9 +384,15 @@ initialize_castfuncs(ForeignScanState *node)
         switch (ct)
         {
             case COERCION_PATH_FUNC:
-                festate->castfuncs[i] = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
-                fmgr_info(funcid, festate->castfuncs[i]);
-                break;
+                {
+                    MemoryContext   oldctx;
+                    
+                    oldctx = MemoryContextSwitchTo(CurTransactionContext);
+                    festate->castfuncs[i] = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
+                    fmgr_info(funcid, festate->castfuncs[i]);
+                    MemoryContextSwitchTo(oldctx);
+                    break;
+                }
             case COERCION_PATH_RELABELTYPE:
             case COERCION_PATH_COERCEVIAIO:  /* TODO: double check that we
                                               * shouldn't do anything here*/
@@ -397,6 +404,117 @@ initialize_castfuncs(ForeignScanState *node)
         }
     }
     festate->initialized = true;
+}
+
+/*
+ * read_primitive_type
+ *      Returns primitive type value from array
+ */
+static Datum
+read_primitive_type(std::shared_ptr<arrow::Array> array,
+                    int type_id, int64_t i,
+                    FmgrInfo *castfunc)
+{
+    Datum   res;
+
+    /* Get datum depending on the column type */
+    switch (type_id)
+    {
+        case arrow::Type::INT32:
+        {
+            arrow::Int32Array* intarray = (arrow::Int32Array *) array.get();
+            int value = intarray->Value(i);
+
+            res = Int32GetDatum(value);
+            break;
+        }
+        case arrow::Type::INT64:
+        {
+            arrow::Int64Array* intarray = (arrow::Int64Array *) array.get();
+            int64 value = intarray->Value(i);
+
+            res = Int64GetDatum(value);
+            break;
+        }
+        case arrow::Type::STRING:
+        {
+            arrow::StringArray* stringarray = (arrow::StringArray *) array.get();
+            std::string value = stringarray->GetString(i);
+
+            res = CStringGetTextDatum(value.c_str());
+            break;
+        }
+        case arrow::Type::BINARY:
+        {
+            arrow::BinaryArray* binarray = (arrow::BinaryArray *) array.get();
+            std::string value = binarray->GetString(i);
+
+            /* Build bytea */
+            bytea *b = cstring_to_text_with_len(value.data(), value.size());
+
+            res = PointerGetDatum(b);
+            break;
+        }
+        case arrow::Type::TIMESTAMP:
+        {
+            TimestampTz ts;
+            arrow::TimestampArray* tsarray = (arrow::TimestampArray *) array.get();
+
+            ts = time_t_to_timestamptz(
+                    tsarray->Value(i) / 1000000000);
+            res = TimestampTzGetDatum(ts);
+            break;
+        }
+        case arrow::Type::DATE32:
+        {
+            arrow::Date32Array* tsarray = (arrow::Date32Array *) array.get();
+            int32 d = tsarray->Value(i);
+
+            res = DateADTGetDatum(d);
+            break;
+        }
+        /* TODO: add other types */
+        default:
+            elog(ERROR,
+                 "parquet_fdw: unsupported column type: %d",
+                 type_id);
+    }
+
+    /* Call cast function if needed */
+    if (castfunc != NULL)
+        return FunctionCall1(castfunc, res);
+
+    return res;
+}
+
+/*
+ * nested_list_get_datum
+ *      Returns postgres array build from elements of array. Only one
+ *      dimensional arrays are supported.
+ */
+static Datum
+nested_list_get_datum(std::shared_ptr<arrow::Array> array, int type_id,
+                      FmgrInfo *castfunc)
+{
+    ArrayType  *res;
+    Datum      *values;
+    Oid         typid;
+    int16       typlen;
+    bool        typbyval;
+    char        typalign;
+
+    values = (Datum *) palloc0(sizeof(Datum) * array->length());
+    typid = to_postgres_type(type_id);  /* TODO: get type from tuple descriptor */
+    get_typlenbyvalalign(typid, &typlen, &typbyval, &typalign);
+
+    for (int64_t i = 0; i < array->length(); ++i)
+        values[i] = read_primitive_type(array, type_id, i, castfunc);
+
+    /* TODO: nulls */
+    res = construct_array(values, array->length(), typid,
+                          typlen, typbyval, typalign);
+
+    return PointerGetDatum(res);
 }
 
 /*
@@ -429,74 +547,25 @@ populate_slot(ParquetFdwExecutionState *festate, TupleTableSlot *slot)
                 continue;
             }
 
-            /* Get datum depending on the column type */
-            switch (type_id)
+            /* Currently only primitive types and lists are supported */
+            if (type_id != arrow::Type::LIST)
             {
-                case arrow::Type::INT32:
-                {
-                    arrow::Int32Array* intarray = (arrow::Int32Array *) array.get();
-                    int value = intarray->Value(festate->row);
-
-                    slot->tts_values[i] = Int32GetDatum(value);
-                    break;
-                }
-                case arrow::Type::INT64:
-                {
-                    arrow::Int64Array* intarray = (arrow::Int64Array *) array.get();
-                    int64 value = intarray->Value(festate->row);
-
-                    slot->tts_values[i] = Int64GetDatum(value);
-                    break;
-                }
-                case arrow::Type::STRING:
-                {
-                    arrow::StringArray* stringarray = (arrow::StringArray *) array.get();
-                    std::string value = stringarray->GetString(festate->row);
-
-                    slot->tts_values[i] = CStringGetTextDatum(value.c_str());
-                    break;
-                }
-                case arrow::Type::BINARY:
-                {
-                    arrow::BinaryArray* binarray = (arrow::BinaryArray *) array.get();
-                    std::string value = binarray->GetString(festate->row);
-
-                    /* Build bytea */
-                    bytea *b = cstring_to_text_with_len(value.data(), value.size());
-
-                    slot->tts_values[i] = PointerGetDatum(b);
-                    break;
-                }
-                case arrow::Type::TIMESTAMP:
-                {
-                    TimestampTz ts;
-                    arrow::TimestampArray* tsarray = (arrow::TimestampArray *) array.get();
-
-                    ts = time_t_to_timestamptz(
-                            tsarray->Value(festate->row) / 1000000000);
-                    slot->tts_values[i] = TimestampTzGetDatum(ts);
-                    break;
-                }
-                case arrow::Type::DATE32:
-                {
-                    arrow::Date32Array* tsarray = (arrow::Date32Array *) array.get();
-                    int32 d = tsarray->Value(festate->row);
-
-                    slot->tts_values[i] = DateADTGetDatum(d);
-                    break;
-                }
-                /* TODO: add other types */
-                default:
-                    elog(ERROR,
-                         "parquet_fdw: unsupported column type: %d",
-                         column->type()->id());
+                slot->tts_values[i] = read_primitive_type(array,
+                                                          type_id,
+                                                          festate->row,
+                                                          festate->castfuncs[i]);
             }
-
-            /* Call cast function if needed */
-            if (festate->castfuncs[i] != NULL)
+            else
             {
-                slot->tts_values[i] = FunctionCall1(festate->castfuncs[i],
-                                                    slot->tts_values[i]);
+                arrow::ListArray* larray = (arrow::ListArray *) array.get();
+
+                std::shared_ptr<arrow::Array> slice =
+                    larray->values()->Slice(larray->value_offset(festate->row),
+                                            larray->value_length(festate->row));
+
+                slot->tts_values[i] = nested_list_get_datum(slice,
+                                                            type_id,
+                                                            festate->castfuncs[i]);
             }
             slot->tts_isnull[i] = false;
         }
@@ -523,7 +592,16 @@ parquetIterateForeignScan(ForeignScanState *node)
 
         try
         {
-            festate->reader->RowGroup(festate->row_group)->ReadTable(festate->indices, &festate->table);
+            arrow::Status status = festate->reader
+                ->RowGroup(festate->row_group)
+                ->ReadTable(festate->indices, &festate->table);
+
+            if (!status.ok())
+                throw std::runtime_error(status.message().c_str());
+
+            if (!festate->table)
+                throw std::runtime_error("got empty table");
+
             festate->row = 0;
             festate->row_num = festate->table->num_rows();
             festate->row_group++;
