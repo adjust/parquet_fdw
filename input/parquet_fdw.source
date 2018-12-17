@@ -1,0 +1,29 @@
+CREATE EXTENSION parquet_fdw;
+
+DROP ROLE IF EXISTS regress_parquet_fdw;
+CREATE ROLE regress_parquet_fdw LOGIN SUPERUSER;
+
+SET ROLE regress_parquet_fdw;
+CREATE SERVER parquet_srv FOREIGN DATA WRAPPER parquet_fdw;
+CREATE USER MAPPING FOR regress_parquet_fdw SERVER parquet_srv;
+
+SET ROLE regress_parquet_fdw;
+
+CREATE FOREIGN TABLE example (one INT8, two INT8[], three TEXT)
+SERVER parquet_srv
+OPTIONS (filename '@abs_srcdir@/data/example.parquet', sorted 'one');
+
+SELECT * FROM example;
+-- sorting
+EXPLAIN (COSTS OFF) SELECT * FROM example ORDER BY one;
+EXPLAIN (COSTS OFF) SELECT * FROM example ORDER BY three;
+
+-- invalid options
+CREATE FOREIGN TABLE example2 (one INT8, two INT8[], three TEXT)
+SERVER parquet_srv;
+CREATE FOREIGN TABLE example2 (one INT8, two INT8[], three TEXT)
+SERVER parquet_srv
+OPTIONS (filename 'nonexistent.parquet', some_option '123');
+CREATE FOREIGN TABLE example2 (one INT8, two INT8[], three TEXT)
+SERVER parquet_srv
+OPTIONS (filename '@abs_srcdir@/data/example.parquet', some_option '123');

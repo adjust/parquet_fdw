@@ -1,8 +1,11 @@
+#include <sys/stat.h>
+
 #include "postgres.h"
 #include "fmgr.h"
 
 #include "access/reloptions.h"
 #include "catalog/pg_foreign_table.h"
+#include "commands/defrem.h"
 #include "foreign/fdwapi.h"
 #include "optimizer/planmain.h"
 #include "utils/elog.h"
@@ -54,6 +57,7 @@ parquet_fdw_validator(PG_FUNCTION_ARGS)
     List       *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
     Oid         catalog = PG_GETARG_OID(1);
     ListCell   *lc;
+    bool        filename_provided = false;
 
     /* Only check table options */
     if (catalog != ForeignTableRelationId)
@@ -63,14 +67,30 @@ parquet_fdw_validator(PG_FUNCTION_ARGS)
     {
         DefElem    *def = (DefElem *) lfirst(lc);
 
-        if (strcmp(def->defname, "filename") != 0
-            && strcmp(def->defname, "sorted") != 0)
+        if (strcmp(def->defname, "filename") == 0)
+        {
+            struct stat stat_buf;
+
+            if (stat(defGetString(def), &stat_buf) != 0)
+                ereport(ERROR,
+                        (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                         errmsg("parquet_fdw: file \"%s\" does not exist",
+                                defGetString(def))));
+            filename_provided = true;
+        }
+        else if (strcmp(def->defname, "sorted") == 0)
+            ;  /* do nothing */
+        else
         {
             ereport(ERROR,
                     (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
-                     errmsg("invalid option \"%s\"", def->defname)));
+                     errmsg("parquet_fdw: invalid option \"%s\"",
+                            def->defname)));
         }
     }
+
+    if (!filename_provided)
+        elog(ERROR, "parquet_fdw: filename is required");
 
     PG_RETURN_VOID();
 }
