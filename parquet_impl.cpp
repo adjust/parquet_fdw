@@ -90,7 +90,7 @@ create_parquet_state(ForeignScanState *scanstate,
     TupleTableSlot *slot = scanstate->ss.ss_ScanTupleSlot;
     TupleDesc tupleDesc = slot->tts_tupleDescriptor;
 
-    /* Create mapping between tuple descriptor and parquet columns */
+    /* Create mapping between tuple descriptor and parquet columns. */
     festate->map.resize(tupleDesc->natts);
     for (int i = 0; i < tupleDesc->natts; i++)
     {
@@ -103,8 +103,18 @@ create_parquet_state(ForeignScanState *scanstate,
 
         for (int k = 0; k < schema->num_columns(); k++)
         {
+            parquet::schema::NodePtr node = schema->Column(k)->schema_node();
+            std::vector<std::string> path = node->path()->ToDotVector();
+
+            /*
+             * Compare postgres attribute name to the top level column name in
+             * parquet.
+             *
+             * XXX If we will ever want to support structs then this should be
+             * changed.
+             */
             if (strcmp(NameStr(TupleDescAttr(tupleDesc, i)->attname),
-                       schema->Column(k)->name().c_str()) == 0)
+                       path[0].c_str()) == 0)
             {
                 /* Found mapping! */
                 festate->indices.push_back(k);
@@ -338,10 +348,19 @@ to_postgres_type(int arrow_type)
     }
 }
 
+static int
+get_arrow_list_elem_type(std::shared_ptr<arrow::DataType> type)
+{
+    auto children = type->children();
+
+    Assert(children->length() == 1);
+    return children[0]->type()->id();
+}
+
 /*
  * initialize_castfuncs
  *      Check wether implicit cast will be required and prepare cast function
- *      call.
+ *      call. For arrays find cast functions for its elements.
  */
 static void
 initialize_castfuncs(ForeignScanState *node)
@@ -368,8 +387,15 @@ initialize_castfuncs(ForeignScanState *node)
         TupleDesc tupleDesc = slot->tts_tupleDescriptor;
         CoercionPathType ct;
 
+        /* Find underlying type of list */
+        if (type_id == arrow::Type::LIST)
+            type_id = get_arrow_list_elem_type(column->type());
         src_type = to_postgres_type(type_id);
         dst_type = TupleDescAttr(tupleDesc, i)->atttypid;
+
+        /* Find underlying type of array */
+        if (type_is_array(dst_type))
+            dst_type = get_element_type(dst_type);
 
         if (IsBinaryCoercible(src_type, dst_type))
         {
@@ -494,25 +520,38 @@ read_primitive_type(std::shared_ptr<arrow::Array> array,
  */
 static Datum
 nested_list_get_datum(std::shared_ptr<arrow::Array> array, int type_id,
-                      FmgrInfo *castfunc)
+                      Oid elem_type, FmgrInfo *castfunc)
 {
     ArrayType  *res;
     Datum      *values;
-    Oid         typid;
-    int16       typlen;
-    bool        typbyval;
-    char        typalign;
+    bool       *nulls = NULL;
+    int16       elem_len;
+    bool        elem_byval;
+    char        elem_align;
+    int         dims[1];
+    int         lbs[1];
 
     values = (Datum *) palloc0(sizeof(Datum) * array->length());
-    typid = to_postgres_type(type_id);  /* TODO: get type from tuple descriptor */
-    get_typlenbyvalalign(typid, &typlen, &typbyval, &typalign);
+    get_typlenbyvalalign(elem_type, &elem_len, &elem_byval, &elem_align);
 
+    /* Fill values and nulls arrays */
     for (int64_t i = 0; i < array->length(); ++i)
-        values[i] = read_primitive_type(array, type_id, i, castfunc);
+    {
+        if (!array->IsNull(i))
+            values[i] = read_primitive_type(array, type_id, i, castfunc);
+        else
+        {
+            if (!nulls)
+                nulls = (bool *) palloc0(sizeof(bool) * array->length());
+            nulls[i] = true;
+        }
+    }
 
-    /* TODO: nulls */
-    res = construct_array(values, array->length(), typid,
-                          typlen, typbyval, typalign);
+    /* Construct one dimensional array */
+    dims[0] = array->length();
+    lbs[0] = 1;
+    res = construct_md_array(values, nulls, 1, dims, lbs,
+                             elem_type, elem_len, elem_byval, elem_align);
 
     return PointerGetDatum(res);
 }
@@ -539,7 +578,7 @@ populate_slot(ParquetFdwExecutionState *festate, TupleTableSlot *slot)
              * over chunks
              */
             auto array = column->data()->chunk(0);
-            int  type_id = column->type()->id();
+            int  arrow_type_id = column->type()->id();
 
             if (array->IsNull(festate->row))
             {
@@ -548,23 +587,34 @@ populate_slot(ParquetFdwExecutionState *festate, TupleTableSlot *slot)
             }
 
             /* Currently only primitive types and lists are supported */
-            if (type_id != arrow::Type::LIST)
+            if (arrow_type_id != arrow::Type::LIST)
             {
                 slot->tts_values[i] = read_primitive_type(array,
-                                                          type_id,
+                                                          arrow_type_id,
                                                           festate->row,
                                                           festate->castfuncs[i]);
             }
             else
             {
                 arrow::ListArray* larray = (arrow::ListArray *) array.get();
+                Oid pg_type_id = TupleDescAttr(slot->tts_tupleDescriptor, i)->atttypid;
+
+                if (!type_is_array(pg_type_id))
+                    elog(ERROR,
+                         "cannot convert parquet column of type LIST to "
+                         "postgres column of scalar type");
+
+                /* Figure out the base element types */
+                pg_type_id = get_element_type(pg_type_id);
+                arrow_type_id = get_arrow_list_elem_type(column->type());
 
                 std::shared_ptr<arrow::Array> slice =
                     larray->values()->Slice(larray->value_offset(festate->row),
                                             larray->value_length(festate->row));
 
                 slot->tts_values[i] = nested_list_get_datum(slice,
-                                                            type_id,
+                                                            arrow_type_id,
+                                                            pg_type_id,
                                                             festate->castfuncs[i]);
             }
             slot->tts_isnull[i] = false;
