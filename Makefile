@@ -16,4 +16,4 @@ PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
 parquet.o:
-	g++ $(CPPFLAGS) -O0 -ggdb3 parquet_impl.cpp $(PG_LIBS) -c -fPIC $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)
+	g++ $(CPPFLAGS) -std=c++11 -O0 -ggdb3 parquet_impl.cpp $(PG_LIBS) -c -fPIC $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)

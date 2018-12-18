@@ -1,3 +1,5 @@
+SET client_min_messages = WARNING;
+
 CREATE EXTENSION parquet_fdw;
 
 DROP ROLE IF EXISTS regress_parquet_fdw;

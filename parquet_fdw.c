@@ -72,10 +72,11 @@ parquet_fdw_validator(PG_FUNCTION_ARGS)
             struct stat stat_buf;
 
             if (stat(defGetString(def), &stat_buf) != 0)
+            {
                 ereport(ERROR,
                         (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
-                         errmsg("parquet_fdw: file \"%s\" does not exist",
-                                defGetString(def))));
+                         errmsg("parquet_fdw: %s", strerror(errno))));
+            }
             filename_provided = true;
         }
         else if (strcmp(def->defname, "sorted") == 0)

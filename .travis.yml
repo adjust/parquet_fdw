@@ -1,0 +1,27 @@
+sudo: required
+language: c
+
+matrix:
+    include:
+      - env: postgres=10
+        addons:
+            postgresql: 10
+            apt:
+                packages:
+                  - postgresql-10
+                  - postgresql-client-10
+                  - postgresql-server-dev-10
+        install:
+          - export PGPORT=5433
+          - sudo make install
+
+before_install:
+    - ./install_arrow.sh
+
+script:
+    - sudo chmod a+x /home/travis  # make files accessible from postgres users
+    - namei -m /home/travis/build/zilder/parquet_fdw/data/example.parquet
+    - make installcheck
+      
+after_failure:
+  - cat regression.diffs

@@ -1,3 +1,4 @@
+SET client_min_messages = WARNING;
 CREATE EXTENSION parquet_fdw;
 DROP ROLE IF EXISTS regress_parquet_fdw;
 CREATE ROLE regress_parquet_fdw LOGIN SUPERUSER;
@@ -38,7 +39,7 @@ ERROR:  parquet_fdw: filename is required
 CREATE FOREIGN TABLE example2 (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv
 OPTIONS (filename 'nonexistent.parquet', some_option '123');
-ERROR:  parquet_fdw: file "nonexistent.parquet" does not exist
+ERROR:  parquet_fdw: No such file or directory
 CREATE FOREIGN TABLE example2 (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv
 OPTIONS (filename '/home/zilder/projects/parquet_fdw/data/example.parquet', some_option '123');

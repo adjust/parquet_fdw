@@ -1,7 +1,5 @@
 *.o
 *.so
-sql/*.sql
-expected/*.sql
 regression.diffs
 regression.out
 results
