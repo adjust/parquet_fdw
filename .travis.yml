@@ -20,7 +20,6 @@ before_install:
 
 script:
     - sudo chmod a+x /home/travis  # make files accessible from postgres users
-    - namei -m /home/travis/build/zilder/parquet_fdw/data/example.parquet
     - make installcheck
       
 after_failure:
