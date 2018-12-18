@@ -1,3 +1,5 @@
+[![Build Status](https://travis-ci.org/zilder/parquet_fdw.svg?branch=master)](https://travis-ci.org/zilder/parquet_fdw)
+
 # parquet_fdw
 
 Parquet foreign data wrapper for PostgreSQL.
