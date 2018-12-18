@@ -383,19 +383,35 @@ initialize_castfuncs(ForeignScanState *node)
         int     type_id = column->type()->id();
         int     src_type,
                 dst_type;
+        bool    src_is_list,
+                dst_is_array;
         Oid     funcid;
         TupleDesc tupleDesc = slot->tts_tupleDescriptor;
         CoercionPathType ct;
 
         /* Find underlying type of list */
-        if (type_id == arrow::Type::LIST)
+        src_is_list = (type_id == arrow::Type::LIST);
+        if (src_is_list)
             type_id = get_arrow_list_elem_type(column->type());
         src_type = to_postgres_type(type_id);
         dst_type = TupleDescAttr(tupleDesc, i)->atttypid;
 
         /* Find underlying type of array */
-        if (type_is_array(dst_type))
+        dst_is_array = type_is_array(dst_type);
+        if (dst_is_array)
             dst_type = get_element_type(dst_type);
+
+        /* Make sure both types are compatible */
+        if (src_is_list != dst_is_array)
+        {
+            ereport(ERROR,
+                    (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
+                     errmsg("parquet_fdw: incompatible types in column \"%s\"",
+                            column->name().c_str()),
+                     errhint(src_is_list ?
+                         "parquet column is of type list while postgres type is scalar" :
+                         "parquet column is of scalar type while postgres type is array")));
+        }
 
         if (IsBinaryCoercible(src_type, dst_type))
         {
