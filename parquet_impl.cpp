@@ -19,6 +19,7 @@ extern "C"
 #include "executor/tuptable.h"
 #include "foreign/foreign.h"
 #include "nodes/execnodes.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/makefuncs.h"
 #include "nodes/relation.h"
 #include "optimizer/pathnode.h"
@@ -33,7 +34,18 @@ extern "C"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
+#include "utils/typcache.h"
 }
+
+/*
+ * Restriction
+ */
+struct RowGroupRestrict
+{
+    AttrNumber  attnum;
+    Const      *value;
+    int         strategy;
+};
 
 /*
  * Just a plain C struct since we going to keep objects created by postgres
@@ -42,7 +54,8 @@ struct ParquetFdwPlanState
 {
     char       *filename;
     Bitmapset  *attrs_sorted;
-    Bitmapset  *attrs_used; /* attributes actually used in query */
+    Bitmapset  *attrs_used;    /* attributes actually used in query */
+    List       *filters;       /* list of RowGroupRestrict */
 };
 
 class ParquetFdwExecutionState
@@ -257,8 +270,9 @@ parquetGetForeignPaths(PlannerInfo *root,
                                  &sort_op, NULL, NULL,
                                  NULL);
 
-        attr_pathkey = build_expression_pathkey(root, (Expr *) var, NULL, sort_op,
-                                           baserel->relids, true);
+        attr_pathkey = build_expression_pathkey(root, (Expr *) var, NULL,
+                                                sort_op, baserel->relids,
+                                                true);
         pathkeys = list_concat(pathkeys, attr_pathkey);
     }
 
@@ -279,6 +293,83 @@ parquetGetForeignPaths(PlannerInfo *root,
 									 (List *) fdw_private));
 }
 
+/*
+ * extract_useful_clauses
+ *      Build a list of expressions we can use to filter out row groups.
+ */
+static List *
+extract_useful_clauses(PlannerInfo *root,
+                       RelOptInfo *baserel,
+                       List *scan_clauses)
+{
+    List     *useful_clauses = NIL;
+    ListCell *lc;
+
+    foreach (lc, scan_clauses)
+    {
+        TypeCacheEntry *tce;
+        Node           *clause = (Node *) lfirst(lc);
+        OpExpr         *expr;
+        Expr           *left, *right;
+        int				strategy;
+        Const *c;
+        Var *v;
+
+        /* Isn't opexpr? */
+        if (!IsA(clause, OpExpr))
+            continue;
+
+        expr = (OpExpr *) clause;
+
+        /* Only interested in binary opexprs */
+        if (list_length(expr->args) != 2)
+            continue;
+
+        left = (Expr *) linitial(expr->args);
+        right = (Expr *) lsecond(expr->args);
+
+        /*
+         * Looking for expressions like "EXPR OP CONST" or "CONST OP EXPR"
+         *
+         * XXX Currently only Var as expression is supported. Will be
+         * extended in future.
+         */
+        if (IsA(right, Const))
+        {
+            if (!IsA(left, Var))
+                continue;
+            v = (Var *) left;
+            c = (Const *) right;
+        }
+        else if (IsA(left, Const))
+        {
+            if (!IsA(right, Var))
+                continue;
+            v = (Var *) right;
+            c = (Const *) left;
+        }
+        else
+            continue;
+
+        /* TODO: make sure that operator is <, <=, =, >= or > */
+
+        /* TODO */
+        tce = lookup_type_cache(exprType((Node *) left),
+                                TYPECACHE_BTREE_OPFAMILY);
+		strategy = get_op_opfamily_strategy(expr->opno, tce->btree_opf);
+        elog(LOG, "Strategy: %d", strategy);
+
+        RowGroupRestrict *restrict = (RowGroupRestrict *) palloc(sizeof(RowGroupRestrict));
+        restrict->attnum = v->varattno;
+        restrict->value = c;
+        restrict->strategy = strategy;
+
+        useful_clauses = lappend(useful_clauses, restrict);
+    }
+
+    return useful_clauses;
+}
+
 extern "C" ForeignScan *
 parquetGetForeignPlan(PlannerInfo *root,
                       RelOptInfo *baserel,
@@ -289,6 +380,7 @@ parquetGetForeignPlan(PlannerInfo *root,
                       Plan *outer_plan)
 {
 	Index		scan_relid = baserel->relid;
+    ParquetFdwPlanState *fdw_private = (ParquetFdwPlanState *) best_path->fdw_private;
 
 	/*
 	 * We have no native ability to evaluate restriction clauses, so we just
@@ -299,12 +391,16 @@ parquetGetForeignPlan(PlannerInfo *root,
 	 */
 	scan_clauses = extract_actual_clauses(scan_clauses, false);
 
+    fdw_private->filters = extract_useful_clauses(root,
+                                                  baserel,
+                                                  scan_clauses);
+
 	/* Create the ForeignScan node */
 	return make_foreignscan(tlist,
 							scan_clauses,
 							scan_relid,
 							NIL,	/* no expressions to evaluate */
-							best_path->fdw_private,
+							(List *) fdw_private,
 							NIL,	/* no custom tlist */
 							NIL,	/* no remote quals */
 							outer_plan);
@@ -642,6 +738,49 @@ populate_slot(ParquetFdwExecutionState *festate, TupleTableSlot *slot)
     }
 }
 
+static void
+read_next_rowgroup(ForeignScanState *node)
+{
+    ParquetFdwExecutionState   *festate = (ParquetFdwExecutionState *) node->fdw_state;
+	ForeignScan *plan = (ForeignScan *) node->ss.ps.plan;
+    ParquetFdwPlanState *fdw_private = (ParquetFdwPlanState *) plan->fdw_private;
+
+    while (true)
+    {
+        auto rowgroup = festate->reader->parquet_reader()->metadata()->RowGroup(festate->row_group);
+        ListCell *lc;
+        
+        foreach (lc, fdw_private->filters)
+        {
+            RowGroupRestrict *restrict = (RowGroupRestrict *) lfirst(lc);
+            auto colchunk = rowgroup->ColumnChunk(festate->map[restrict->attnum - 1]);
+            auto stats = colchunk->statistics();
+
+            elog(LOG,
+                 "(min, max) = (%s, %s)",
+                 stats->EncodeMin().c_str(),
+                 stats->EncodeMax().c_str());
+        }
+
+        /* TODO */
+        break;
+    }
+
+    arrow::Status status = festate->reader
+        ->RowGroup(festate->row_group)
+        ->ReadTable(festate->indices, &festate->table);
+
+    if (!status.ok())
+        throw std::runtime_error(status.message().c_str());
+
+    if (!festate->table)
+        throw std::runtime_error("got empty table");
+
+    festate->row = 0;
+    festate->row_num = festate->table->num_rows();
+    festate->row_group++;
+}
+
 extern "C" TupleTableSlot *
 parquetIterateForeignScan(ForeignScanState *node)
 {
@@ -658,19 +797,7 @@ parquetIterateForeignScan(ForeignScanState *node)
 
         try
         {
-            arrow::Status status = festate->reader
-                ->RowGroup(festate->row_group)
-                ->ReadTable(festate->indices, &festate->table);
-
-            if (!status.ok())
-                throw std::runtime_error(status.message().c_str());
-
-            if (!festate->table)
-                throw std::runtime_error("got empty table");
-
-            festate->row = 0;
-            festate->row_num = festate->table->num_rows();
-            festate->row_group++;
+            read_next_rowgroup(node);
         }
         catch(const std::exception& e)
         {
