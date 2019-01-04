@@ -6,6 +6,7 @@
 #include "arrow/io/api.h"
 #include "arrow/array.h"
 #include "parquet/arrow/reader.h"
+#include "parquet/arrow/schema.h"
 #include "parquet/exception.h"
 #include "parquet/file_reader.h"
 
@@ -14,6 +15,7 @@ extern "C"
 #include "postgres.h"
 
 #include "access/sysattr.h"
+#include "access/nbtree.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "executor/tuptable.h"
@@ -40,7 +42,7 @@ extern "C"
 /*
  * Restriction
  */
-struct RowGroupRestrict
+struct RowGroupFilter
 {
     AttrNumber  attnum;
     Const      *value;
@@ -55,7 +57,7 @@ struct ParquetFdwPlanState
     char       *filename;
     Bitmapset  *attrs_sorted;
     Bitmapset  *attrs_used;    /* attributes actually used in query */
-    List       *filters;       /* list of RowGroupRestrict */
+    List       *filters;       /* list of RowGroupFilter */
 };
 
 class ParquetFdwExecutionState
@@ -294,15 +296,15 @@ parquetGetForeignPaths(PlannerInfo *root,
 }
 
 /*
- * extract_useful_clauses
+ * extract_rowgroup_filters
  *      Build a list of expressions we can use to filter out row groups.
  */
 static List *
-extract_useful_clauses(PlannerInfo *root,
-                       RelOptInfo *baserel,
-                       List *scan_clauses)
+extract_rowgroup_filters(PlannerInfo *root,
+                         RelOptInfo *baserel,
+                         List *scan_clauses)
 {
-    List     *useful_clauses = NIL;
+    List     *filters = NIL;
     ListCell *lc;
 
     foreach (lc, scan_clauses)
@@ -351,23 +353,26 @@ extract_useful_clauses(PlannerInfo *root,
         else
             continue;
 
-        /* TODO: make sure that operator is <, <=, =, >= or > */
-
         /* TODO */
         tce = lookup_type_cache(exprType((Node *) left),
                                 TYPECACHE_BTREE_OPFAMILY);
 		strategy = get_op_opfamily_strategy(expr->opno, tce->btree_opf);
+
+        /* Not a btree family operator? */
+        if (strategy == 0)
+            continue;
+
         elog(LOG, "Strategy: %d", strategy);
 
-        RowGroupRestrict *restrict = (RowGroupRestrict *) palloc(sizeof(RowGroupRestrict));
-        restrict->attnum = v->varattno;
-        restrict->value = c;
-        restrict->strategy = strategy;
+        RowGroupFilter *f = (RowGroupFilter *) palloc(sizeof(RowGroupFilter));
+        f->attnum = v->varattno;
+        f->value = c;
+        f->strategy = strategy;
 
-        useful_clauses = lappend(useful_clauses, restrict);
+        filters = lappend(filters, f);
     }
 
-    return useful_clauses;
+    return filters;
 }
 
 extern "C" ForeignScan *
@@ -391,9 +396,9 @@ parquetGetForeignPlan(PlannerInfo *root,
 	 */
 	scan_clauses = extract_actual_clauses(scan_clauses, false);
 
-    fdw_private->filters = extract_useful_clauses(root,
-                                                  baserel,
-                                                  scan_clauses);
+    fdw_private->filters = extract_rowgroup_filters(root,
+                                                    baserel,
+                                                    scan_clauses);
 
 	/* Create the ForeignScan node */
 	return make_foreignscan(tlist,
@@ -738,32 +743,133 @@ populate_slot(ParquetFdwExecutionState *festate, TupleTableSlot *slot)
     }
 }
 
+static Datum
+bytes_to_postgres_type(const char *bytes, int arrow_type)
+{
+    switch(arrow_type)
+    {
+        case arrow::Type::INT32:
+            return Int32GetDatum(*(int32 *) bytes);
+        case arrow::Type::INT64:
+            return Int64GetDatum(*(int64 *) bytes);
+        case arrow::Type::STRING:
+        case arrow::Type::BINARY:
+            return CStringGetTextDatum(bytes);
+        default:
+            return PointerGetDatum(NULL);
+    }
+}
+
 static void
+find_cmp_func(FmgrInfo *finfo, Oid type1, Oid type2)
+{
+    Oid cmp_proc_oid;
+    TypeCacheEntry *tce_1, *tce_2;
+
+    tce_1 = lookup_type_cache(type1, TYPECACHE_BTREE_OPFAMILY);
+    tce_2 = lookup_type_cache(type2, TYPECACHE_BTREE_OPFAMILY);
+
+    cmp_proc_oid = get_opfamily_proc(tce_1->btree_opf,
+                                     tce_1->btree_opintype,
+                                     tce_2->btree_opintype,
+                                     BTORDER_PROC);
+    fmgr_info(cmp_proc_oid, finfo);
+}
+
+static bool
 read_next_rowgroup(ForeignScanState *node)
 {
     ParquetFdwExecutionState   *festate = (ParquetFdwExecutionState *) node->fdw_state;
-	ForeignScan *plan = (ForeignScan *) node->ss.ps.plan;
+	ForeignScan         *plan = (ForeignScan *) node->ss.ps.plan;
     ParquetFdwPlanState *fdw_private = (ParquetFdwPlanState *) plan->fdw_private;
+    std::shared_ptr<arrow::Schema> schema;
 
-    while (true)
+    parquet::arrow::FromParquetSchema(
+            festate->reader->parquet_reader()->metadata()->schema(),
+            &schema);
+
+next_rowgroup:
+
+    if (festate->row_group >= festate->reader->num_row_groups())
+        return false;
+
+    bool skip = false;
+    auto rowgroup = festate->reader->parquet_reader()->metadata()->RowGroup(festate->row_group);
+    ListCell *lc;
+    
+    foreach (lc, fdw_private->filters)
     {
-        auto rowgroup = festate->reader->parquet_reader()->metadata()->RowGroup(festate->row_group);
-        ListCell *lc;
-        
-        foreach (lc, fdw_private->filters)
-        {
-            RowGroupRestrict *restrict = (RowGroupRestrict *) lfirst(lc);
-            auto colchunk = rowgroup->ColumnChunk(festate->map[restrict->attnum - 1]);
-            auto stats = colchunk->statistics();
+        RowGroupFilter *filter = (RowGroupFilter *) lfirst(lc);
+        int             col = festate->map[filter->attnum - 1];
+        auto            colchunk = rowgroup->ColumnChunk(col);
+        auto            stats = colchunk->statistics();
+        std::shared_ptr<arrow::DataType> type = schema->field(col)->type();
+        FmgrInfo finfo;
+        Datum    val = filter->value->constvalue;
+        int      collid = filter->value->constcollid;
 
-            elog(LOG,
-                 "(min, max) = (%s, %s)",
-                 stats->EncodeMin().c_str(),
-                 stats->EncodeMax().c_str());
+        /* TODO: to_postgres_type returns error, have to change this behaviour */
+        find_cmp_func(&finfo,
+                      to_postgres_type(type->id()),
+                      filter->value->consttype);
+
+        switch (filter->strategy)
+        {
+            case BTLessStrategyNumber:
+            case BTLessEqualStrategyNumber:
+                {
+                    Datum lower = bytes_to_postgres_type(stats->EncodeMin().c_str(), type->id());
+                    int cmpres = FunctionCall2Coll(&finfo, collid, lower, val);
+                    bool satisfies = (filter->strategy == BTLessStrategyNumber && cmpres < 0)
+                        || (filter->strategy == BTLessEqualStrategyNumber && cmpres <= 0);
+
+                    if (!satisfies)
+                    {
+                        elog(LOG, "skip rowgroup");
+                        skip = true;
+                    }
+                    break;
+                }
+            case BTGreaterStrategyNumber:
+            case BTGreaterEqualStrategyNumber:
+                {
+                    Datum upper = bytes_to_postgres_type(stats->EncodeMax().c_str(), type->id());
+                    int cmpres = FunctionCall2Coll(&finfo, collid, upper, val);
+
+                    bool satisfies = (filter->strategy == BTGreaterStrategyNumber && cmpres > 0)
+                        || (filter->strategy == BTGreaterEqualStrategyNumber && cmpres >= 0);
+
+                    if (!satisfies)
+                    {
+                        elog(LOG, "skip rowgroup");
+                        skip = true;
+                    }
+                    break;
+                }
+            case BTEqualStrategyNumber:
+                {
+                    Datum lower = bytes_to_postgres_type(stats->EncodeMin().c_str(), type->id());
+                    Datum upper = bytes_to_postgres_type(stats->EncodeMax().c_str(), type->id());
+
+                    int l = FunctionCall2Coll(&finfo, collid, lower, val);
+                    int u = FunctionCall2Coll(&finfo, collid, upper, val);
+
+                    if (l > 0 || u < 0)
+                    {
+                        elog(LOG, "skip rowgroup");
+                        skip = true;
+                    }
+                }
+            default:
+                continue;
         }
 
-        /* TODO */
-        break;
+        /* Skip this row group */
+        if (skip)
+        {
+            festate->row_group++;
+            goto next_rowgroup;
+        }
     }
 
     arrow::Status status = festate->reader
@@ -779,6 +885,8 @@ read_next_rowgroup(ForeignScanState *node)
     festate->row = 0;
     festate->row_num = festate->table->num_rows();
     festate->row_group++;
+
+    return true;
 }
 
 extern "C" TupleTableSlot *
@@ -797,7 +905,8 @@ parquetIterateForeignScan(ForeignScanState *node)
 
         try
         {
-            read_next_rowgroup(node);
+            if (!read_next_rowgroup(node))
+                return slot;
         }
         catch(const std::exception& e)
         {
