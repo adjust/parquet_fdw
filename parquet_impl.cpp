@@ -443,9 +443,7 @@ to_postgres_type(int arrow_type)
         case arrow::Type::TIMESTAMP:
             return TIMESTAMPTZOID;
         default:
-            elog(ERROR,
-                 "parquet_fdw: unsupported column type: %d",
-                 arrow_type);
+            return InvalidOid;
     }
 }
 
@@ -494,8 +492,13 @@ initialize_castfuncs(ForeignScanState *node)
         src_is_list = (type_id == arrow::Type::LIST);
         if (src_is_list)
             type_id = get_arrow_list_elem_type(column->type());
+
         src_type = to_postgres_type(type_id);
         dst_type = TupleDescAttr(tupleDesc, i)->atttypid;
+
+        if (!OidIsValid(src_type))
+            elog(ERROR, "parquet_fdw: unsupported column type: %s",
+                 column->type()->name());
 
         /* Find underlying type of array */
         dst_is_array = type_is_array(dst_type);
@@ -551,7 +554,7 @@ initialize_castfuncs(ForeignScanState *node)
 
 /*
  * read_primitive_type
- *      Returns primitive type value from array
+ *      Returns primitive type value from arrow array
  */
 static Datum
 read_primitive_type(std::shared_ptr<arrow::Array> array,
@@ -600,11 +603,29 @@ read_primitive_type(std::shared_ptr<arrow::Array> array,
         }
         case arrow::Type::TIMESTAMP:
         {
+            /* TODO: deal with timezones */
             TimestampTz ts;
             arrow::TimestampArray* tsarray = (arrow::TimestampArray *) array.get();
+            auto tstype = (arrow::TimestampType *) array->type().get();
 
-            ts = time_t_to_timestamptz(
-                    tsarray->Value(i) / 1000000000);
+            switch (tstype->unit())
+            {
+                case arrow::TimeUnit::SECOND:
+                    ts = time_t_to_timestamptz(tsarray->Value(i));
+                    break;
+                case arrow::TimeUnit::MILLI:
+                    ts = time_t_to_timestamptz(tsarray->Value(i) / 1000);
+                    break;
+                case arrow::TimeUnit::MICRO:
+                    ts = time_t_to_timestamptz(tsarray->Value(i) / 1000000);
+                    break;
+                case arrow::TimeUnit::NANO:
+                    ts = time_t_to_timestamptz(tsarray->Value(i) / 1000000000);
+                    break;
+                default:
+                    elog(ERROR, "Timestamp of unknown precision: %d",
+                         tstype->unit());
+            }
             res = TimestampTzGetDatum(ts);
             break;
         }
@@ -743,10 +764,15 @@ populate_slot(ParquetFdwExecutionState *festate, TupleTableSlot *slot)
     }
 }
 
+/*
+ * bytes_to_postgres_type
+ *      Convert min/max values from column statistics stored in parquet file as
+ *      plain bytes to postgres Datum.
+ */
 static Datum
-bytes_to_postgres_type(const char *bytes, int arrow_type)
+bytes_to_postgres_type(const char *bytes, arrow::DataType *arrow_type)
 {
-    switch(arrow_type)
+    switch(arrow_type->id())
     {
         case arrow::Type::INT32:
             return Int32GetDatum(*(int32 *) bytes);
@@ -755,11 +781,41 @@ bytes_to_postgres_type(const char *bytes, int arrow_type)
         case arrow::Type::STRING:
         case arrow::Type::BINARY:
             return CStringGetTextDatum(bytes);
+        case arrow::Type::TIMESTAMP:
+            {
+                TimestampTz ts;
+                auto tstype = (arrow::TimestampType *) arrow_type;
+
+                switch (tstype->unit())
+                {
+                    case arrow::TimeUnit::SECOND:
+                        ts = time_t_to_timestamptz((*(int64 *) bytes));
+                        break;
+                    case arrow::TimeUnit::MILLI:
+                        ts = time_t_to_timestamptz((*(int64 *) bytes) / 1000);
+                        break;
+                    case arrow::TimeUnit::MICRO:
+                        ts = time_t_to_timestamptz((*(int64 *) bytes) / 1000000);
+                        break;
+                    case arrow::TimeUnit::NANO:
+                        ts = time_t_to_timestamptz((*(int64 *) bytes) / 1000000000);
+                        break;
+                    default:
+                        elog(ERROR, "Timestamp of unknown precision: %d",
+                             tstype->unit());
+                }
+
+                return TimestampTzGetDatum(ts);
+            }
         default:
             return PointerGetDatum(NULL);
     }
 }
 
+/*
+ * find_cmp_func
+ *      Find comparison function for two given types.
+ */
 static void
 find_cmp_func(FmgrInfo *finfo, Oid type1, Oid type2)
 {
@@ -776,6 +832,100 @@ find_cmp_func(FmgrInfo *finfo, Oid type1, Oid type2)
     fmgr_info(cmp_proc_oid, finfo);
 }
 
+/*
+ * row_group_matches_filter
+ *      Check if min/max values of the column of the row group match filter.
+ */
+static bool
+row_group_matches_filter(parquet::RowGroupStatistics *stats,
+                         arrow::DataType *arrow_type,
+                         RowGroupFilter *filter)
+{
+    FmgrInfo finfo;
+    Datum    val = filter->value->constvalue;
+    int      collid = filter->value->constcollid;
+    int      strategy = filter->strategy;
+
+    find_cmp_func(&finfo,
+                  filter->value->consttype,
+                  to_postgres_type(arrow_type->id()));
+
+    switch (filter->strategy)
+    {
+        case BTLessStrategyNumber:
+        case BTLessEqualStrategyNumber:
+            {
+                Datum   lower;
+                int     cmpres;
+                bool    satisfies;
+
+                lower = bytes_to_postgres_type(stats->EncodeMin().c_str(),
+                                               arrow_type);
+                cmpres = FunctionCall2Coll(&finfo, collid, val, lower);
+
+                satisfies =
+                    (strategy == BTLessStrategyNumber      && cmpres > 0) ||
+                    (strategy == BTLessEqualStrategyNumber && cmpres >= 0);
+
+                if (!satisfies)
+                {
+                    elog(LOG, "skip rowgroup");
+                    return false;
+                }
+                break;
+            }
+
+        case BTGreaterStrategyNumber:
+        case BTGreaterEqualStrategyNumber:
+            {
+                Datum   upper;
+                int     cmpres;
+                bool    satisfies;
+
+                upper = bytes_to_postgres_type(stats->EncodeMax().c_str(),
+                                               arrow_type);
+                cmpres = FunctionCall2Coll(&finfo, collid, val, upper);
+
+                satisfies =
+                    (strategy == BTGreaterStrategyNumber      && cmpres < 0) ||
+                    (strategy == BTGreaterEqualStrategyNumber && cmpres <= 0);
+
+                if (!satisfies)
+                {
+                    elog(LOG, "skip rowgroup");
+                    return false;
+                }
+                break;
+            }
+
+        case BTEqualStrategyNumber:
+            {
+                Datum   lower,
+                        upper;
+
+                lower = bytes_to_postgres_type(stats->EncodeMin().c_str(),
+                                               arrow_type);
+                upper = bytes_to_postgres_type(stats->EncodeMax().c_str(),
+                                               arrow_type);
+
+                int l = FunctionCall2Coll(&finfo, collid, val, lower);
+                int u = FunctionCall2Coll(&finfo, collid, val, upper);
+
+                if (l < 0 || u > 0)
+                {
+                    elog(LOG, "skip rowgroup");
+                    return false;
+                }
+            }
+
+        default:
+            /* should not happen */
+            Assert(true);
+    }
+
+    return true;
+}
+
 static bool
 read_next_rowgroup(ForeignScanState *node)
 {
@@ -783,89 +933,39 @@ read_next_rowgroup(ForeignScanState *node)
 	ForeignScan         *plan = (ForeignScan *) node->ss.ps.plan;
     ParquetFdwPlanState *fdw_private = (ParquetFdwPlanState *) plan->fdw_private;
     std::shared_ptr<arrow::Schema> schema;
+    ListCell *lc;
 
+    /* TODO: probably it is worth to build schema once and not for each row
+     * group iteration */
     parquet::arrow::FromParquetSchema(
             festate->reader->parquet_reader()->metadata()->schema(),
             &schema);
 
 next_rowgroup:
-
     if (festate->row_group >= festate->reader->num_row_groups())
         return false;
 
     bool skip = false;
-    auto rowgroup = festate->reader->parquet_reader()->metadata()->RowGroup(festate->row_group);
-    ListCell *lc;
+    auto rowgroup = festate->reader
+                        ->parquet_reader()
+                        ->metadata()
+                        ->RowGroup(festate->row_group);
     
+    /* Check whether row group matches filters */
     foreach (lc, fdw_private->filters)
     {
         RowGroupFilter *filter = (RowGroupFilter *) lfirst(lc);
-        int             col = festate->map[filter->attnum - 1];
-        auto            colchunk = rowgroup->ColumnChunk(col);
-        auto            stats = colchunk->statistics();
-        std::shared_ptr<arrow::DataType> type = schema->field(col)->type();
-        FmgrInfo finfo;
-        Datum    val = filter->value->constvalue;
-        int      collid = filter->value->constcollid;
+        std::unique_ptr<parquet::ColumnChunkMetaData> colchunk;
+        std::shared_ptr<parquet::RowGroupStatistics>  stats;
+        std::shared_ptr<arrow::DataType>              type;
+        int     col;
 
-        /* TODO: to_postgres_type returns error, have to change this behaviour */
-        find_cmp_func(&finfo,
-                      to_postgres_type(type->id()),
-                      filter->value->consttype);
+        col = festate->map[filter->attnum - 1];
+        colchunk = rowgroup->ColumnChunk(col);
+        stats = colchunk->statistics();
+        type = schema->field(col)->type();
 
-        switch (filter->strategy)
-        {
-            case BTLessStrategyNumber:
-            case BTLessEqualStrategyNumber:
-                {
-                    Datum lower = bytes_to_postgres_type(stats->EncodeMin().c_str(), type->id());
-                    int cmpres = FunctionCall2Coll(&finfo, collid, lower, val);
-                    bool satisfies = (filter->strategy == BTLessStrategyNumber && cmpres < 0)
-                        || (filter->strategy == BTLessEqualStrategyNumber && cmpres <= 0);
-
-                    if (!satisfies)
-                    {
-                        elog(LOG, "skip rowgroup");
-                        skip = true;
-                    }
-                    break;
-                }
-            case BTGreaterStrategyNumber:
-            case BTGreaterEqualStrategyNumber:
-                {
-                    Datum upper = bytes_to_postgres_type(stats->EncodeMax().c_str(), type->id());
-                    int cmpres = FunctionCall2Coll(&finfo, collid, upper, val);
-
-                    bool satisfies = (filter->strategy == BTGreaterStrategyNumber && cmpres > 0)
-                        || (filter->strategy == BTGreaterEqualStrategyNumber && cmpres >= 0);
-
-                    if (!satisfies)
-                    {
-                        elog(LOG, "skip rowgroup");
-                        skip = true;
-                    }
-                    break;
-                }
-            case BTEqualStrategyNumber:
-                {
-                    Datum lower = bytes_to_postgres_type(stats->EncodeMin().c_str(), type->id());
-                    Datum upper = bytes_to_postgres_type(stats->EncodeMax().c_str(), type->id());
-
-                    int l = FunctionCall2Coll(&finfo, collid, lower, val);
-                    int u = FunctionCall2Coll(&finfo, collid, upper, val);
-
-                    if (l > 0 || u < 0)
-                    {
-                        elog(LOG, "skip rowgroup");
-                        skip = true;
-                    }
-                }
-            default:
-                continue;
-        }
-
-        /* Skip this row group */
-        if (skip)
+        if (!row_group_matches_filter(stats.get(), type.get(), filter))
         {
             festate->row_group++;
             goto next_rowgroup;
