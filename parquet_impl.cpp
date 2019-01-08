@@ -39,6 +39,23 @@ extern "C"
 #include "utils/typcache.h"
 }
 
+
+#define to_postgres_timestamp(tstype, i, ts)                    \
+    switch ((tstype)->unit()) {                                 \
+        case arrow::TimeUnit::SECOND:                           \
+            ts = time_t_to_timestamptz((i)); break;             \
+        case arrow::TimeUnit::MILLI:                            \
+            ts = time_t_to_timestamptz((i) / 1000); break;      \
+        case arrow::TimeUnit::MICRO:                            \
+            ts = time_t_to_timestamptz((i) / 1000000); break;   \
+        case arrow::TimeUnit::NANO:                             \
+            ts = time_t_to_timestamptz((i) / 1000000000); break;\
+        default:                                                \
+            elog(ERROR, "Timestamp of unknown precision: %d",   \
+                 (tstype)->unit());                             \
+    }
+
+
 /*
  * Restriction
  */
@@ -362,8 +379,6 @@ extract_rowgroup_filters(PlannerInfo *root,
         if (strategy == 0)
             continue;
 
-        elog(LOG, "Strategy: %d", strategy);
-
         RowGroupFilter *f = (RowGroupFilter *) palloc(sizeof(RowGroupFilter));
         f->attnum = v->varattno;
         f->value = c;
@@ -441,7 +456,7 @@ to_postgres_type(int arrow_type)
         case arrow::Type::BINARY:
             return BYTEAOID;
         case arrow::Type::TIMESTAMP:
-            return TIMESTAMPTZOID;
+            return TIMESTAMPOID;
         default:
             return InvalidOid;
     }
@@ -498,7 +513,7 @@ initialize_castfuncs(ForeignScanState *node)
 
         if (!OidIsValid(src_type))
             elog(ERROR, "parquet_fdw: unsupported column type: %s",
-                 column->type()->name());
+                 column->type()->name().c_str());
 
         /* Find underlying type of array */
         dst_is_array = type_is_array(dst_type);
@@ -608,25 +623,8 @@ read_primitive_type(std::shared_ptr<arrow::Array> array,
             arrow::TimestampArray* tsarray = (arrow::TimestampArray *) array.get();
             auto tstype = (arrow::TimestampType *) array->type().get();
 
-            switch (tstype->unit())
-            {
-                case arrow::TimeUnit::SECOND:
-                    ts = time_t_to_timestamptz(tsarray->Value(i));
-                    break;
-                case arrow::TimeUnit::MILLI:
-                    ts = time_t_to_timestamptz(tsarray->Value(i) / 1000);
-                    break;
-                case arrow::TimeUnit::MICRO:
-                    ts = time_t_to_timestamptz(tsarray->Value(i) / 1000000);
-                    break;
-                case arrow::TimeUnit::NANO:
-                    ts = time_t_to_timestamptz(tsarray->Value(i) / 1000000000);
-                    break;
-                default:
-                    elog(ERROR, "Timestamp of unknown precision: %d",
-                         tstype->unit());
-            }
-            res = TimestampTzGetDatum(ts);
+            to_postgres_timestamp(tstype, tsarray->Value(i), ts);
+            res = TimestampGetDatum(ts);
             break;
         }
         case arrow::Type::DATE32:
@@ -786,26 +784,8 @@ bytes_to_postgres_type(const char *bytes, arrow::DataType *arrow_type)
                 TimestampTz ts;
                 auto tstype = (arrow::TimestampType *) arrow_type;
 
-                switch (tstype->unit())
-                {
-                    case arrow::TimeUnit::SECOND:
-                        ts = time_t_to_timestamptz((*(int64 *) bytes));
-                        break;
-                    case arrow::TimeUnit::MILLI:
-                        ts = time_t_to_timestamptz((*(int64 *) bytes) / 1000);
-                        break;
-                    case arrow::TimeUnit::MICRO:
-                        ts = time_t_to_timestamptz((*(int64 *) bytes) / 1000000);
-                        break;
-                    case arrow::TimeUnit::NANO:
-                        ts = time_t_to_timestamptz((*(int64 *) bytes) / 1000000000);
-                        break;
-                    default:
-                        elog(ERROR, "Timestamp of unknown precision: %d",
-                             tstype->unit());
-                }
-
-                return TimestampTzGetDatum(ts);
+                to_postgres_timestamp(tstype, *(int64 *) bytes, ts);
+                return TimestampGetDatum(ts);
             }
         default:
             return PointerGetDatum(NULL);
@@ -868,10 +848,7 @@ row_group_matches_filter(parquet::RowGroupStatistics *stats,
                     (strategy == BTLessEqualStrategyNumber && cmpres >= 0);
 
                 if (!satisfies)
-                {
-                    elog(LOG, "skip rowgroup");
                     return false;
-                }
                 break;
             }
 
@@ -891,10 +868,7 @@ row_group_matches_filter(parquet::RowGroupStatistics *stats,
                     (strategy == BTGreaterEqualStrategyNumber && cmpres <= 0);
 
                 if (!satisfies)
-                {
-                    elog(LOG, "skip rowgroup");
                     return false;
-                }
                 break;
             }
 
@@ -912,10 +886,7 @@ row_group_matches_filter(parquet::RowGroupStatistics *stats,
                 int u = FunctionCall2Coll(&finfo, collid, val, upper);
 
                 if (l < 0 || u > 0)
-                {
-                    elog(LOG, "skip rowgroup");
                     return false;
-                }
             }
 
         default:
@@ -967,6 +938,7 @@ next_rowgroup:
 
         if (!row_group_matches_filter(stats.get(), type.get(), filter))
         {
+            elog(DEBUG1, "parquet_fdw: skip rowgroup %d", festate->row_group);
             festate->row_group++;
             goto next_rowgroup;
         }

@@ -32,7 +32,46 @@ EXPLAIN (COSTS OFF) SELECT * FROM example ORDER BY three;
    ->  Foreign Scan on example
 (3 rows)
 
+-- filtering
+SET client_min_messages = DEBUG1;
+SELECT * FROM example WHERE one < 1;
+DEBUG:  parquet_fdw: skip rowgroup 0
+ one | two | three 
+-----+-----+-------
+(0 rows)
+
+SELECT * FROM example WHERE one <= 1;
+ one |   two   | three 
+-----+---------+-------
+   1 | {1,2,3} | foo
+(1 row)
+
+SELECT * FROM example WHERE one > 3;
+DEBUG:  parquet_fdw: skip rowgroup 0
+ one | two | three 
+-----+-----+-------
+(0 rows)
+
+SELECT * FROM example WHERE one >= 3;
+ one |   two   | three 
+-----+---------+-------
+   3 | {7,8,9} | baz
+(1 row)
+
+SELECT * FROM example WHERE one = 2;
+ one |    two     | three 
+-----+------------+-------
+   2 | {NULL,5,6} | bar
+(1 row)
+
+SELECT * FROM example WHERE one = 4;
+DEBUG:  parquet_fdw: skip rowgroup 0
+ one | two | three 
+-----+-----+-------
+(0 rows)
+
 -- invalid options
+SET client_min_messages = WARNING;
 CREATE FOREIGN TABLE example2 (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv;
 ERROR:  parquet_fdw: filename is required

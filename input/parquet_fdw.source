@@ -1,7 +1,5 @@
 SET client_min_messages = WARNING;
-
 CREATE EXTENSION parquet_fdw;
-
 DROP ROLE IF EXISTS regress_parquet_fdw;
 CREATE ROLE regress_parquet_fdw LOGIN SUPERUSER;
 
@@ -20,7 +18,17 @@ SELECT * FROM example;
 EXPLAIN (COSTS OFF) SELECT * FROM example ORDER BY one;
 EXPLAIN (COSTS OFF) SELECT * FROM example ORDER BY three;
 
+-- filtering
+SET client_min_messages = DEBUG1;
+SELECT * FROM example WHERE one < 1;
+SELECT * FROM example WHERE one <= 1;
+SELECT * FROM example WHERE one > 3;
+SELECT * FROM example WHERE one >= 3;
+SELECT * FROM example WHERE one = 2;
+SELECT * FROM example WHERE one = 4;
+
 -- invalid options
+SET client_min_messages = WARNING;
 CREATE FOREIGN TABLE example2 (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv;
 CREATE FOREIGN TABLE example2 (one INT8, two INT8[], three TEXT)
