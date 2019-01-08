@@ -35,6 +35,7 @@ Now you should be able to create foreign table from Parquet files. Currently `pa
 |        INT32 |      INT4 |
 |        INT64 |      INT8 |
 |    TIMESTAMP | TIMESTAMP |
+|       DATE32 |      DATE |
 |       STRING |      TEXT |
 |       BINARY |     BYTEA |
 

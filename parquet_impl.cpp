@@ -457,6 +457,8 @@ to_postgres_type(int arrow_type)
             return BYTEAOID;
         case arrow::Type::TIMESTAMP:
             return TIMESTAMPOID;
+        case arrow::Type::DATE32:
+            return DATEOID;
         default:
             return InvalidOid;
     }
@@ -632,7 +634,12 @@ read_primitive_type(std::shared_ptr<arrow::Array> array,
             arrow::Date32Array* tsarray = (arrow::Date32Array *) array.get();
             int32 d = tsarray->Value(i);
 
-            res = DateADTGetDatum(d);
+            /*
+             * Postgres date starts with 2000-01-01 while unix date (which
+             * Parquet is using) starts with 1970-01-01. So we need to do
+             * simple calculations here.
+             */
+            res = DateADTGetDatum(d + (UNIX_EPOCH_JDATE - POSTGRES_EPOCH_JDATE));
             break;
         }
         /* TODO: add other types */
@@ -787,6 +794,9 @@ bytes_to_postgres_type(const char *bytes, arrow::DataType *arrow_type)
                 to_postgres_timestamp(tstype, *(int64 *) bytes, ts);
                 return TimestampGetDatum(ts);
             }
+        case arrow::Type::DATE32:
+            return DateADTGetDatum(*(int32 *) bytes +
+                                   (UNIX_EPOCH_JDATE - POSTGRES_EPOCH_JDATE));
         default:
             return PointerGetDatum(NULL);
     }
