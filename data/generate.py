@@ -14,7 +14,8 @@ df1 = pd.DataFrame({'one': [1, 2, 3],
                              datetime(2018, 1, 3)],
                     'five': [date(2018, 1, 1),
                              date(2018, 1, 2),
-                             date(2018, 1, 3)]})
+                             date(2018, 1, 3)],
+                    'six': [True, False, True]})
 table1 = pa.Table.from_pandas(df1)
 
 # row group 2
@@ -26,11 +27,11 @@ df2 = pd.DataFrame({'one': [4, 5, 6],
                              datetime(2018, 1, 6)],
                     'five': [date(2018, 1, 4),
                              date(2018, 1, 5),
-                             date(2018, 1, 6)]})
+                             date(2018, 1, 6)],
+                    'six': [False, False, False]})
 table2 = pa.Table.from_pandas(df2)
 
 with pq.ParquetWriter('example.parquet', table1.schema) as writer:
     writer.write_table(table1)
     writer.write_table(table2)
 
-#pq.write_table(table, 'example.parquet')

@@ -331,52 +331,75 @@ extract_rowgroup_filters(PlannerInfo *root,
         OpExpr         *expr;
         Expr           *left, *right;
         int				strategy;
-        Const *c;
-        Var *v;
+        Const          *c;
+        Var            *v;
 
-        /* Isn't opexpr? */
-        if (!IsA(clause, OpExpr))
-            continue;
-
-        expr = (OpExpr *) clause;
-
-        /* Only interested in binary opexprs */
-        if (list_length(expr->args) != 2)
-            continue;
-
-        left = (Expr *) linitial(expr->args);
-        right = (Expr *) lsecond(expr->args);
-
-        /*
-         * Looking for expressions like "EXPR OP CONST" or "CONST OP EXPR"
-         *
-         * XXX Currently only Var as expression is supported. Will be
-         * extended in future.
-         */
-        if (IsA(right, Const))
+        if (IsA(clause, OpExpr))
         {
-            if (!IsA(left, Var))
+            expr = (OpExpr *) clause;
+
+            /* Only interested in binary opexprs */
+            if (list_length(expr->args) != 2)
                 continue;
-            v = (Var *) left;
-            c = (Const *) right;
+
+            left = (Expr *) linitial(expr->args);
+            right = (Expr *) lsecond(expr->args);
+
+            /*
+             * Looking for expressions like "EXPR OP CONST" or "CONST OP EXPR"
+             *
+             * XXX Currently only Var as expression is supported. Will be
+             * extended in future.
+             */
+            if (IsA(right, Const))
+            {
+                if (!IsA(left, Var))
+                    continue;
+                v = (Var *) left;
+                c = (Const *) right;
+            }
+            else if (IsA(left, Const))
+            {
+                if (!IsA(right, Var))
+                    continue;
+                v = (Var *) right;
+                c = (Const *) left;
+            }
+            else
+                continue;
+
+            /* TODO */
+            tce = lookup_type_cache(exprType((Node *) left),
+                                    TYPECACHE_BTREE_OPFAMILY);
+            strategy = get_op_opfamily_strategy(expr->opno, tce->btree_opf);
+
+            /* Not a btree family operator? */
+            if (strategy == 0)
+                continue;
         }
-        else if (IsA(left, Const))
+        else if (IsA(clause, Var))
         {
-            if (!IsA(right, Var))
+            /* Trivial expression containing only a single boolean Var */
+            v = (Var *) clause;
+            strategy = BTEqualStrategyNumber;
+            c = (Const *) makeBoolConst(true, false);
+        }
+        else if (IsA(clause, BoolExpr))
+        {
+            /* Check that this is NOT VAR expression */
+            BoolExpr *boolExpr = (BoolExpr *) clause;
+
+            if (boolExpr->args && list_length(boolExpr->args) != 1)
                 continue;
-            v = (Var *) right;
-            c = (Const *) left;
+
+            if (!IsA(linitial(boolExpr->args), Var))
+                continue;
+
+            v = (Var *) linitial(boolExpr->args);
+            strategy = BTEqualStrategyNumber;
+            c = (Const *) makeBoolConst(false, false);
         }
         else
-            continue;
-
-        /* TODO */
-        tce = lookup_type_cache(exprType((Node *) left),
-                                TYPECACHE_BTREE_OPFAMILY);
-		strategy = get_op_opfamily_strategy(expr->opno, tce->btree_opf);
-
-        /* Not a btree family operator? */
-        if (strategy == 0)
             continue;
 
         RowGroupFilter *f = (RowGroupFilter *) palloc(sizeof(RowGroupFilter));
@@ -447,6 +470,8 @@ to_postgres_type(int arrow_type)
 {
     switch (arrow_type)
     {
+        case arrow::Type::BOOL:
+            return BOOLOID;
         case arrow::Type::INT32:
             return INT4OID;
         case arrow::Type::INT64:
@@ -583,9 +608,16 @@ read_primitive_type(std::shared_ptr<arrow::Array> array,
     /* Get datum depending on the column type */
     switch (type_id)
     {
+        case arrow::Type::BOOL:
+        {
+            arrow::BooleanArray *boolarray = (arrow::BooleanArray *) array.get();
+
+            res = BoolGetDatum(boolarray->Value(i));
+            break;
+        }
         case arrow::Type::INT32:
         {
-            arrow::Int32Array* intarray = (arrow::Int32Array *) array.get();
+            arrow::Int32Array *intarray = (arrow::Int32Array *) array.get();
             int value = intarray->Value(i);
 
             res = Int32GetDatum(value);
@@ -593,7 +625,7 @@ read_primitive_type(std::shared_ptr<arrow::Array> array,
         }
         case arrow::Type::INT64:
         {
-            arrow::Int64Array* intarray = (arrow::Int64Array *) array.get();
+            arrow::Int64Array *intarray = (arrow::Int64Array *) array.get();
             int64 value = intarray->Value(i);
 
             res = Int64GetDatum(value);
@@ -601,7 +633,7 @@ read_primitive_type(std::shared_ptr<arrow::Array> array,
         }
         case arrow::Type::STRING:
         {
-            arrow::StringArray* stringarray = (arrow::StringArray *) array.get();
+            arrow::StringArray *stringarray = (arrow::StringArray *) array.get();
             std::string value = stringarray->GetString(i);
 
             res = CStringGetTextDatum(value.c_str());
@@ -609,7 +641,7 @@ read_primitive_type(std::shared_ptr<arrow::Array> array,
         }
         case arrow::Type::BINARY:
         {
-            arrow::BinaryArray* binarray = (arrow::BinaryArray *) array.get();
+            arrow::BinaryArray *binarray = (arrow::BinaryArray *) array.get();
             std::string value = binarray->GetString(i);
 
             /* Build bytea */
@@ -622,7 +654,7 @@ read_primitive_type(std::shared_ptr<arrow::Array> array,
         {
             /* TODO: deal with timezones */
             TimestampTz ts;
-            arrow::TimestampArray* tsarray = (arrow::TimestampArray *) array.get();
+            arrow::TimestampArray *tsarray = (arrow::TimestampArray *) array.get();
             auto tstype = (arrow::TimestampType *) array->type().get();
 
             to_postgres_timestamp(tstype, tsarray->Value(i), ts);
@@ -631,7 +663,7 @@ read_primitive_type(std::shared_ptr<arrow::Array> array,
         }
         case arrow::Type::DATE32:
         {
-            arrow::Date32Array* tsarray = (arrow::Date32Array *) array.get();
+            arrow::Date32Array *tsarray = (arrow::Date32Array *) array.get();
             int32 d = tsarray->Value(i);
 
             /*
@@ -779,6 +811,8 @@ bytes_to_postgres_type(const char *bytes, arrow::DataType *arrow_type)
 {
     switch(arrow_type->id())
     {
+        case arrow::Type::BOOL:
+            return BoolGetDatum(*(bool *) bytes);
         case arrow::Type::INT32:
             return Int32GetDatum(*(int32 *) bytes);
         case arrow::Type::INT64:
