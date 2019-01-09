@@ -99,6 +99,9 @@ public:
     uint32_t row;        /* current row within row group */
     uint32_t row_num;    /* total rows in row group */
 
+    std::set<int> attrs_used;
+    std::list<RowGroupFilter> filters;
+
     ParquetFdwExecutionState(const char *filename)
         : row_group(0), row(0), row_num(0), initialized(false)
     {
@@ -111,11 +114,14 @@ public:
 
 static void *
 create_parquet_state(ForeignScanState *scanstate,
-                     ParquetFdwPlanState *fdw_private)
+                     const char *filename,
+                     std::set<int> &attrs_used,
+                     std::list<RowGroupFilter> &filters)
 {
     ParquetFdwExecutionState *festate;
 
-    festate = new ParquetFdwExecutionState(fdw_private->filename);
+    festate = new ParquetFdwExecutionState(filename);
+    festate->filters = std::move(filters);
     scanstate->fdw_state = festate;
     auto schema = festate->reader->parquet_reader()->metadata()->schema();
  
@@ -130,7 +136,7 @@ create_parquet_state(ForeignScanState *scanstate,
         festate->map[i] = -1;
 
         /* Skip columns we don't intend to use in query */
-        if (!bms_is_member(attnum, fdw_private->attrs_used))
+        if (attrs_used.find(attnum) == attrs_used.end())
             continue;
 
         for (int k = 0; k < schema->num_columns(); k++)
@@ -316,12 +322,10 @@ parquetGetForeignPaths(PlannerInfo *root,
  * extract_rowgroup_filters
  *      Build a list of expressions we can use to filter out row groups.
  */
-static List *
-extract_rowgroup_filters(PlannerInfo *root,
-                         RelOptInfo *baserel,
-                         List *scan_clauses)
+static void
+extract_rowgroup_filters(List *scan_clauses,
+                         std::list<RowGroupFilter> &filters)
 {
-    List     *filters = NIL;
     ListCell *lc;
 
     foreach (lc, scan_clauses)
@@ -379,14 +383,20 @@ extract_rowgroup_filters(PlannerInfo *root,
         }
         else if (IsA(clause, Var))
         {
-            /* Trivial expression containing only a single boolean Var */
+            /*
+             * Trivial expression containing only a single boolean Var. This
+             * also covers cases "BOOL_VAR = true"
+             * */
             v = (Var *) clause;
             strategy = BTEqualStrategyNumber;
             c = (Const *) makeBoolConst(true, false);
         }
         else if (IsA(clause, BoolExpr))
         {
-            /* Check that this is NOT VAR expression */
+            /*
+             * Similar to previous case but for expressions like "!BOOL_VAR" or
+             * "BOOL_VAR = false"
+             */
             BoolExpr *boolExpr = (BoolExpr *) clause;
 
             if (boolExpr->args && list_length(boolExpr->args) != 1)
@@ -402,15 +412,15 @@ extract_rowgroup_filters(PlannerInfo *root,
         else
             continue;
 
-        RowGroupFilter *f = (RowGroupFilter *) palloc(sizeof(RowGroupFilter));
-        f->attnum = v->varattno;
-        f->value = c;
-        f->strategy = strategy;
+        RowGroupFilter f
+        {
+            .attnum = v->varattno,
+            .value = c,
+            .strategy = strategy,
+        };
 
-        filters = lappend(filters, f);
+        filters.push_back(f);
     }
-
-    return filters;
 }
 
 extern "C" ForeignScan *
@@ -422,8 +432,10 @@ parquetGetForeignPlan(PlannerInfo *root,
                       List *scan_clauses,
                       Plan *outer_plan)
 {
-	Index		scan_relid = baserel->relid;
     ParquetFdwPlanState *fdw_private = (ParquetFdwPlanState *) best_path->fdw_private;
+	Index		scan_relid = baserel->relid;
+    List       *attrs_used = NIL;
+    AttrNumber  attr;
 
 	/*
 	 * We have no native ability to evaluate restriction clauses, so we just
@@ -434,16 +446,23 @@ parquetGetForeignPlan(PlannerInfo *root,
 	 */
 	scan_clauses = extract_actual_clauses(scan_clauses, false);
 
-    fdw_private->filters = extract_rowgroup_filters(root,
-                                                    baserel,
-                                                    scan_clauses);
+    /*
+     * We can't just pass arbitrary structure into make_foreignscan() because
+     * in some cases (i.e. plan caching) postgres may want to make a copy of
+     * the plan and it can only make copy of something it knows of, namely
+     * Nodes. So we need to convert everything in nodes and store it in a List.
+     */
+    attr = -1;
+    while ((attr = bms_next_member(fdw_private->attrs_used, attr)) >= 0)
+        attrs_used = lappend_int(attrs_used, attr);
 
 	/* Create the ForeignScan node */
 	return make_foreignscan(tlist,
 							scan_clauses,
 							scan_relid,
 							NIL,	/* no expressions to evaluate */
-							(List *) fdw_private,
+							list_make2(makeString(fdw_private->filename),
+                                       attrs_used),
 							NIL,	/* no custom tlist */
 							NIL,	/* no remote quals */
 							outer_plan);
@@ -452,12 +471,29 @@ parquetGetForeignPlan(PlannerInfo *root,
 extern "C" void
 parquetBeginForeignScan(ForeignScanState *node, int eflags)
 {
-	ForeignScan *plan = (ForeignScan *) node->ss.ps.plan;
+	ForeignScan    *plan = (ForeignScan *) node->ss.ps.plan;
+    List           *fdw_private = plan->fdw_private;
+    List           *attrs_used_list = (List *) lsecond(fdw_private);
+    ListCell       *lc;
+    char           *filename;
+    std::set<int>   attrs_used;
+    std::list<RowGroupFilter> filters;
+
+    /* Unwrap fdw_private */
+    filename = strVal((Value *) linitial(fdw_private));
+
+    foreach (lc, attrs_used_list)
+        attrs_used.insert(lfirst_int(lc));
     
+    /* Build filters list */
+    extract_rowgroup_filters(plan->scan.plan.qual, filters);
+
     try
     {
         node->fdw_state = create_parquet_state(node,
-                (ParquetFdwPlanState *) plan->fdw_private);
+                                               filename,
+                                               attrs_used,
+                                               filters);
     }
     catch(const std::exception& e)
     {
@@ -946,7 +982,6 @@ read_next_rowgroup(ForeignScanState *node)
 {
     ParquetFdwExecutionState   *festate = (ParquetFdwExecutionState *) node->fdw_state;
 	ForeignScan         *plan = (ForeignScan *) node->ss.ps.plan;
-    ParquetFdwPlanState *fdw_private = (ParquetFdwPlanState *) plan->fdw_private;
     std::shared_ptr<arrow::Schema> schema;
     ListCell *lc;
 
@@ -967,20 +1002,20 @@ next_rowgroup:
                         ->RowGroup(festate->row_group);
     
     /* Check whether row group matches filters */
-    foreach (lc, fdw_private->filters)
+    for (auto it = festate->filters.begin(); it != festate->filters.end(); it++)
     {
-        RowGroupFilter *filter = (RowGroupFilter *) lfirst(lc);
+        RowGroupFilter &filter = *it;
         std::unique_ptr<parquet::ColumnChunkMetaData> colchunk;
         std::shared_ptr<parquet::RowGroupStatistics>  stats;
         std::shared_ptr<arrow::DataType>              type;
         int     col;
 
-        col = festate->map[filter->attnum - 1];
+        col = festate->map[filter.attnum - 1];
         colchunk = rowgroup->ColumnChunk(col);
         stats = colchunk->statistics();
         type = schema->field(col)->type();
 
-        if (!row_group_matches_filter(stats.get(), type.get(), filter))
+        if (!row_group_matches_filter(stats.get(), type.get(), &filter))
         {
             elog(DEBUG1, "parquet_fdw: skip rowgroup %d", festate->row_group);
             festate->row_group++;
