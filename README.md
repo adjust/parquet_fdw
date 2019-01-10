@@ -38,6 +38,9 @@ Now you should be able to create foreign table from Parquet files. Currently `pa
 |       DATE32 |      DATE |
 |       STRING |      TEXT |
 |       BINARY |     BYTEA |
+|         LIST |     ARRAY |
+
+Currently `parquet_fdw` doesn't support structs and nested lists.
 
 Following options are supported:
 * **filename** - path to Parquet file to read;

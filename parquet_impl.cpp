@@ -74,7 +74,6 @@ struct ParquetFdwPlanState
     char       *filename;
     Bitmapset  *attrs_sorted;
     Bitmapset  *attrs_used;    /* attributes actually used in query */
-    List       *filters;       /* list of RowGroupFilter */
 };
 
 class ParquetFdwExecutionState
