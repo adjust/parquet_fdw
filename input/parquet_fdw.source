@@ -11,11 +11,12 @@ CREATE USER MAPPING FOR regress_parquet_fdw SERVER parquet_srv;
 SET ROLE regress_parquet_fdw;
 
 CREATE FOREIGN TABLE example (
-    one INT8,
-    two INT8[],
-    three TEXT,
-    four TIMESTAMP,
-    five DATE)
+    one     INT8,
+    two     INT8[],
+    three   TEXT,
+    four    TIMESTAMP,
+    five    DATE,
+    six     BOOL)
 SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/example.parquet', sorted 'one');
 
@@ -32,6 +33,13 @@ SELECT * FROM example WHERE one > 6;
 SELECT * FROM example WHERE one >= 6;
 SELECT * FROM example WHERE one = 2;
 SELECT * FROM example WHERE one = 7;
+SELECT * FROM example WHERE six = true;
+SELECT * FROM example WHERE six = false;
+
+-- prepared statements
+prepare prep(date) as select * from example where five < $1;
+execute prep('2018-01-03');
+execute prep('2018-01-01');
 
 -- invalid options
 SET client_min_messages = WARNING;
