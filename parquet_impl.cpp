@@ -529,7 +529,7 @@ get_arrow_list_elem_type(std::shared_ptr<arrow::DataType> type)
 {
     auto children = type->children();
 
-    Assert(children->length() == 1);
+    Assert(children.size() == 1);
     return children[0]->type()->id();
 }
 
@@ -983,12 +983,16 @@ read_next_rowgroup(ForeignScanState *node)
 	ForeignScan         *plan = (ForeignScan *) node->ss.ps.plan;
     std::shared_ptr<arrow::Schema> schema;
     ListCell *lc;
+    arrow::Status status;
 
     /* TODO: probably it is worth to build schema once and not for each row
      * group iteration */
-    parquet::arrow::FromParquetSchema(
+    status =  parquet::arrow::FromParquetSchema(
             festate->reader->parquet_reader()->metadata()->schema(),
             &schema);
+
+    if (!status.ok())
+        elog(ERROR, "parquet_fdw: error reading parquet schema");
 
 next_rowgroup:
     if (festate->row_group >= festate->reader->num_row_groups())
@@ -1022,7 +1026,7 @@ next_rowgroup:
         }
     }
 
-    arrow::Status status = festate->reader
+    status = festate->reader
         ->RowGroup(festate->row_group)
         ->ReadTable(festate->indices, &festate->table);
 

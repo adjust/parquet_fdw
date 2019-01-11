@@ -1,5 +1,6 @@
 *.o
 *.so
+*.bc
 regression.diffs
 regression.out
 results
