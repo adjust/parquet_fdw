@@ -1043,6 +1043,12 @@ next_rowgroup:
         ->RowGroup(festate->row_group)
         ->ReadTable(festate->indices, &festate->table);
 
+    if (!status.ok())
+        throw std::runtime_error(status.message().c_str());
+
+    if (!festate->table)
+        throw std::runtime_error("got empty table");
+
     /* Fill festate->columns and festate->types */
     festate->columns.clear();
     festate->types.clear();
@@ -1060,12 +1066,6 @@ next_rowgroup:
             festate->types.push_back(column->type().get());
         }
     }
-
-    if (!status.ok())
-        throw std::runtime_error(status.message().c_str());
-
-    if (!festate->table)
-        throw std::runtime_error("got empty table");
 
     festate->row = 0;
     festate->row_num = festate->table->num_rows();
