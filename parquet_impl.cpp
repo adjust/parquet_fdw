@@ -92,6 +92,13 @@ public:
     /* Current row group */
     std::shared_ptr<arrow::Table> table;
 
+    /*
+     * Plain pointers to inner the structures of row group. It's needed to
+     * prevent excessive shared_ptr management.
+     */
+    std::vector<arrow::Array *> columns;
+    std::vector<arrow::DataType *> types;
+
     bool     initialized;
 
     uint32_t row_group;  /* current row group index */
@@ -525,7 +532,7 @@ to_postgres_type(int arrow_type)
 }
 
 static int
-get_arrow_list_elem_type(std::shared_ptr<arrow::DataType> type)
+get_arrow_list_elem_type(arrow::DataType *type)
 {
     auto children = type->children();
 
@@ -548,6 +555,8 @@ initialize_castfuncs(ForeignScanState *node)
 
     for (int i = 0; i < festate->map.size(); ++i)
     {
+        int arrow_col = festate->map[i];
+
         if (festate->map[i] < 0)
         {
             /* Null column */
@@ -555,8 +564,9 @@ initialize_castfuncs(ForeignScanState *node)
             continue;
         }
 
-        auto    column = festate->table->column(festate->map[i]);
-        int     type_id = column->type()->id();
+        arrow::Array *column = festate->columns[arrow_col];
+        arrow::DataType *type = festate->types[arrow_col];
+        int     type_id = type->id();
         int     src_type,
                 dst_type;
         bool    src_is_list,
@@ -568,14 +578,14 @@ initialize_castfuncs(ForeignScanState *node)
         /* Find underlying type of list */
         src_is_list = (type_id == arrow::Type::LIST);
         if (src_is_list)
-            type_id = get_arrow_list_elem_type(column->type());
+            type_id = get_arrow_list_elem_type(type);
 
         src_type = to_postgres_type(type_id);
         dst_type = TupleDescAttr(tupleDesc, i)->atttypid;
 
         if (!OidIsValid(src_type))
             elog(ERROR, "parquet_fdw: unsupported column type: %s",
-                 column->type()->name().c_str());
+                 type->name().c_str());
 
         /* Find underlying type of array */
         dst_is_array = type_is_array(dst_type);
@@ -588,7 +598,7 @@ initialize_castfuncs(ForeignScanState *node)
             ereport(ERROR,
                     (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
                      errmsg("parquet_fdw: incompatible types in column \"%s\"",
-                            column->name().c_str()),
+                            festate->table->column(arrow_col)->name().c_str()),
                      errhint(src_is_list ?
                          "parquet column is of type list while postgres type is scalar" :
                          "parquet column is of scalar type while postgres type is array")));
@@ -634,7 +644,7 @@ initialize_castfuncs(ForeignScanState *node)
  *      Returns primitive type value from arrow array
  */
 static Datum
-read_primitive_type(std::shared_ptr<arrow::Array> array,
+read_primitive_type(arrow::Array *array,
                     int type_id, int64_t i,
                     FmgrInfo *castfunc)
 {
@@ -645,14 +655,14 @@ read_primitive_type(std::shared_ptr<arrow::Array> array,
     {
         case arrow::Type::BOOL:
         {
-            arrow::BooleanArray *boolarray = (arrow::BooleanArray *) array.get();
+            arrow::BooleanArray *boolarray = (arrow::BooleanArray *) array;
 
             res = BoolGetDatum(boolarray->Value(i));
             break;
         }
         case arrow::Type::INT32:
         {
-            arrow::Int32Array *intarray = (arrow::Int32Array *) array.get();
+            arrow::Int32Array *intarray = (arrow::Int32Array *) array;
             int value = intarray->Value(i);
 
             res = Int32GetDatum(value);
@@ -660,7 +670,7 @@ read_primitive_type(std::shared_ptr<arrow::Array> array,
         }
         case arrow::Type::INT64:
         {
-            arrow::Int64Array *intarray = (arrow::Int64Array *) array.get();
+            arrow::Int64Array *intarray = (arrow::Int64Array *) array;
             int64 value = intarray->Value(i);
 
             res = Int64GetDatum(value);
@@ -668,7 +678,7 @@ read_primitive_type(std::shared_ptr<arrow::Array> array,
         }
         case arrow::Type::STRING:
         {
-            arrow::StringArray *stringarray = (arrow::StringArray *) array.get();
+            arrow::StringArray *stringarray = (arrow::StringArray *) array;
             std::string value = stringarray->GetString(i);
 
             res = CStringGetTextDatum(value.c_str());
@@ -676,7 +686,7 @@ read_primitive_type(std::shared_ptr<arrow::Array> array,
         }
         case arrow::Type::BINARY:
         {
-            arrow::BinaryArray *binarray = (arrow::BinaryArray *) array.get();
+            arrow::BinaryArray *binarray = (arrow::BinaryArray *) array;
             std::string value = binarray->GetString(i);
 
             /* Build bytea */
@@ -689,7 +699,7 @@ read_primitive_type(std::shared_ptr<arrow::Array> array,
         {
             /* TODO: deal with timezones */
             TimestampTz ts;
-            arrow::TimestampArray *tsarray = (arrow::TimestampArray *) array.get();
+            arrow::TimestampArray *tsarray = (arrow::TimestampArray *) array;
             auto tstype = (arrow::TimestampType *) array->type().get();
 
             to_postgres_timestamp(tstype, tsarray->Value(i), ts);
@@ -698,7 +708,7 @@ read_primitive_type(std::shared_ptr<arrow::Array> array,
         }
         case arrow::Type::DATE32:
         {
-            arrow::Date32Array *tsarray = (arrow::Date32Array *) array.get();
+            arrow::Date32Array *tsarray = (arrow::Date32Array *) array;
             int32 d = tsarray->Value(i);
 
             /*
@@ -729,7 +739,7 @@ read_primitive_type(std::shared_ptr<arrow::Array> array,
  *      dimensional arrays are supported.
  */
 static Datum
-nested_list_get_datum(std::shared_ptr<arrow::Array> array, int type_id,
+nested_list_get_datum(arrow::Array *array, int type_id,
                       Oid elem_type, FmgrInfo *castfunc)
 {
     ArrayType  *res;
@@ -776,19 +786,20 @@ populate_slot(ParquetFdwExecutionState *festate, TupleTableSlot *slot)
     /* Fill slot values */
     for (int i = 0; i < slot->tts_tupleDescriptor->natts; i++)
     {
+        int arrow_col = festate->map[i];
         /*
          * We only fill slot attributes if column was referred in targetlist
          * or clauses. In other cases mark attribute as NULL.
          * */
-        if (festate->map[i] >= 0)
+        if (arrow_col >= 0)
         {
-            auto column = festate->table->column(festate->map[i]);
             /*
              * Each row group contains only one chunk so no reason to iterate 
              * over chunks
              */
-            auto array = column->data()->chunk(0);
-            int  arrow_type_id = column->type()->id();
+            arrow::Array *array = festate->columns[arrow_col];
+            arrow::DataType *arrow_type = festate->types[arrow_col];
+            int arrow_type_id = arrow_type->id();
 
             if (array->IsNull(festate->row))
             {
@@ -806,7 +817,7 @@ populate_slot(ParquetFdwExecutionState *festate, TupleTableSlot *slot)
             }
             else
             {
-                arrow::ListArray* larray = (arrow::ListArray *) array.get();
+                arrow::ListArray* larray = (arrow::ListArray *) array;
                 Oid pg_type_id = TupleDescAttr(slot->tts_tupleDescriptor, i)->atttypid;
 
                 if (!type_is_array(pg_type_id))
@@ -816,13 +827,13 @@ populate_slot(ParquetFdwExecutionState *festate, TupleTableSlot *slot)
 
                 /* Figure out the base element types */
                 pg_type_id = get_element_type(pg_type_id);
-                arrow_type_id = get_arrow_list_elem_type(column->type());
+                arrow_type_id = get_arrow_list_elem_type(arrow_type);
 
                 std::shared_ptr<arrow::Array> slice =
                     larray->values()->Slice(larray->value_offset(festate->row),
                                             larray->value_length(festate->row));
 
-                slot->tts_values[i] = nested_list_get_datum(slice,
+                slot->tts_values[i] = nested_list_get_datum(slice.get(),
                                                             arrow_type_id,
                                                             pg_type_id,
                                                             festate->castfuncs[i]);
@@ -980,10 +991,12 @@ static bool
 read_next_rowgroup(ForeignScanState *node)
 {
     ParquetFdwExecutionState   *festate = (ParquetFdwExecutionState *) node->fdw_state;
-	ForeignScan         *plan = (ForeignScan *) node->ss.ps.plan;
+	ForeignScan        *plan = (ForeignScan *) node->ss.ps.plan;
+    TupleTableSlot     *slot = node->ss.ss_ScanTupleSlot;
     std::shared_ptr<arrow::Schema> schema;
     ListCell *lc;
     arrow::Status status;
+    int natts = slot->tts_tupleDescriptor->natts;
 
     /* TODO: probably it is worth to build schema once and not for each row
      * group iteration */
@@ -1029,6 +1042,24 @@ next_rowgroup:
     status = festate->reader
         ->RowGroup(festate->row_group)
         ->ReadTable(festate->indices, &festate->table);
+
+    /* Fill festate->columns and festate->types */
+    festate->columns.clear();
+    festate->types.clear();
+    for (int i = 0; i < natts; i++)
+    {
+        if (festate->map[i] >= 0)
+        {
+            auto column = festate->table->column(festate->map[i]);
+
+            /*
+             * Each row group contains only one chunk so no reason to iterate 
+             * over chunks
+             */
+            festate->columns.push_back(column->data()->chunk(0).get());
+            festate->types.push_back(column->type().get());
+        }
+    }
 
     if (!status.ok())
         throw std::runtime_error(status.message().c_str());
