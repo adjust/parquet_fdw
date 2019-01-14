@@ -250,6 +250,12 @@ extract_used_attributes(RelOptInfo *baserel)
                        baserel->relid,
                        &fdw_private->attrs_used);
     }
+
+    if (bms_is_empty(fdw_private->attrs_used))
+    {
+        bms_free(fdw_private->attrs_used);
+        fdw_private->attrs_used = bms_make_singleton(1 - FirstLowInvalidHeapAttributeNumber);
+    }
 }
 
 extern "C" void

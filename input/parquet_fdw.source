@@ -21,6 +21,11 @@ SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/example.parquet', sorted 'one');
 
 SELECT * FROM example;
+
+-- no explicit columns mentions
+SELECT 1 as x FROM example;
+SELECT count(*) as count FROM example;
+
 -- sorting
 EXPLAIN (COSTS OFF) SELECT * FROM example ORDER BY one;
 EXPLAIN (COSTS OFF) SELECT * FROM example ORDER BY three;
