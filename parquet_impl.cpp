@@ -39,6 +39,7 @@ extern "C"
 #include "utils/typcache.h"
 }
 
+#define BATCH_CAPACITY 1000
 
 #define to_postgres_timestamp(tstype, i, ts)                    \
     switch ((tstype)->unit()) {                                 \
@@ -96,20 +97,27 @@ public:
      * Plain pointers to inner the structures of row group. It's needed to
      * prevent excessive shared_ptr management.
      */
-    std::vector<arrow::Array *> columns;
-    std::vector<arrow::DataType *> types;
+    std::vector<arrow::Array *>         columns;
+    std::vector<arrow::DataType *>      types;
+
+    MemoryContext                       batch_cxt;
+    std::vector<std::vector<Datum> >    values;
+    std::vector<std::vector<bool> >     nulls;
+    int64     offset; /* offset from the row group start */
+    int64     batch_size;
 
     bool     initialized;
 
     uint32_t row_group;  /* current row group index */
     uint32_t row;        /* current row within row group */
-    uint32_t row_num;    /* total rows in row group */
+    uint32_t num_rows;    /* total rows in row group */
 
     std::set<int> attrs_used;
     std::list<RowGroupFilter> filters;
 
     ParquetFdwExecutionState(const char *filename)
-        : row_group(0), row(0), row_num(0), initialized(false)
+        : row_group(0), row(0), num_rows(0), batch_size(-1),
+          offset(0), initialized(false)
     {
         reader.reset(
                 new parquet::arrow::FileReader(
@@ -118,7 +126,7 @@ public:
     }
 };
 
-static void *
+static ParquetFdwExecutionState *
 create_parquet_state(ForeignScanState *scanstate,
                      const char *filename,
                      std::set<int> &attrs_used,
@@ -167,6 +175,9 @@ create_parquet_state(ForeignScanState *scanstate,
             }
         }
     }
+
+    festate->values.resize(festate->map.size());
+    festate->nulls.resize(festate->map.size());
 
     return festate;
 }
@@ -477,13 +488,16 @@ parquetGetForeignPlan(PlannerInfo *root,
 extern "C" void
 parquetBeginForeignScan(ForeignScanState *node, int eflags)
 {
+    ParquetFdwExecutionState *festate; 
 	ForeignScan    *plan = (ForeignScan *) node->ss.ps.plan;
+	EState         *estate = node->ss.ps.state;
     List           *fdw_private = plan->fdw_private;
     List           *attrs_used_list = (List *) lsecond(fdw_private);
     ListCell       *lc;
     char           *filename;
     std::set<int>   attrs_used;
     std::list<RowGroupFilter> filters;
+    
 
     /* Unwrap fdw_private */
     filename = strVal((Value *) linitial(fdw_private));
@@ -496,15 +510,21 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
 
     try
     {
-        node->fdw_state = create_parquet_state(node,
-                                               filename,
-                                               attrs_used,
-                                               filters);
+        festate = create_parquet_state(node,
+                                       filename,
+                                       attrs_used,
+                                       filters);
     }
     catch(const std::exception& e)
     {
         elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
     }
+
+    /* MemoryContext for batch */
+    festate->batch_cxt = AllocSetContextCreate(estate->es_query_cxt,
+                                               "parquet_fdw tuple data",
+                                               ALLOCSET_DEFAULT_SIZES);
+    node->fdw_state = festate;
 }
 
 static Oid
@@ -750,6 +770,7 @@ nested_list_get_datum(arrow::Array *array, int type_id,
     char        elem_align;
     int         dims[1];
     int         lbs[1];
+    MemoryContext   oldcxt;
 
     values = (Datum *) palloc0(sizeof(Datum) * array->length());
     get_typlenbyvalalign(elem_type, &elem_len, &elem_byval, &elem_align);
@@ -773,6 +794,11 @@ nested_list_get_datum(arrow::Array *array, int type_id,
     res = construct_md_array(values, nulls, 1, dims, lbs,
                              elem_type, elem_len, elem_byval, elem_align);
 
+    /* values and null have been copied to the array and no longer needed */
+    pfree(values);
+    if (nulls)
+        pfree(nulls);
+
     return PointerGetDatum(res);
 }
 
@@ -784,65 +810,23 @@ static void
 populate_slot(ParquetFdwExecutionState *festate, TupleTableSlot *slot)
 {
     /* Fill slot values */
-    for (int i = 0; i < slot->tts_tupleDescriptor->natts; i++)
+    for (int attr = 0; attr < slot->tts_tupleDescriptor->natts; attr++)
     {
-        int arrow_col = festate->map[i];
+        int arrow_col = festate->map[attr];
         /*
          * We only fill slot attributes if column was referred in targetlist
          * or clauses. In other cases mark attribute as NULL.
          * */
         if (arrow_col >= 0)
         {
-            /*
-             * Each row group contains only one chunk so no reason to iterate 
-             * over chunks
-             */
-            arrow::Array *array = festate->columns[arrow_col];
-            arrow::DataType *arrow_type = festate->types[arrow_col];
-            int arrow_type_id = arrow_type->id();
+            int i = festate->row - festate->offset;
 
-            if (array->IsNull(festate->row))
-            {
-                slot->tts_isnull[i] = true;
-                continue;
-            }
-
-            /* Currently only primitive types and lists are supported */
-            if (arrow_type_id != arrow::Type::LIST)
-            {
-                slot->tts_values[i] = read_primitive_type(array,
-                                                          arrow_type_id,
-                                                          festate->row,
-                                                          festate->castfuncs[i]);
-            }
-            else
-            {
-                arrow::ListArray* larray = (arrow::ListArray *) array;
-                Oid pg_type_id = TupleDescAttr(slot->tts_tupleDescriptor, i)->atttypid;
-
-                if (!type_is_array(pg_type_id))
-                    elog(ERROR,
-                         "cannot convert parquet column of type LIST to "
-                         "postgres column of scalar type");
-
-                /* Figure out the base element types */
-                pg_type_id = get_element_type(pg_type_id);
-                arrow_type_id = get_arrow_list_elem_type(arrow_type);
-
-                std::shared_ptr<arrow::Array> slice =
-                    larray->values()->Slice(larray->value_offset(festate->row),
-                                            larray->value_length(festate->row));
-
-                slot->tts_values[i] = nested_list_get_datum(slice.get(),
-                                                            arrow_type_id,
-                                                            pg_type_id,
-                                                            festate->castfuncs[i]);
-            }
-            slot->tts_isnull[i] = false;
+            slot->tts_values[attr] = festate->values[arrow_col][i];
+            slot->tts_isnull[attr] = festate->nulls[arrow_col][i];
         }
         else
         {
-            slot->tts_isnull[i] = true;
+            slot->tts_isnull[attr] = true;
         }
     }
 }
@@ -1068,8 +1052,141 @@ next_rowgroup:
     }
 
     festate->row = 0;
-    festate->row_num = festate->table->num_rows();
+    festate->num_rows = festate->table->num_rows();
     festate->row_group++;
+
+    return true;
+}
+
+static bool
+read_next_batch(ForeignScanState *node)
+{
+    ParquetFdwExecutionState   *festate = (ParquetFdwExecutionState *) node->fdw_state;
+	ForeignScan        *plan = (ForeignScan *) node->ss.ps.plan;
+    TupleTableSlot     *slot = node->ss.ss_ScanTupleSlot;
+
+    if (festate->row >= festate->num_rows)
+    {
+        /* Are there row groups left to read? */
+        if (festate->row_group >= festate->reader->num_row_groups())
+            return false;
+
+        /* Read next row group */
+        try
+        {
+            if (!read_next_rowgroup(node))
+                return false;
+        }
+        catch(const std::exception& e)
+        {
+            elog(ERROR,
+                 "parquet_fdw: failed to read row group %d: %s",
+                 festate->row_group, e.what());
+        }
+
+        /* Lookup cast funcs */
+        if (!festate->initialized)
+            initialize_castfuncs(node);
+    }
+
+    /* Read and cache values of the batch */
+    for (int attr = 0; attr < slot->tts_tupleDescriptor->natts; attr++)
+    {
+        int arrow_col = festate->map[attr];
+        /*
+         * We only fill slot attributes if column was referred in targetlist
+         * or clauses. In other cases mark attribute as NULL.
+         * */
+        if (arrow_col >= 0)
+        {
+            /*
+             * Each row group contains only one chunk so no reason to iterate 
+             * over chunks
+             */
+            arrow::Array       *array = festate->columns[arrow_col];
+            arrow::DataType    *arrow_type = festate->types[arrow_col];
+            int                 arrow_type_id = arrow_type->id();
+            MemoryContext       oldcxt;
+
+            festate->values[arrow_col].resize(BATCH_CAPACITY);
+            festate->nulls[arrow_col].resize(BATCH_CAPACITY);
+            festate->offset = festate->row;
+
+            /* Currently only primitive types and lists are supported */
+            if (arrow_type_id != arrow::Type::LIST)
+            {
+                int     i;
+                int64   row;
+
+                /* Read column batch */
+                for (i = 0, row = festate->offset;
+                     i < BATCH_CAPACITY && row < festate->num_rows;
+                     i++, row++)
+                {
+                    if (array->IsNull(row))
+                    {
+                        festate->nulls[arrow_col][i] = true;
+                        continue;
+                    }
+
+                    oldcxt = MemoryContextSwitchTo(festate->batch_cxt);
+                    festate->values[arrow_col][i] =
+                        read_primitive_type(array,
+                                            arrow_type_id,
+                                            row,
+                                            festate->castfuncs[attr]);
+                    festate->nulls[arrow_col][i] = false;
+                    MemoryContextSwitchTo(oldcxt);
+                }
+
+                festate->batch_size = i;
+            }
+            else
+            {
+                Oid     pg_type_id;
+                int     i;
+                int64   row;
+
+                pg_type_id = TupleDescAttr(slot->tts_tupleDescriptor, attr)->atttypid;
+                if (!type_is_array(pg_type_id))
+                    elog(ERROR,
+                         "parquet_fdw: cannot convert parquet column of type "
+                         "LIST to postgres column of scalar type");
+
+                /* Figure out the base element types */
+                pg_type_id = get_element_type(pg_type_id);
+                arrow_type_id = get_arrow_list_elem_type(arrow_type);
+
+                for (i = 0, row = festate->offset;
+                     i < BATCH_CAPACITY && row < festate->num_rows;
+                     i++, row++)
+                {
+                    arrow::ListArray   *larray = (arrow::ListArray *) array;
+
+                    if (array->IsNull(row))
+                    {
+                        festate->nulls[arrow_col][i] = true;
+                        continue;
+                    }
+
+                    std::shared_ptr<arrow::Array> slice =
+                        larray->values()->Slice(larray->value_offset(row),
+                                                larray->value_length(row));
+
+                    oldcxt = MemoryContextSwitchTo(festate->batch_cxt);
+                    festate->values[arrow_col][i] =
+                        nested_list_get_datum(slice.get(),
+                                              arrow_type_id,
+                                              pg_type_id,
+                                              festate->castfuncs[attr]);
+                    festate->nulls[arrow_col][i] = false;
+                    MemoryContextSwitchTo(oldcxt);
+                }
+
+                festate->batch_size = i;
+            } /* if arrow_type_id */
+        } /* if arrow_col */
+    }
 
     return true;
 }
@@ -1082,27 +1199,10 @@ parquetIterateForeignScan(ForeignScanState *node)
 
 	ExecClearTuple(slot);
 
-    if (festate->row >= festate->row_num)
+    if (festate->row - festate->offset >= festate->batch_size)
     {
-        /* Read next row group */
-        if (festate->row_group >= festate->reader->num_row_groups())
+        if (!read_next_batch(node))
             return slot;
-
-        try
-        {
-            if (!read_next_rowgroup(node))
-                return slot;
-        }
-        catch(const std::exception& e)
-        {
-            elog(ERROR,
-                 "parquet_fdw: failed to read row group %d: %s",
-                 festate->row_group, e.what());
-        }
-
-        /* Lookup cast funcs */
-        if (!festate->initialized)
-            initialize_castfuncs(node);
     }
 
     populate_slot(festate, slot);
@@ -1125,6 +1225,6 @@ parquetReScanForeignScan(ForeignScanState *node)
 
     festate->row_group = 0;
     festate->row = 0;
-    festate->row_num = 0;
+    festate->num_rows = 0;
 }
 
