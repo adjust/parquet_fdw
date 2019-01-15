@@ -81,6 +81,8 @@ parquet_fdw_validator(PG_FUNCTION_ARGS)
         }
         else if (strcmp(def->defname, "sorted") == 0)
             ;  /* do nothing */
+        else if (strcmp(def->defname, "batch_size") == 0)
+            ;
         else
         {
             ereport(ERROR,

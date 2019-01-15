@@ -39,7 +39,7 @@ extern "C"
 #include "utils/typcache.h"
 }
 
-#define BATCH_CAPACITY 1000
+#define DEFAULT_BATCH_CAPACITY 10000
 
 #define to_postgres_timestamp(tstype, i, ts)                    \
     switch ((tstype)->unit()) {                                 \
@@ -75,6 +75,7 @@ struct ParquetFdwPlanState
     char       *filename;
     Bitmapset  *attrs_sorted;
     Bitmapset  *attrs_used;    /* attributes actually used in query */
+    int         batch_capacity;
 };
 
 class ParquetFdwExecutionState
@@ -85,8 +86,11 @@ public:
     /* Column indices */
     std::vector<int> indices;
 
-    /* Mapping between slot attributes and parquet columns */
+    /* Mapping between slot attributes and arrow result set columns */
     std::vector<int> map;
+
+    /* Mapping between slot attributes and parquet schema columns */
+    std::vector<int> pq_map;
 
     std::vector<FmgrInfo *> castfuncs;
 
@@ -101,10 +105,12 @@ public:
     std::vector<arrow::DataType *>      types;
 
     MemoryContext                       batch_cxt;
-    std::vector<std::vector<Datum> >    values;
-    std::vector<std::vector<bool> >     nulls;
-    int64     offset; /* offset from the row group start */
+    Datum                             **values;
+    bool                              **nulls;
+    int64     offset;       /* offset from the row group start */
+    int       batch_capacity;
     int64     batch_size;
+    bool     *has_nulls;    /* per column statistics */
 
     bool     initialized;
 
@@ -130,7 +136,8 @@ static ParquetFdwExecutionState *
 create_parquet_state(ForeignScanState *scanstate,
                      const char *filename,
                      std::set<int> &attrs_used,
-                     std::list<RowGroupFilter> &filters)
+                     std::list<RowGroupFilter> &filters,
+                     int batch_capacity)
 {
     ParquetFdwExecutionState *festate;
 
@@ -144,10 +151,13 @@ create_parquet_state(ForeignScanState *scanstate,
 
     /* Create mapping between tuple descriptor and parquet columns. */
     festate->map.resize(tupleDesc->natts);
+    festate->pq_map.resize(tupleDesc->natts);
     for (int i = 0; i < tupleDesc->natts; i++)
     {
         AttrNumber attnum = i + 1 - FirstLowInvalidHeapAttributeNumber;
+
         festate->map[i] = -1;
+        festate->pq_map[i] = -1;
 
         /* Skip columns we don't intend to use in query */
         if (attrs_used.find(attnum) == attrs_used.end())
@@ -171,13 +181,24 @@ create_parquet_state(ForeignScanState *scanstate,
                 /* Found mapping! */
                 festate->indices.push_back(k);
                 festate->map[i] = festate->indices.size() - 1; /* index of last element */
+                festate->pq_map[i] = k;
                 break;
             }
         }
     }
 
-    festate->values.resize(festate->map.size());
-    festate->nulls.resize(festate->map.size());
+    /* Initialize batch cache */
+    festate->batch_capacity = batch_capacity;
+    festate->values = (Datum **) palloc0(sizeof(Datum *) * festate->map.size());
+    festate->nulls = (bool **) palloc0(sizeof(bool *) * festate->map.size());
+
+    for (int i = 0; i < festate->map.size(); i++)
+    {
+        festate->values[i] = (Datum *) palloc0(sizeof(Datum) * batch_capacity);
+        festate->nulls[i] = (bool *) palloc0(sizeof(bool) * batch_capacity);
+    }
+
+    festate->has_nulls = (bool *) palloc(sizeof(bool) * festate->map.size());
 
     return festate;
 }
@@ -210,6 +231,8 @@ get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
 	ForeignTable *table;
     ListCell     *lc;
 
+    fdw_private->batch_capacity = DEFAULT_BATCH_CAPACITY;
+
     table = GetForeignTable(relid);
     
     foreach(lc, table->options)
@@ -222,6 +245,11 @@ get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
         {
             fdw_private->attrs_sorted =
                 parse_attributes_list(defGetString(def), relid);
+        }
+        else if (strcmp(def->defname, "batch_size") == 0)
+        {
+            fdw_private->batch_capacity =
+                strtol(defGetString(def), NULL, 10);
         }
         else
             elog(ERROR, "unknown option '%s'", def->defname);
@@ -478,8 +506,9 @@ parquetGetForeignPlan(PlannerInfo *root,
 							scan_clauses,
 							scan_relid,
 							NIL,	/* no expressions to evaluate */
-							list_make2(makeString(fdw_private->filename),
-                                       attrs_used),
+							list_make3(makeString(fdw_private->filename),
+                                       attrs_used,
+                                       makeInteger(fdw_private->batch_capacity)),
 							NIL,	/* no custom tlist */
 							NIL,	/* no remote quals */
 							outer_plan);
@@ -497,6 +526,7 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
     char           *filename;
     std::set<int>   attrs_used;
     std::list<RowGroupFilter> filters;
+    int             batch_capacity;
     
 
     /* Unwrap fdw_private */
@@ -504,6 +534,8 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
 
     foreach (lc, attrs_used_list)
         attrs_used.insert(lfirst_int(lc));
+
+    batch_capacity = intVal((Value *) lthird(fdw_private));
     
     /* Build filters list */
     extract_rowgroup_filters(plan->scan.plan.qual, filters);
@@ -513,7 +545,8 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
         festate = create_parquet_state(node,
                                        filename,
                                        attrs_used,
-                                       filters);
+                                       filters,
+                                       batch_capacity);
     }
     catch(const std::exception& e)
     {
@@ -1010,16 +1043,44 @@ next_rowgroup:
         std::shared_ptr<arrow::DataType>              type;
         int     col;
 
-        col = festate->map[filter.attnum - 1];
+        //col = festate->map[filter.attnum - 1];
+        col = festate->pq_map[filter.attnum - 1];
         colchunk = rowgroup->ColumnChunk(col);
         stats = colchunk->statistics();
         type = schema->field(col)->type();
+
+        /* TODO: check if stats is null */
 
         if (!row_group_matches_filter(stats.get(), type.get(), &filter))
         {
             elog(DEBUG1, "parquet_fdw: skip rowgroup %d", festate->row_group);
             festate->row_group++;
             goto next_rowgroup;
+        }
+    }
+
+    /* Determine which columns has null values */
+    /* TODO: rewrite this piece to get rid of repetitive code */
+    for (int i = 0; i < festate->pq_map.size(); i++)
+    {
+        std::unique_ptr<parquet::ColumnChunkMetaData> colchunk;
+        std::shared_ptr<parquet::RowGroupStatistics>  stats;
+
+        if (festate->pq_map[i] < 0)
+            continue;
+
+        colchunk = rowgroup->ColumnChunk(i);
+        stats = colchunk->statistics();
+
+        if (stats)
+        {
+            festate->has_nulls[i] = (stats->null_count() > 0);
+            //elog(LOG, "col %i has_nulls=%i", i, festate->has_nulls[i]); 
+        }
+        else
+        {
+            festate->has_nulls[i] = true;
+            //elog(LOG, "col %i has no statistics", i); 
         }
     }
 
@@ -1065,6 +1126,8 @@ read_next_batch(ForeignScanState *node)
 	ForeignScan        *plan = (ForeignScan *) node->ss.ps.plan;
     TupleTableSlot     *slot = node->ss.ss_ScanTupleSlot;
 
+	MemoryContextReset(festate->batch_cxt);
+
     if (festate->row >= festate->num_rows)
     {
         /* Are there row groups left to read? */
@@ -1108,8 +1171,6 @@ read_next_batch(ForeignScanState *node)
             int                 arrow_type_id = arrow_type->id();
             MemoryContext       oldcxt;
 
-            festate->values[arrow_col].resize(BATCH_CAPACITY);
-            festate->nulls[arrow_col].resize(BATCH_CAPACITY);
             festate->offset = festate->row;
 
             /* Currently only primitive types and lists are supported */
@@ -1120,10 +1181,10 @@ read_next_batch(ForeignScanState *node)
 
                 /* Read column batch */
                 for (i = 0, row = festate->offset;
-                     i < BATCH_CAPACITY && row < festate->num_rows;
+                     i < festate->batch_capacity && row < festate->num_rows;
                      i++, row++)
                 {
-                    if (array->IsNull(row))
+                    if (festate->has_nulls[arrow_col] && array->IsNull(row))
                     {
                         festate->nulls[arrow_col][i] = true;
                         continue;
@@ -1158,12 +1219,13 @@ read_next_batch(ForeignScanState *node)
                 arrow_type_id = get_arrow_list_elem_type(arrow_type);
 
                 for (i = 0, row = festate->offset;
-                     i < BATCH_CAPACITY && row < festate->num_rows;
+                     i < festate->batch_capacity && row < festate->num_rows;
                      i++, row++)
                 {
                     arrow::ListArray   *larray = (arrow::ListArray *) array;
 
-                    if (array->IsNull(row))
+                    //if (array->IsNull(row))
+                    if (festate->has_nulls[arrow_col] && array->IsNull(row))
                     {
                         festate->nulls[arrow_col][i] = true;
                         continue;
