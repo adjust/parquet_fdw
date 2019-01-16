@@ -17,6 +17,8 @@ or in case when PostgreSQL is installed in a custom location:
 ```sh
 make install PG_CONFIG=/path/to/pg_config
 ```
+Also additional compilation flags can be passed through `CCFLAGS` variable.
+
 After extension was successfully installed run in `psql`:
 ```sql
 create extension parquet_fdw;

@@ -19,5 +19,4 @@ parquet.bc:
 	$(COMPILE.cxx.bc) $(CCFLAGS) $(CPPFLAGS) -fPIC -c -o $@ parquet_impl.cpp
 
 parquet.o:
-	g++ $(CPPFLAGS) -std=c++11 -ggdb3 parquet_impl.cpp $(PG_LIBS) -c -fPIC $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)
-
+	g++ -std=c++11 -O3 $(CPPFLAGS) $(CCFLAGS) parquet_impl.cpp $(PG_LIBS) -c -fPIC $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)
