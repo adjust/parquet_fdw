@@ -76,6 +76,7 @@ struct ParquetFdwPlanState
     Bitmapset  *attrs_sorted;
     Bitmapset  *attrs_used;    /* attributes actually used in query */
     int         batch_capacity;
+    bool        use_mmap;
 };
 
 class ParquetFdwExecutionState
@@ -130,14 +131,14 @@ public:
     /* Wether object is properly initialized */
     bool     initialized;
 
-    ParquetFdwExecutionState(const char *filename)
+    ParquetFdwExecutionState(const char *filename, bool use_mmap)
         : row_group(0), row(0), num_rows(0), batch_size(-1),
           batch_offset(0), initialized(false)
     {
         reader.reset(
-                new parquet::arrow::FileReader(
-                        arrow::default_memory_pool(),
-                        parquet::ParquetFileReader::OpenFile(filename)));
+            new parquet::arrow::FileReader(
+                    arrow::default_memory_pool(),
+                    parquet::ParquetFileReader::OpenFile(filename, use_mmap)));
     }
 };
 
@@ -146,11 +147,12 @@ create_parquet_state(ForeignScanState *scanstate,
                      const char *filename,
                      std::set<int> &attrs_used,
                      std::list<RowGroupFilter> &filters,
-                     int batch_capacity)
+                     int batch_capacity,
+                     bool use_mmap)
 {
     ParquetFdwExecutionState *festate;
 
-    festate = new ParquetFdwExecutionState(filename);
+    festate = new ParquetFdwExecutionState(filename, use_mmap);
     festate->filters = std::move(filters);
     scanstate->fdw_state = festate;
     auto schema = festate->reader->parquet_reader()->metadata()->schema();
@@ -240,6 +242,7 @@ get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
     ListCell     *lc;
 
     fdw_private->batch_capacity = DEFAULT_BATCH_CAPACITY;
+    fdw_private->use_mmap = false;
 
     table = GetForeignTable(relid);
     
@@ -256,8 +259,17 @@ get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
         }
         else if (strcmp(def->defname, "batch_size") == 0)
         {
+            /* TODO: use parse_int() */
             fdw_private->batch_capacity =
                 strtol(defGetString(def), NULL, 10);
+        }
+        else if (strcmp(def->defname, "use_mmap") == 0)
+        { 
+            if (!parse_bool(defGetString(def), &fdw_private->use_mmap))
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("invalid value for boolean option \"%s\": %s",
+                                def->defname, defGetString(def))));
         }
         else
             elog(ERROR, "unknown option '%s'", def->defname);
@@ -523,9 +535,10 @@ parquetGetForeignPlan(PlannerInfo *root,
 							scan_clauses,
 							scan_relid,
 							NIL,	/* no expressions to evaluate */
-							list_make3(makeString(fdw_private->filename),
+							list_make4(makeString(fdw_private->filename),
                                        attrs_used,
-                                       makeInteger(fdw_private->batch_capacity)),
+                                       makeInteger(fdw_private->batch_capacity),
+                                       makeInteger(fdw_private->use_mmap)),
 							NIL,	/* no custom tlist */
 							NIL,	/* no remote quals */
 							outer_plan);
@@ -544,7 +557,7 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
     std::set<int>   attrs_used;
     std::list<RowGroupFilter> filters;
     int             batch_capacity;
-    
+    bool            use_mmap; 
 
     /* Unwrap fdw_private */
     filename = strVal((Value *) linitial(fdw_private));
@@ -553,6 +566,7 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
         attrs_used.insert(lfirst_int(lc));
 
     batch_capacity = intVal((Value *) lthird(fdw_private));
+    use_mmap = (bool) intVal((Value *) lfourth(fdw_private));
     
     /* Build filters list */
     extract_rowgroup_filters(plan->scan.plan.qual, filters);
@@ -563,7 +577,8 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
                                        filename,
                                        attrs_used,
                                        filters,
-                                       batch_capacity);
+                                       batch_capacity,
+                                       use_mmap);
     }
     catch(const std::exception& e)
     {

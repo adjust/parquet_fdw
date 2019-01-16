@@ -8,6 +8,7 @@
 #include "commands/defrem.h"
 #include "foreign/fdwapi.h"
 #include "optimizer/planmain.h"
+#include "utils/builtins.h"
 #include "utils/elog.h"
 
 
@@ -82,7 +83,19 @@ parquet_fdw_validator(PG_FUNCTION_ARGS)
         else if (strcmp(def->defname, "sorted") == 0)
             ;  /* do nothing */
         else if (strcmp(def->defname, "batch_size") == 0)
-            ;
+            /* Check that int value is valid */
+            strtol(defGetString(def), NULL, 10);
+        else if (strcmp(def->defname, "use_mmap") == 0)
+        {
+            /* Check that bool value is valid */
+            bool    use_mmap;
+
+            if (!parse_bool(defGetString(def), &use_mmap))
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("invalid value for boolean option \"%s\": %s",
+                                def->defname, defGetString(def))));
+        }
         else
         {
             ereport(ERROR,
