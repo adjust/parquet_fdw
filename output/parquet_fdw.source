@@ -27,6 +27,24 @@ SELECT * FROM example;
    6 | {16,17,18} | tres  | 2018-01-06 00:00:00 | 2018-01-06 | f
 (6 rows)
 
+-- no explicit columns mentions
+SELECT 1 as x FROM example;
+ x 
+---
+ 1
+ 1
+ 1
+ 1
+ 1
+ 1
+(6 rows)
+
+SELECT count(*) as count FROM example;
+ count 
+-------
+     6
+(1 row)
+
 -- sorting
 EXPLAIN (COSTS OFF) SELECT * FROM example ORDER BY one;
        QUERY PLAN        

@@ -240,7 +240,7 @@ estimate_costs(PlannerInfo *root, RelOptInfo *baserel,
 }
 
 static void
-extract_used_attributes(RelOptInfo *baserel, Bitmapset **attrs_used)
+extract_used_attributes(RelOptInfo *baserel)
 {
     ParquetFdwPlanState *fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
     ListCell *lc;
@@ -257,6 +257,12 @@ extract_used_attributes(RelOptInfo *baserel, Bitmapset **attrs_used)
                        baserel->relid,
                        &fdw_private->attrs_used);
     }
+
+    if (bms_is_empty(fdw_private->attrs_used))
+    {
+        bms_free(fdw_private->attrs_used);
+        fdw_private->attrs_used = bms_make_singleton(1 - FirstLowInvalidHeapAttributeNumber);
+    }
 }
 
 extern "C" void
@@ -270,14 +276,13 @@ parquetGetForeignPaths(PlannerInfo *root,
     List       *pathkeys = NIL;
     ListCell   *lc;
 
-	/* Estimate costs */
-	estimate_costs(root, baserel, &startup_cost, &total_cost);
-
-    /*
-     * Collect used attributes to reduce number of read columns during scan
-     */
     fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
-    extract_used_attributes(baserel, &fdw_private->attrs_used);
+
+    /* Estimate costs */
+    estimate_costs(root, baserel, &startup_cost, &total_cost);
+
+    /* Collect used attributes to reduce number of read columns during scan */
+    extract_used_attributes(baserel);
 
     /* Build pathkeys based on attrs_sorted */
     int attnum = -1;
@@ -994,7 +999,6 @@ read_next_rowgroup(ForeignScanState *node)
 	ForeignScan        *plan = (ForeignScan *) node->ss.ps.plan;
     TupleTableSlot     *slot = node->ss.ss_ScanTupleSlot;
     std::shared_ptr<arrow::Schema> schema;
-    ListCell *lc;
     arrow::Status status;
     int natts = slot->tts_tupleDescriptor->natts;
 
@@ -1011,7 +1015,6 @@ next_rowgroup:
     if (festate->row_group >= festate->reader->num_row_groups())
         return false;
 
-    bool skip = false;
     auto rowgroup = festate->reader
                         ->parquet_reader()
                         ->metadata()
