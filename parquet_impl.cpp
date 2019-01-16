@@ -772,10 +772,12 @@ read_primitive_type(arrow::Array *array,
         case arrow::Type::BINARY:
         {
             arrow::BinaryArray *binarray = (arrow::BinaryArray *) array;
-            std::string value = binarray->GetString(i);
+
+            int32_t vallen = 0;
+            const char *value = reinterpret_cast<const char*>(binarray->GetValue(i, &vallen));
 
             /* Build bytea */
-            bytea *b = cstring_to_text_with_len(value.data(), value.size());
+            bytea *b = cstring_to_text_with_len(value, vallen);
 
             res = PointerGetDatum(b);
             break;
