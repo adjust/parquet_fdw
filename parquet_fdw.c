@@ -17,11 +17,11 @@ PG_MODULE_MAGIC;
 
 /* FDW routines */
 extern void parquetGetForeignRelSize(PlannerInfo *root,
-					  RelOptInfo *baserel,
-					  Oid foreigntableid);
+                      RelOptInfo *baserel,
+                      Oid foreigntableid);
 extern void parquetGetForeignPaths(PlannerInfo *root,
-					RelOptInfo *baserel,
-					Oid foreigntableid);
+                    RelOptInfo *baserel,
+                    Oid foreigntableid);
 extern ForeignScan *parquetGetForeignPlan(PlannerInfo *root,
                       RelOptInfo *baserel,
                       Oid foreigntableid,
@@ -38,17 +38,17 @@ PG_FUNCTION_INFO_V1(parquet_fdw_handler);
 Datum
 parquet_fdw_handler(PG_FUNCTION_ARGS)
 {
-	FdwRoutine *fdwroutine = makeNode(FdwRoutine);
+    FdwRoutine *fdwroutine = makeNode(FdwRoutine);
 
-	fdwroutine->GetForeignRelSize = parquetGetForeignRelSize;
-	fdwroutine->GetForeignPaths = parquetGetForeignPaths;
-	fdwroutine->GetForeignPlan = parquetGetForeignPlan;
-	fdwroutine->BeginForeignScan = parquetBeginForeignScan;
-	fdwroutine->IterateForeignScan = parquetIterateForeignScan;
-	fdwroutine->ReScanForeignScan = parquetReScanForeignScan;
-	fdwroutine->EndForeignScan = parquetEndForeignScan;
+    fdwroutine->GetForeignRelSize = parquetGetForeignRelSize;
+    fdwroutine->GetForeignPaths = parquetGetForeignPaths;
+    fdwroutine->GetForeignPlan = parquetGetForeignPlan;
+    fdwroutine->BeginForeignScan = parquetBeginForeignScan;
+    fdwroutine->IterateForeignScan = parquetIterateForeignScan;
+    fdwroutine->ReScanForeignScan = parquetReScanForeignScan;
+    fdwroutine->EndForeignScan = parquetEndForeignScan;
 
-	PG_RETURN_POINTER(fdwroutine);
+    PG_RETURN_POINTER(fdwroutine);
 }
 
 PG_FUNCTION_INFO_V1(parquet_fdw_validator);
