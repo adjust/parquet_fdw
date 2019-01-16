@@ -762,13 +762,6 @@ read_primitive_type(arrow::Array *array,
             break;
         }
         case arrow::Type::STRING:
-        {
-            arrow::StringArray *stringarray = (arrow::StringArray *) array;
-            std::string value = stringarray->GetString(i);
-
-            res = CStringGetTextDatum(value.c_str());
-            break;
-        }
         case arrow::Type::BINARY:
         {
             arrow::BinaryArray *binarray = (arrow::BinaryArray *) array;
