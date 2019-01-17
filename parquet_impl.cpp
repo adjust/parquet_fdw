@@ -227,7 +227,8 @@ parse_attributes_list(char *start, Oid relid)
 
     while ((token = strtok(start, delim)) != NULL)
     {
-        attnum = get_attnum(relid, token);
+        if ((attnum = get_attnum(relid, token)) == InvalidAttrNumber)
+            elog(ERROR, "paruqet_fdw: invalid attribute name '%s'", token);
         attrs = bms_add_member(attrs, attnum);
         start = NULL;
     }
