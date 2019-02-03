@@ -79,6 +79,13 @@ struct ParquetFdwPlanState
     bool        use_mmap;
 };
 
+struct ChunkInfo
+{
+    int     chunk;      /* current chunk number */
+    int64   pos;        /* current pos within chunk */
+    int64   len;        /* current chunk length */
+};
+
 class ParquetFdwExecutionState
 {
 public:
@@ -121,6 +128,7 @@ public:
     uint32_t        row_group;      /* current row group index */
     uint32_t        row;            /* current row within row group */
     uint32_t        num_rows;       /* total rows in row group */
+    std::vector<ChunkInfo> chunks;  /* current chunk and position per-column */
 
     /*
      * Filters built from query restrictions that help to filter out row
@@ -650,7 +658,7 @@ initialize_castfuncs(ForeignScanState *node)
             continue;
         }
 
-        arrow::Array *column = festate->columns[arrow_col];
+        std::shared_ptr<arrow::Column> column = festate->table->column(festate->map[i]);
         arrow::DataType *type = festate->types[arrow_col];
         int     type_id = type->id();
         int     src_type,
@@ -1109,20 +1117,18 @@ next_rowgroup:
         throw std::runtime_error("got empty table");
 
     /* Fill festate->columns and festate->types */
-    festate->columns.clear();
+    /* TODO: don't clear each time */
+    festate->chunks.clear();
     festate->types.clear();
     for (int i = 0; i < natts; i++)
     {
         if (festate->map[i] >= 0)
         {
+            ChunkInfo chunkInfo = { .chunk = 0, .pos = 0, .len = 0 };
             auto column = festate->table->column(festate->map[i]);
 
-            /*
-             * Each row group contains only one chunk so no reason to iterate 
-             * over chunks
-             */
-            festate->columns.push_back(column->data()->chunk(0).get());
             festate->types.push_back(column->type().get());
+            festate->chunks.push_back(chunkInfo);
         }
     }
 
@@ -1182,29 +1188,37 @@ read_next_batch(ForeignScanState *node)
          * */
         if (arrow_col >= 0)
         {
-            /*
-             * Each row group contains only one chunk so no reason to iterate 
-             * over chunks
-             */
-            arrow::Array       *array = festate->columns[arrow_col];
+            ChunkInfo &chunkInfo = festate->chunks[arrow_col];
+            auto column = festate->table->column(arrow_col);
+            arrow::Array       *array = column->data()->chunk(chunkInfo.chunk).get();
             arrow::DataType    *arrow_type = festate->types[arrow_col];
             int                 arrow_type_id = arrow_type->id();
             MemoryContext       oldcxt;
 
             festate->batch_offset = festate->row;
+            chunkInfo.len = array->length();
 
             /* Currently only primitive types and lists are supported */
             if (arrow_type_id != arrow::Type::LIST)
             {
                 int     i;
-                int64   row;
+                int64   offset;
 
                 /* Read column batch */
-                for (i = 0, row = festate->batch_offset;
-                     i < festate->batch_capacity && row < festate->num_rows;
-                     i++, row++)
+                for (i = 0; i < festate->batch_capacity; i++)
                 {
-                    if (festate->has_nulls[arrow_col] && array->IsNull(row))
+                    if (chunkInfo.pos >= chunkInfo.len)
+                    {
+                        /* There are no more chunks */
+                        if (++chunkInfo.chunk >= column->data()->num_chunks())
+                            break;
+
+                        array = column->data()->chunk(chunkInfo.chunk).get();
+                        chunkInfo.pos = 0;
+                        chunkInfo.len = array->length();
+                    }
+
+                    if (festate->has_nulls[arrow_col] && array->IsNull(chunkInfo.pos))
                     {
                         festate->nulls[arrow_col][i] = true;
                         continue;
@@ -1214,10 +1228,12 @@ read_next_batch(ForeignScanState *node)
                     festate->values[arrow_col][i] =
                         read_primitive_type(array,
                                             arrow_type_id,
-                                            row,
+                                            chunkInfo.pos,
                                             festate->castfuncs[attr]);
                     festate->nulls[arrow_col][i] = false;
                     MemoryContextSwitchTo(oldcxt);
+
+                    chunkInfo.pos++;
                 }
 
                 festate->batch_size = i;
@@ -1238,21 +1254,32 @@ read_next_batch(ForeignScanState *node)
                 pg_type_id = get_element_type(pg_type_id);
                 arrow_type_id = get_arrow_list_elem_type(arrow_type);
 
-                for (i = 0, row = festate->batch_offset;
-                     i < festate->batch_capacity && row < festate->num_rows;
-                     i++, row++)
+                for (i = 0; i < festate->batch_capacity; i++)
                 {
+                    if (chunkInfo.pos >= chunkInfo.len)
+                    {
+                        chunkInfo.chunk++;
+
+                        /* There are no more chunks */
+                        if (chunkInfo.chunk >= column->data()->num_chunks())
+                            break;
+
+                        array = column->data()->chunk(chunkInfo.chunk).get();
+                        chunkInfo.pos = 0;
+                        chunkInfo.len = array->length();
+                    }
+                    int64 pos = chunkInfo.pos;
                     arrow::ListArray   *larray = (arrow::ListArray *) array;
 
-                    if (festate->has_nulls[arrow_col] && array->IsNull(row))
+                    if (festate->has_nulls[arrow_col] && array->IsNull(pos))
                     {
                         festate->nulls[arrow_col][i] = true;
                         continue;
                     }
 
                     std::shared_ptr<arrow::Array> slice =
-                        larray->values()->Slice(larray->value_offset(row),
-                                                larray->value_length(row));
+                        larray->values()->Slice(larray->value_offset(pos),
+                                                larray->value_length(pos));
 
                     oldcxt = MemoryContextSwitchTo(festate->batch_cxt);
                     festate->values[arrow_col][i] =
@@ -1262,6 +1289,8 @@ read_next_batch(ForeignScanState *node)
                                               festate->castfuncs[attr]);
                     festate->nulls[arrow_col][i] = false;
                     MemoryContextSwitchTo(oldcxt);
+
+                    chunkInfo.pos++;
                 }
 
                 festate->batch_size = i;
