@@ -1101,9 +1101,9 @@ next_rowgroup:
         stats = rowgroup->ColumnChunk(festate->indices[arrow_col])->statistics();
 
         if (stats)
-            festate->has_nulls[i] = (stats->null_count() > 0);
+            festate->has_nulls[arrow_col] = (stats->null_count() > 0);
         else
-            festate->has_nulls[i] = true;
+            festate->has_nulls[arrow_col] = true;
     }
 
     status = festate->reader
@@ -1205,7 +1205,7 @@ read_next_batch(ForeignScanState *node)
                 int64   offset;
 
                 /* Read column batch */
-                for (i = 0; i < festate->batch_capacity; i++)
+                for (i = 0; i < festate->batch_capacity; i++, chunkInfo.pos++)
                 {
                     if (chunkInfo.pos >= chunkInfo.len)
                     {
@@ -1232,8 +1232,6 @@ read_next_batch(ForeignScanState *node)
                                             festate->castfuncs[attr]);
                     festate->nulls[arrow_col][i] = false;
                     MemoryContextSwitchTo(oldcxt);
-
-                    chunkInfo.pos++;
                 }
 
                 festate->batch_size = i;
@@ -1254,7 +1252,7 @@ read_next_batch(ForeignScanState *node)
                 pg_type_id = get_element_type(pg_type_id);
                 arrow_type_id = get_arrow_list_elem_type(arrow_type);
 
-                for (i = 0; i < festate->batch_capacity; i++)
+                for (i = 0; i < festate->batch_capacity; i++, chunkInfo.pos++)
                 {
                     if (chunkInfo.pos >= chunkInfo.len)
                     {
@@ -1289,8 +1287,6 @@ read_next_batch(ForeignScanState *node)
                                               festate->castfuncs[attr]);
                     festate->nulls[arrow_col][i] = false;
                     MemoryContextSwitchTo(oldcxt);
-
-                    chunkInfo.pos++;
                 }
 
                 festate->batch_size = i;
