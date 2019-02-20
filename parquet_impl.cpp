@@ -823,6 +823,32 @@ read_primitive_type(arrow::Array *array,
 }
 
 /*
+ * GetPrimitiveValues
+ *      Get plain C value array. Copy-pasted from Arrow.
+ */
+template <typename T>
+inline const T* GetPrimitiveValues(const arrow::Array& arr) {
+  if (arr.length() == 0) {
+    return nullptr;
+  }
+  const auto& prim_arr = arrow::internal::checked_cast<const arrow::PrimitiveArray&>(arr);
+  const T* raw_values = reinterpret_cast<const T*>(prim_arr.values()->data());
+  return raw_values + arr.offset();
+}
+
+/* 
+ * copy_to_c_array
+ *      memcpy plain values from Arrow array to a C array.
+ */
+template<typename T> inline void
+copy_to_c_array(T *values, const arrow::Array *array, int elem_size)
+{
+    const T *in = GetPrimitiveValues<T>(*array);
+
+    memcpy(values, in, elem_size * array->length());
+}
+
+/*
  * nested_list_get_datum
  *      Returns postgres array build from elements of array. Only one
  *      dimensional arrays are supported.
@@ -845,6 +871,22 @@ nested_list_get_datum(arrow::Array *array, int type_id,
     get_typlenbyvalalign(elem_type, &elem_len, &elem_byval, &elem_align);
 
     /* Fill values and nulls arrays */
+    if (array->null_count() == 0)
+    {
+        /*
+         * Ok, there are no nulls, so probably we could just memcpy the
+         * entire array
+         */
+        switch(type_id)
+        {
+            case arrow::Type::INT32:
+                copy_to_c_array<int32_t>((int32_t *) values, array, elem_len);
+                goto construct_array;
+            case arrow::Type::INT64:
+                copy_to_c_array<int64_t>((int64_t *) values, array, elem_len);
+                goto construct_array;
+        }
+    }
     for (int64_t i = 0; i < array->length(); ++i)
     {
         if (!array->IsNull(i))
@@ -857,6 +899,7 @@ nested_list_get_datum(arrow::Array *array, int type_id,
         }
     }
 
+construct_array:
     /* Construct one dimensional array */
     dims[0] = array->length();
     lbs[0] = 1;
