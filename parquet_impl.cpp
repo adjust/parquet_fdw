@@ -924,15 +924,16 @@ populate_slot(ParquetFdwExecutionState *festate, TupleTableSlot *slot)
                 if (festate->has_nulls[arrow_col] && array->IsNull(chunkInfo.pos))
                 {
                     slot->tts_isnull[attr] = true;
-                    continue;
                 }
-
-                slot->tts_values[attr] = 
-                    read_primitive_type(array,
-                                        arrow_type_id,
-                                        chunkInfo.pos,
-                                        festate->castfuncs[attr]);
-                slot->tts_isnull[attr] = false;
+                else
+                {
+                    slot->tts_values[attr] = 
+                        read_primitive_type(array,
+                                            arrow_type_id,
+                                            chunkInfo.pos,
+                                            festate->castfuncs[attr]);
+                    slot->tts_isnull[attr] = false;
+                }
             }
             else
             {
@@ -968,19 +969,20 @@ populate_slot(ParquetFdwExecutionState *festate, TupleTableSlot *slot)
                 if (festate->has_nulls[arrow_col] && array->IsNull(pos))
                 {
                     slot->tts_isnull[attr] = true;
-                    continue;
                 }
+                else
+                {
+                    std::shared_ptr<arrow::Array> slice =
+                        larray->values()->Slice(larray->value_offset(pos),
+                                                larray->value_length(pos));
 
-                std::shared_ptr<arrow::Array> slice =
-                    larray->values()->Slice(larray->value_offset(pos),
-                                            larray->value_length(pos));
-
-                slot->tts_values[attr] =
-                    nested_list_get_datum(slice.get(),
-                                          arrow_type_id,
-                                          pg_type_id,
-                                          festate->castfuncs[attr]);
-                slot->tts_isnull[attr] = false;
+                    slot->tts_values[attr] =
+                        nested_list_get_datum(slice.get(),
+                                              arrow_type_id,
+                                              pg_type_id,
+                                              festate->castfuncs[attr]);
+                    slot->tts_isnull[attr] = false;
+                }
             }
 
             chunkInfo.pos++;
