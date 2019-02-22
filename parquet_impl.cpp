@@ -2,6 +2,9 @@
  * Parquet processing implementation
  */
 
+#include <list>
+#include <set>
+
 #include "arrow/api.h"
 #include "arrow/io/api.h"
 #include "arrow/array.h"
@@ -9,6 +12,7 @@
 #include "parquet/arrow/schema.h"
 #include "parquet/exception.h"
 #include "parquet/file_reader.h"
+#include "parquet/statistics.h"
 
 extern "C"
 {
