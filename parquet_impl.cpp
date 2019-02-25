@@ -132,6 +132,12 @@ public:
      */
     std::list<RowGroupFilter>       filters;
 
+    MemoryContext segments_cxt;
+    char *segment_start_ptr;
+    char *segment_cur_ptr;
+    char *segment_last_ptr;
+
+
     /* Wether object is properly initialized */
     bool     initialized;
 
@@ -153,6 +159,7 @@ create_parquet_state(ForeignScanState *scanstate,
                      bool use_mmap)
 {
     ParquetFdwExecutionState *festate;
+	EState	   *estate = scanstate->ss.ps.state;
 
     festate = new ParquetFdwExecutionState(filename, use_mmap);
     festate->filters = std::move(filters);
@@ -200,6 +207,13 @@ create_parquet_state(ForeignScanState *scanstate,
     }
 
     festate->has_nulls = (bool *) palloc(sizeof(bool) * festate->map.size());
+
+    festate->segments_cxt = AllocSetContextCreate(estate->es_query_cxt,
+                                                  "parquet_fdw tuple data",
+                                                  ALLOCSET_DEFAULT_SIZES);
+    festate->segment_start_ptr = NULL;
+    festate->segment_cur_ptr = NULL;
+    festate->segment_last_ptr = NULL;
 
     return festate;
 }
@@ -705,7 +719,8 @@ initialize_castfuncs(ForeignScanState *node)
  *      Returns primitive type value from arrow array
  */
 static Datum
-read_primitive_type(arrow::Array *array,
+read_primitive_type(ParquetFdwExecutionState *festate,
+                    arrow::Array *array,
                     int type_id, int64_t i,
                     FmgrInfo *castfunc)
 {
@@ -746,7 +761,21 @@ read_primitive_type(arrow::Array *array,
             const char *value = reinterpret_cast<const char*>(binarray->GetValue(i, &vallen));
 
             /* Build bytea */
-            bytea *b = cstring_to_text_with_len(value, vallen);
+            bytea *b;
+            int64 bytea_len = vallen + VARHDRSZ;
+            if (festate->segment_last_ptr - festate->segment_cur_ptr < bytea_len)
+            {
+                MemoryContext oldctx = MemoryContextSwitchTo(festate->segments_cxt);
+                festate->segment_start_ptr = (char *) palloc(1024 * 1024);
+                festate->segment_cur_ptr = festate->segment_start_ptr;
+                festate->segment_last_ptr = festate->segment_start_ptr + 1024 * 1024 - 1;
+                MemoryContextSwitchTo(oldctx);
+            }
+
+            b = (bytea *) festate->segment_cur_ptr;
+            festate->segment_cur_ptr += bytea_len;
+            SET_VARSIZE(b, bytea_len);
+            memcpy(VARDATA(b), value, vallen);
 
             res = PointerGetDatum(b);
             break;
@@ -821,7 +850,8 @@ copy_to_c_array(T *values, const arrow::Array *array, int elem_size)
  *      dimensional arrays are supported.
  */
 static Datum
-nested_list_get_datum(arrow::Array *array, int type_id,
+nested_list_get_datum(ParquetFdwExecutionState *festate,
+                      arrow::Array *array, int type_id,
                       Oid elem_type, FmgrInfo *castfunc)
 {
     ArrayType  *res;
@@ -857,7 +887,7 @@ nested_list_get_datum(arrow::Array *array, int type_id,
     for (int64_t i = 0; i < array->length(); ++i)
     {
         if (!array->IsNull(i))
-            values[i] = read_primitive_type(array, type_id, i, castfunc);
+            values[i] = read_primitive_type(festate, array, type_id, i, castfunc);
         else
         {
             if (!nulls)
@@ -932,7 +962,8 @@ populate_slot(ParquetFdwExecutionState *festate, TupleTableSlot *slot)
                 else
                 {
                     slot->tts_values[attr] = 
-                        read_primitive_type(array,
+                        read_primitive_type(festate,
+                                            array,
                                             arrow_type_id,
                                             chunkInfo.pos,
                                             festate->castfuncs[attr]);
@@ -981,7 +1012,8 @@ populate_slot(ParquetFdwExecutionState *festate, TupleTableSlot *slot)
                                                 larray->value_length(pos));
 
                     slot->tts_values[attr] =
-                        nested_list_get_datum(slice.get(),
+                        nested_list_get_datum(festate,
+                                              slice.get(),
                                               arrow_type_id,
                                               pg_type_id,
                                               festate->castfuncs[attr]);
