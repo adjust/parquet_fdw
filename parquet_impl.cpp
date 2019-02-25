@@ -43,7 +43,7 @@ extern "C"
 #include "utils/typcache.h"
 }
 
-#define DEFAULT_BATCH_CAPACITY 10000
+#define SEGMENT_SIZE (1024 * 1024)
 
 #define to_postgres_timestamp(tstype, i, ts)                    \
     switch ((tstype)->unit()) {                                 \
@@ -132,10 +132,14 @@ public:
      */
     std::list<RowGroupFilter>       filters;
 
-    MemoryContext segments_cxt;
-    char *segment_start_ptr;
-    char *segment_cur_ptr;
-    char *segment_last_ptr;
+    /*
+     * Special memory segment to speed up bytea/Text allocations.
+     */
+    MemoryContext                   segments_cxt;
+    char                           *segment_start_ptr;
+    char                           *segment_cur_ptr;
+    char                           *segment_last_ptr;
+    std::list<char *>               garbage_segments;
 
 
     /* Wether object is properly initialized */
@@ -765,11 +769,22 @@ read_primitive_type(ParquetFdwExecutionState *festate,
             int64 bytea_len = vallen + VARHDRSZ;
             if (festate->segment_last_ptr - festate->segment_cur_ptr < bytea_len)
             {
-                MemoryContext oldctx = MemoryContextSwitchTo(festate->segments_cxt);
-                festate->segment_start_ptr = (char *) palloc(1024 * 1024);
+                MemoryContext oldcxt;
+                
+                /*
+                 * Recycle the last segment at the next iteration (if there
+                 * was one)
+                 */
+                if (festate->segment_start_ptr)
+                    festate->garbage_segments.
+                        push_back(festate->segment_start_ptr);
+
+                oldcxt = MemoryContextSwitchTo(festate->segments_cxt);
+                festate->segment_start_ptr = (char *) palloc(SEGMENT_SIZE);
                 festate->segment_cur_ptr = festate->segment_start_ptr;
-                festate->segment_last_ptr = festate->segment_start_ptr + 1024 * 1024 - 1;
-                MemoryContextSwitchTo(oldctx);
+                festate->segment_last_ptr =
+                    festate->segment_start_ptr + SEGMENT_SIZE - 1;
+                MemoryContextSwitchTo(oldcxt);
             }
 
             b = (bytea *) festate->segment_cur_ptr;
@@ -1279,13 +1294,15 @@ parquetIterateForeignScan(ForeignScanState *node)
 
 	ExecClearTuple(slot);
 
-    /*
-    if (festate->row - festate->batch_offset >= festate->batch_size)
+    /* recycle old segments if any */
+    if (!festate->garbage_segments.empty())
     {
-        if (!read_next_batch(node))
-            return slot;
+        for (auto it : festate->garbage_segments)
+            pfree(it);
+        festate->garbage_segments.clear();
+        elog(DEBUG1, "parquet_fdw: garbage segments recycled");
     }
-    */
+
     if (festate->row >= festate->num_rows)
     {
         /* Are there row groups left to read? */
