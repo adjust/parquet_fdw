@@ -719,6 +719,49 @@ initialize_castfuncs(ForeignScanState *node)
 }
 
 /*
+ * fast_alloc
+ *      Preallocate a big memory segment and distribute blocks from it. When
+ *      segment is exhausted it is added to garbage_segments list and freed
+ *      on the next executor's iteration. If requested size is bigger that
+ *      SEGMENT_SIZE then just palloc is used.
+ */
+static inline void *
+fast_alloc(ParquetFdwExecutionState *festate, Size size)
+{
+    void   *ret;
+
+    /* If allocation is bigger than segment then just palloc */
+    if (size > SEGMENT_SIZE)
+        return palloc(size);
+
+    /* If there is not enough space in current segment create a new one */
+    if (festate->segment_last_ptr - festate->segment_cur_ptr < size)
+    {
+        MemoryContext oldcxt;
+        
+        /*
+         * Recycle the last segment at the next iteration (if there
+         * was one)
+         */
+        if (festate->segment_start_ptr)
+            festate->garbage_segments.
+                push_back(festate->segment_start_ptr);
+
+        oldcxt = MemoryContextSwitchTo(festate->segments_cxt);
+        festate->segment_start_ptr = (char *) palloc(SEGMENT_SIZE);
+        festate->segment_cur_ptr = festate->segment_start_ptr;
+        festate->segment_last_ptr =
+            festate->segment_start_ptr + SEGMENT_SIZE - 1;
+        MemoryContextSwitchTo(oldcxt);
+    }
+
+    ret = (void *) festate->segment_cur_ptr;
+    festate->segment_cur_ptr += MAXALIGN(size);
+
+    return ret;
+}
+
+/*
  * read_primitive_type
  *      Returns primitive type value from arrow array
  */
@@ -765,30 +808,8 @@ read_primitive_type(ParquetFdwExecutionState *festate,
             const char *value = reinterpret_cast<const char*>(binarray->GetValue(i, &vallen));
 
             /* Build bytea */
-            bytea *b;
             int64 bytea_len = vallen + VARHDRSZ;
-            if (festate->segment_last_ptr - festate->segment_cur_ptr < bytea_len)
-            {
-                MemoryContext oldcxt;
-                
-                /*
-                 * Recycle the last segment at the next iteration (if there
-                 * was one)
-                 */
-                if (festate->segment_start_ptr)
-                    festate->garbage_segments.
-                        push_back(festate->segment_start_ptr);
-
-                oldcxt = MemoryContextSwitchTo(festate->segments_cxt);
-                festate->segment_start_ptr = (char *) palloc(SEGMENT_SIZE);
-                festate->segment_cur_ptr = festate->segment_start_ptr;
-                festate->segment_last_ptr =
-                    festate->segment_start_ptr + SEGMENT_SIZE - 1;
-                MemoryContextSwitchTo(oldcxt);
-            }
-
-            b = (bytea *) festate->segment_cur_ptr;
-            festate->segment_cur_ptr += bytea_len;
+            bytea *b = (bytea *) fast_alloc(festate, bytea_len);
             SET_VARSIZE(b, bytea_len);
             memcpy(VARDATA(b), value, vallen);
 
@@ -877,9 +898,8 @@ nested_list_get_datum(ParquetFdwExecutionState *festate,
     char        elem_align;
     int         dims[1];
     int         lbs[1];
-    MemoryContext   oldcxt;
 
-    values = (Datum *) palloc0(sizeof(Datum) * array->length());
+    values = (Datum *) fast_alloc(festate, sizeof(Datum) * array->length());
     get_typlenbyvalalign(elem_type, &elem_len, &elem_byval, &elem_align);
 
     /* Fill values and nulls arrays */
@@ -906,7 +926,12 @@ nested_list_get_datum(ParquetFdwExecutionState *festate,
         else
         {
             if (!nulls)
-                nulls = (bool *) palloc0(sizeof(bool) * array->length());
+            {
+                Size size = sizeof(bool) * array->length();
+
+                nulls = (bool *) fast_alloc(festate, size);
+                memset(nulls, 0, size);
+            }
             nulls[i] = true;
         }
     }
@@ -917,11 +942,6 @@ construct_array:
     lbs[0] = 1;
     res = construct_md_array(values, nulls, 1, dims, lbs,
                              elem_type, elem_len, elem_byval, elem_align);
-
-    /* values and null have been copied to the array and no longer needed */
-    pfree(values);
-    if (nulls)
-        pfree(nulls);
 
     return PointerGetDatum(res);
 }
