@@ -50,6 +50,9 @@ Following options are supported:
 * **use_mmap** - whether memory map operations will be used instead of file read operations (default `false`);
 * **use_threads** - enables parallel columns decoding/decompression (default `false`).
 
+GUC variables:
+* **parquet_fdw.parquet_fdw.use_threads** - global switch that allow user to enable or disable threads (default `true`).
+
 Example:
 ```sql
 create foreign table userdata (

@@ -9,11 +9,13 @@
 #include "foreign/fdwapi.h"
 #include "optimizer/planmain.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/elog.h"
 
 
 PG_MODULE_MAGIC;
 
+void _PG_init(void);
 
 /* FDW routines */
 extern void parquetGetForeignRelSize(PlannerInfo *root,
@@ -33,6 +35,25 @@ extern TupleTableSlot *parquetIterateForeignScan(ForeignScanState *node);
 extern void parquetBeginForeignScan(ForeignScanState *node, int eflags);
 extern void parquetEndForeignScan(ForeignScanState *node);
 extern void parquetReScanForeignScan(ForeignScanState *node);
+
+/* GUC variable */
+extern bool parquet_fdw_use_threads;
+
+void
+_PG_init(void)
+{
+	DefineCustomBoolVariable("parquet_fdw.use_threads",
+							"Enables use_thread option",
+							NULL,
+							&parquet_fdw_use_threads,
+							true,
+							PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+}
 
 PG_FUNCTION_INFO_V1(parquet_fdw_handler);
 Datum

@@ -60,6 +60,7 @@ extern "C"
                  (tstype)->unit());                             \
     }
 
+bool parquet_fdw_use_threads = true;
 
 /*
  * Restriction
@@ -173,7 +174,7 @@ create_parquet_state(ForeignScanState *scanstate,
     auto schema = festate->reader->parquet_reader()->metadata()->schema();
 
     /* Enable parallel columns decoding/decompression if needed */
-    festate->reader->set_use_threads(use_threads);
+    festate->reader->set_use_threads(use_threads && parquet_fdw_use_threads);
  
     TupleTableSlot *slot = scanstate->ss.ss_ScanTupleSlot;
     TupleDesc tupleDesc = slot->tts_tupleDescriptor;
