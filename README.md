@@ -47,7 +47,8 @@ Currently `parquet_fdw` doesn't support structs and nested lists.
 Following options are supported:
 * **filename** - path to Parquet file to read;
 * **sorted** - space separated list of columns that Parquet file is already sorted by; that would help postgres to avoid redundant sorting when running query with `ORDER BY` clause;
-* **use_mmap** - whether memory map operations will be used instead of file read operations (default `false`).
+* **use_mmap** - whether memory map operations will be used instead of file read operations (default `false`);
+* **use_threads** - enables parallel columns decoding/decompression (default `false`).
 
 Example:
 ```sql

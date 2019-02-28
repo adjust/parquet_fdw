@@ -80,6 +80,7 @@ struct ParquetFdwPlanState
     Bitmapset  *attrs_sorted;
     Bitmapset  *attrs_used;    /* attributes actually used in query */
     bool        use_mmap;
+    bool        use_threads;
 };
 
 struct ChunkInfo
@@ -160,7 +161,8 @@ create_parquet_state(ForeignScanState *scanstate,
                      const char *filename,
                      std::set<int> &attrs_used,
                      std::list<RowGroupFilter> &filters,
-                     bool use_mmap)
+                     bool use_mmap,
+                     bool use_threads)
 {
     ParquetFdwExecutionState *festate;
 	EState	   *estate = scanstate->ss.ps.state;
@@ -169,6 +171,9 @@ create_parquet_state(ForeignScanState *scanstate,
     festate->filters = std::move(filters);
     scanstate->fdw_state = festate;
     auto schema = festate->reader->parquet_reader()->metadata()->schema();
+
+    /* Enable parallel columns decoding/decompression if needed */
+    festate->reader->set_use_threads(use_threads);
  
     TupleTableSlot *slot = scanstate->ss.ss_ScanTupleSlot;
     TupleDesc tupleDesc = slot->tts_tupleDescriptor;
@@ -252,6 +257,7 @@ get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
     ListCell     *lc;
 
     fdw_private->use_mmap = false;
+    fdw_private->use_threads = false;
     table = GetForeignTable(relid);
     
     foreach(lc, table->options)
@@ -268,6 +274,14 @@ get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
         else if (strcmp(def->defname, "use_mmap") == 0)
         { 
             if (!parse_bool(defGetString(def), &fdw_private->use_mmap))
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("invalid value for boolean option \"%s\": %s",
+                                def->defname, defGetString(def))));
+        }
+        else if (strcmp(def->defname, "use_threads") == 0)
+        {
+            if (!parse_bool(defGetString(def), &fdw_private->use_threads))
                 ereport(ERROR,
                         (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                          errmsg("invalid value for boolean option \"%s\": %s",
@@ -537,9 +551,10 @@ parquetGetForeignPlan(PlannerInfo *root,
 							scan_clauses,
 							scan_relid,
 							NIL,	/* no expressions to evaluate */
-							list_make3(makeString(fdw_private->filename),
+							list_make4(makeString(fdw_private->filename),
                                        attrs_used,
-                                       makeInteger(fdw_private->use_mmap)),
+                                       makeInteger(fdw_private->use_mmap),
+                                       makeInteger(fdw_private->use_threads)),
 							NIL,	/* no custom tlist */
 							NIL,	/* no remote quals */
 							outer_plan);
@@ -558,6 +573,7 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
     std::set<int>   attrs_used;
     std::list<RowGroupFilter> filters;
     bool            use_mmap; 
+    bool            use_threads;
 
     /* Unwrap fdw_private */
     filename = strVal((Value *) linitial(fdw_private));
@@ -566,6 +582,7 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
         attrs_used.insert(lfirst_int(lc));
 
     use_mmap = (bool) intVal((Value *) lthird(fdw_private));
+    use_threads = (bool) intVal((Value *) llast(fdw_private));
     
     /* Build filters list */
     extract_rowgroup_filters(plan->scan.plan.qual, filters);
@@ -576,7 +593,8 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
                                        filename,
                                        attrs_used,
                                        filters,
-                                       use_mmap);
+                                       use_mmap,
+                                       use_threads);
     }
     catch(const std::exception& e)
     {
@@ -1357,7 +1375,9 @@ parquetIterateForeignScan(ForeignScanState *node)
 extern "C" void
 parquetEndForeignScan(ForeignScanState *node)
 {
-    delete (ParquetFdwExecutionState *) node->fdw_state;
+    ParquetFdwExecutionState *festate = (ParquetFdwExecutionState *) node->fdw_state;
+
+    delete festate;
 }
 
 extern "C" void

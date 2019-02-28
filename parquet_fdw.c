@@ -96,6 +96,17 @@ parquet_fdw_validator(PG_FUNCTION_ARGS)
                          errmsg("invalid value for boolean option \"%s\": %s",
                                 def->defname, defGetString(def))));
         }
+        else if (strcmp(def->defname, "use_threads") == 0)
+        {
+            /* Check that bool value is valid */
+            bool    use_threads;
+
+            if (!parse_bool(defGetString(def), &use_threads))
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("invalid value for boolean option \"%s\": %s",
+                                def->defname, defGetString(def))));
+        }
         else
         {
             ereport(ERROR,
