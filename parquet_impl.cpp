@@ -752,6 +752,8 @@ fast_alloc(ParquetFdwExecutionState *festate, Size size)
     if (size > SEGMENT_SIZE)
         return palloc(size);
 
+    size = MAXALIGN(size);
+
     /* If there is not enough space in current segment create a new one */
     if (festate->segment_last_ptr - festate->segment_cur_ptr < size)
     {
@@ -774,7 +776,7 @@ fast_alloc(ParquetFdwExecutionState *festate, Size size)
     }
 
     ret = (void *) festate->segment_cur_ptr;
-    festate->segment_cur_ptr += MAXALIGN(size);
+    festate->segment_cur_ptr += size;
 
     return ret;
 }
