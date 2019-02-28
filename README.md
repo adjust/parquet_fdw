@@ -51,7 +51,7 @@ Following options are supported:
 * **use_threads** - enables parallel columns decoding/decompression (default `false`).
 
 GUC variables:
-* **parquet_fdw.parquet_fdw.use_threads** - global switch that allow user to enable or disable threads (default `true`).
+* **parquet_fdw.use_threads** - global switch that allow user to enable or disable threads (default `true`).
 
 Example:
 ```sql
