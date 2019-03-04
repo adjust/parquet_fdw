@@ -6,6 +6,7 @@
 #include "access/reloptions.h"
 #include "catalog/pg_foreign_table.h"
 #include "commands/defrem.h"
+#include "commands/explain.h"
 #include "foreign/fdwapi.h"
 #include "optimizer/planmain.h"
 #include "utils/builtins.h"
@@ -35,6 +36,7 @@ extern TupleTableSlot *parquetIterateForeignScan(ForeignScanState *node);
 extern void parquetBeginForeignScan(ForeignScanState *node, int eflags);
 extern void parquetEndForeignScan(ForeignScanState *node);
 extern void parquetReScanForeignScan(ForeignScanState *node);
+extern void parquetExplainForeignScan(ForeignScanState *node, ExplainState *es);
 
 /* GUC variable */
 extern bool parquet_fdw_use_threads;
@@ -68,6 +70,7 @@ parquet_fdw_handler(PG_FUNCTION_ARGS)
     fdwroutine->IterateForeignScan = parquetIterateForeignScan;
     fdwroutine->ReScanForeignScan = parquetReScanForeignScan;
     fdwroutine->EndForeignScan = parquetEndForeignScan;
+    fdwroutine->ExplainForeignScan = parquetExplainForeignScan;
 
     PG_RETURN_POINTER(fdwroutine);
 }

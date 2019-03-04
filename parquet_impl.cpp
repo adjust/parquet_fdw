@@ -22,12 +22,14 @@ extern "C"
 #include "access/nbtree.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
+#include "commands/explain.h"
 #include "executor/tuptable.h"
 #include "foreign/foreign.h"
 #include "nodes/execnodes.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/makefuncs.h"
 #include "nodes/relation.h"
+#include "optimizer/cost.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/planmain.h"
@@ -39,6 +41,7 @@ extern "C"
 #include "utils/date.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
 #include "utils/timestamp.h"
 #include "utils/typcache.h"
 }
@@ -59,6 +62,9 @@ extern "C"
             elog(ERROR, "Timestamp of unknown precision: %d",   \
                  (tstype)->unit());                             \
     }
+
+static void find_cmp_func(FmgrInfo *finfo, Oid type1, Oid type2);
+static Datum bytes_to_postgres_type(const char *bytes, arrow::DataType *arrow_type);
 
 bool parquet_fdw_use_threads = true;
 
@@ -82,6 +88,7 @@ struct ParquetFdwPlanState
     Bitmapset  *attrs_used;    /* attributes actually used in query */
     bool        use_mmap;
     bool        use_threads;
+    List       *rowgroups;
 };
 
 struct ChunkInfo
@@ -135,6 +142,11 @@ public:
     std::list<RowGroupFilter>       filters;
 
     /*
+     *
+     */
+    std::vector<int>                rowgroups;
+
+    /*
      * Special memory segment to speed up bytea/Text allocations.
      */
     MemoryContext                   segments_cxt;
@@ -161,7 +173,6 @@ static ParquetFdwExecutionState *
 create_parquet_state(ForeignScanState *scanstate,
                      const char *filename,
                      std::set<int> &attrs_used,
-                     std::list<RowGroupFilter> &filters,
                      bool use_mmap,
                      bool use_threads)
 {
@@ -169,7 +180,6 @@ create_parquet_state(ForeignScanState *scanstate,
 	EState	   *estate = scanstate->ss.ps.state;
 
     festate = new ParquetFdwExecutionState(filename, use_mmap);
-    festate->filters = std::move(filters);
     scanstate->fdw_state = festate;
     auto schema = festate->reader->parquet_reader()->metadata()->schema();
 
@@ -305,106 +315,6 @@ parquetGetForeignRelSize(PlannerInfo *root,
     baserel->fdw_private = fdw_private;
 }
 
-static void
-estimate_costs(PlannerInfo *root, RelOptInfo *baserel,
-			   Cost *startup_cost, Cost *total_cost)
-{
-	Cost		run_cost = 100;  /* TODO */
-
-	*startup_cost = baserel->baserestrictcost.startup;
-	*total_cost = *startup_cost + run_cost;
-}
-
-static void
-extract_used_attributes(RelOptInfo *baserel)
-{
-    ParquetFdwPlanState *fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
-    ListCell *lc;
-
-    pull_varattnos((Node *) baserel->reltarget->exprs,
-                   baserel->relid,
-                   &fdw_private->attrs_used);
-
-    foreach(lc, baserel->baserestrictinfo)
-    {
-        RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
-
-        pull_varattnos((Node *) rinfo->clause,
-                       baserel->relid,
-                       &fdw_private->attrs_used);
-    }
-
-    if (bms_is_empty(fdw_private->attrs_used))
-    {
-        bms_free(fdw_private->attrs_used);
-        fdw_private->attrs_used = bms_make_singleton(1 - FirstLowInvalidHeapAttributeNumber);
-    }
-}
-
-extern "C" void
-parquetGetForeignPaths(PlannerInfo *root,
-					RelOptInfo *baserel,
-					Oid foreigntableid)
-{
-	ParquetFdwPlanState *fdw_private;
-	Cost		startup_cost;
-	Cost		total_cost;
-    List       *pathkeys = NIL;
-    ListCell   *lc;
-
-    fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
-
-    /* Estimate costs */
-    estimate_costs(root, baserel, &startup_cost, &total_cost);
-
-    /* Collect used attributes to reduce number of read columns during scan */
-    extract_used_attributes(baserel);
-
-    /* Build pathkeys based on attrs_sorted */
-    int attnum = -1;
-    while ((attnum = bms_next_member(fdw_private->attrs_sorted, attnum)) >= 0)
-    {
-        Oid         relid = root->simple_rte_array[baserel->relid]->relid;
-        Oid         typid,
-                    collid;
-        int32       typmod;
-        Oid         sort_op;
-        Var        *var;
-        List       *attr_pathkey;
-
-        /* Build an expression (simple var) */
-        get_atttypetypmodcoll(relid, attnum, &typid, &typmod, &collid);
-        var = makeVar(baserel->relid, attnum, typid, typmod, collid, 0);
-
-        /* Lookup sorting operator for the attribute type */
-        get_sort_group_operators(typid,
-                                 true, false, false,
-                                 &sort_op, NULL, NULL,
-                                 NULL);
-
-        attr_pathkey = build_expression_pathkey(root, (Expr *) var, NULL,
-                                                sort_op, baserel->relids,
-                                                true);
-        pathkeys = list_concat(pathkeys, attr_pathkey);
-    }
-
-	/*
-	 * Create a ForeignPath node and add it as only possible path.  We use the
-	 * fdw_private list of the path to carry the convert_selectively option;
-	 * it will be propagated into the fdw_private list of the Plan node.
-	 */
-	add_path(baserel, (Path *)
-			 create_foreignscan_path(root, baserel,
-									 NULL,	/* default pathtarget */
-									 baserel->rows,
-									 startup_cost,
-									 total_cost,
-									 pathkeys,
-									 NULL,	/* no outer rel either */
-									 NULL,	/* no extra plan */
-									 (List *) fdw_private));
-}
-
 /*
  * extract_rowgroup_filters
  *      Build a list of expressions we can use to filter out row groups.
@@ -418,13 +328,16 @@ extract_rowgroup_filters(List *scan_clauses,
     foreach (lc, scan_clauses)
     {
         TypeCacheEntry *tce;
-        Node       *clause = (Node *) lfirst(lc);
+        Expr       *clause = (Expr *) lfirst(lc);
         OpExpr     *expr;
         Expr       *left, *right;
         int         strategy;
         Const      *c;
         Var        *v;
         Oid         opno;
+
+        if (IsA(clause, RestrictInfo))
+            clause = ((RestrictInfo *) clause)->clause;
 
         if (IsA(clause, OpExpr))
         {
@@ -514,97 +427,6 @@ extract_rowgroup_filters(List *scan_clauses,
     }
 }
 
-extern "C" ForeignScan *
-parquetGetForeignPlan(PlannerInfo *root,
-                      RelOptInfo *baserel,
-                      Oid foreigntableid,
-                      ForeignPath *best_path,
-                      List *tlist,
-                      List *scan_clauses,
-                      Plan *outer_plan)
-{
-    ParquetFdwPlanState *fdw_private = (ParquetFdwPlanState *) best_path->fdw_private;
-	Index		scan_relid = baserel->relid;
-    List       *attrs_used = NIL;
-    AttrNumber  attr;
-
-	/*
-	 * We have no native ability to evaluate restriction clauses, so we just
-	 * put all the scan_clauses into the plan node's qual list for the
-	 * executor to check.  So all we have to do here is strip RestrictInfo
-	 * nodes from the clauses and ignore pseudoconstants (which will be
-	 * handled elsewhere).
-	 */
-	scan_clauses = extract_actual_clauses(scan_clauses, false);
-
-    /*
-     * We can't just pass arbitrary structure into make_foreignscan() because
-     * in some cases (i.e. plan caching) postgres may want to make a copy of
-     * the plan and it can only make copy of something it knows of, namely
-     * Nodes. So we need to convert everything in nodes and store it in a List.
-     */
-    attr = -1;
-    while ((attr = bms_next_member(fdw_private->attrs_used, attr)) >= 0)
-        attrs_used = lappend_int(attrs_used, attr);
-
-	/* Create the ForeignScan node */
-	return make_foreignscan(tlist,
-							scan_clauses,
-							scan_relid,
-							NIL,	/* no expressions to evaluate */
-							list_make4(makeString(fdw_private->filename),
-                                       attrs_used,
-                                       makeInteger(fdw_private->use_mmap),
-                                       makeInteger(fdw_private->use_threads)),
-							NIL,	/* no custom tlist */
-							NIL,	/* no remote quals */
-							outer_plan);
-}
-
-extern "C" void
-parquetBeginForeignScan(ForeignScanState *node, int eflags)
-{
-    ParquetFdwExecutionState *festate; 
-	ForeignScan    *plan = (ForeignScan *) node->ss.ps.plan;
-	EState         *estate = node->ss.ps.state;
-    List           *fdw_private = plan->fdw_private;
-    List           *attrs_used_list = (List *) lsecond(fdw_private);
-    ListCell       *lc;
-    char           *filename;
-    std::set<int>   attrs_used;
-    std::list<RowGroupFilter> filters;
-    bool            use_mmap; 
-    bool            use_threads;
-
-    /* Unwrap fdw_private */
-    filename = strVal((Value *) linitial(fdw_private));
-
-    foreach (lc, attrs_used_list)
-        attrs_used.insert(lfirst_int(lc));
-
-    use_mmap = (bool) intVal((Value *) lthird(fdw_private));
-    use_threads = (bool) intVal((Value *) llast(fdw_private));
-    
-    /* Build filters list */
-    extract_rowgroup_filters(plan->scan.plan.qual, filters);
-
-    try
-    {
-        festate = create_parquet_state(node,
-                                       filename,
-                                       attrs_used,
-                                       filters,
-                                       use_mmap,
-                                       use_threads);
-    }
-    catch(const std::exception& e)
-    {
-        elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
-    }
-
-    node->fdw_state = festate;
-}
-
 static Oid
 to_postgres_type(int arrow_type)
 {
@@ -627,6 +449,366 @@ to_postgres_type(int arrow_type)
         default:
             return InvalidOid;
     }
+}
+
+/*
+ * row_group_matches_filter
+ *      Check if min/max values of the column of the row group match filter.
+ */
+static bool
+row_group_matches_filter(parquet::RowGroupStatistics *stats,
+                         arrow::DataType *arrow_type,
+                         RowGroupFilter *filter)
+{
+    FmgrInfo finfo;
+    Datum    val = filter->value->constvalue;
+    int      collid = filter->value->constcollid;
+    int      strategy = filter->strategy;
+
+    find_cmp_func(&finfo,
+                  filter->value->consttype,
+                  to_postgres_type(arrow_type->id()));
+
+    switch (filter->strategy)
+    {
+        case BTLessStrategyNumber:
+        case BTLessEqualStrategyNumber:
+            {
+                Datum   lower;
+                int     cmpres;
+                bool    satisfies;
+
+                lower = bytes_to_postgres_type(stats->EncodeMin().c_str(),
+                                               arrow_type);
+                cmpres = FunctionCall2Coll(&finfo, collid, val, lower);
+
+                satisfies =
+                    (strategy == BTLessStrategyNumber      && cmpres > 0) ||
+                    (strategy == BTLessEqualStrategyNumber && cmpres >= 0);
+
+                if (!satisfies)
+                    return false;
+                break;
+            }
+
+        case BTGreaterStrategyNumber:
+        case BTGreaterEqualStrategyNumber:
+            {
+                Datum   upper;
+                int     cmpres;
+                bool    satisfies;
+
+                upper = bytes_to_postgres_type(stats->EncodeMax().c_str(),
+                                               arrow_type);
+                cmpres = FunctionCall2Coll(&finfo, collid, val, upper);
+
+                satisfies =
+                    (strategy == BTGreaterStrategyNumber      && cmpres < 0) ||
+                    (strategy == BTGreaterEqualStrategyNumber && cmpres <= 0);
+
+                if (!satisfies)
+                    return false;
+                break;
+            }
+
+        case BTEqualStrategyNumber:
+            {
+                Datum   lower,
+                        upper;
+
+                lower = bytes_to_postgres_type(stats->EncodeMin().c_str(),
+                                               arrow_type);
+                upper = bytes_to_postgres_type(stats->EncodeMax().c_str(),
+                                               arrow_type);
+
+                int l = FunctionCall2Coll(&finfo, collid, val, lower);
+                int u = FunctionCall2Coll(&finfo, collid, val, upper);
+
+                if (l < 0 || u > 0)
+                    return false;
+            }
+
+        default:
+            /* should not happen */
+            Assert(true);
+    }
+
+    return true;
+}
+
+static void
+estimate_costs(PlannerInfo *root, RelOptInfo *baserel,
+			   Cost *startup_cost, Cost *total_cost, int64 *ntuples)
+{
+    std::list<RowGroupFilter>       filters;
+    TupleDesc       tupleDesc;
+    Relation        rel;
+	Cost		    run_cost;  /* TODO */
+
+    rel = heap_open(root->simple_rte_array[baserel->relid]->relid,
+                    AccessShareLock);
+    tupleDesc = RelationGetDescr(rel);
+
+    extract_rowgroup_filters(baserel->baserestrictinfo, filters);
+
+    auto fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
+
+    /* TODO: check if file exists and stuff */
+    std::unique_ptr<parquet::arrow::FileReader> reader(
+        new parquet::arrow::FileReader(
+            arrow::default_memory_pool(),
+            parquet::ParquetFileReader::OpenFile(fdw_private->filename, false)));
+    auto meta = reader->parquet_reader()->metadata();
+
+    *ntuples = 0;
+
+    /* Check whether row group matches filters */
+    for (int r = 0; r < reader->num_row_groups(); r++)
+    {
+        bool match = true;
+        auto rowgroup = reader
+                    ->parquet_reader()
+                    ->metadata()
+                    ->RowGroup(r);
+
+        for (auto it = filters.begin(); it != filters.end(); it++)
+        {
+            RowGroupFilter &filter = *it;
+
+            for (int k = 0; k < rowgroup->num_columns(); k++)
+            {
+                auto column = rowgroup->ColumnChunk(k);
+                AttrNumber attr = filter.attnum - 1;
+                std::vector<std::string> path = column->path_in_schema()->ToDotVector();
+
+                if (strcmp(NameStr(TupleDescAttr(tupleDesc, attr)->attname),
+                           path[0].c_str()) == 0)
+                {
+                    std::shared_ptr<parquet::RowGroupStatistics>  stats;
+                    std::shared_ptr<arrow::Field>                 field;
+                    std::shared_ptr<arrow::DataType>              type;
+                    const parquet::schema::GroupNode& schema_node = *meta->schema()->group_node();
+
+                    parquet::arrow::NodeToField(*schema_node.field(k), &field);
+                    stats = column->statistics();
+                    type = field->type();
+
+                    if (stats && !row_group_matches_filter(stats.get(),
+                                                           type.get(),
+                                                           &filter))
+                    {
+                        match = false;
+                    }
+                }
+            }  /* loop over columns */
+        }  /* loop over filters */
+        
+        /* All the filters match this rowgroup */
+        if (match)
+        {
+            elog(LOG, "row group valid %i", r);
+            fdw_private->rowgroups = lappend_int(fdw_private->rowgroups, r);
+            *ntuples += rowgroup->num_rows();
+        }  /* loop over rowgroups */
+    }
+
+    heap_close(rel, AccessShareLock);
+
+    /*
+     * Actual cost estimation. Here we assume that parquet tuple cost is the
+     * same as regular tuple cost even that this is probably not true in many
+     * cases. Maybe we'll come up with a smarter idea later.
+     */
+    run_cost = *ntuples * cpu_tuple_cost;
+	*startup_cost = baserel->baserestrictcost.startup;
+	*total_cost = *startup_cost + run_cost;
+}
+
+static void
+extract_used_attributes(RelOptInfo *baserel)
+{
+    ParquetFdwPlanState *fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
+    ListCell *lc;
+
+    pull_varattnos((Node *) baserel->reltarget->exprs,
+                   baserel->relid,
+                   &fdw_private->attrs_used);
+
+    foreach(lc, baserel->baserestrictinfo)
+    {
+        RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+        pull_varattnos((Node *) rinfo->clause,
+                       baserel->relid,
+                       &fdw_private->attrs_used);
+    }
+
+    if (bms_is_empty(fdw_private->attrs_used))
+    {
+        bms_free(fdw_private->attrs_used);
+        fdw_private->attrs_used = bms_make_singleton(1 - FirstLowInvalidHeapAttributeNumber);
+    }
+}
+
+extern "C" void
+parquetGetForeignPaths(PlannerInfo *root,
+					RelOptInfo *baserel,
+					Oid foreigntableid)
+{
+	ParquetFdwPlanState *fdw_private;
+	Cost		startup_cost;
+	Cost		total_cost;
+    List       *pathkeys = NIL;
+    ListCell   *lc;
+    int64       ntuples;
+
+    fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
+
+    /* Estimate costs */
+    estimate_costs(root, baserel, &startup_cost, &total_cost, &ntuples);
+
+    /* Collect used attributes to reduce number of read columns during scan */
+    extract_used_attributes(baserel);
+
+    /* Build pathkeys based on attrs_sorted */
+    int attnum = -1;
+    while ((attnum = bms_next_member(fdw_private->attrs_sorted, attnum)) >= 0)
+    {
+        Oid         relid = root->simple_rte_array[baserel->relid]->relid;
+        Oid         typid,
+                    collid;
+        int32       typmod;
+        Oid         sort_op;
+        Var        *var;
+        List       *attr_pathkey;
+
+        /* Build an expression (simple var) */
+        get_atttypetypmodcoll(relid, attnum, &typid, &typmod, &collid);
+        var = makeVar(baserel->relid, attnum, typid, typmod, collid, 0);
+
+        /* Lookup sorting operator for the attribute type */
+        get_sort_group_operators(typid,
+                                 true, false, false,
+                                 &sort_op, NULL, NULL,
+                                 NULL);
+
+        attr_pathkey = build_expression_pathkey(root, (Expr *) var, NULL,
+                                                sort_op, baserel->relids,
+                                                true);
+        pathkeys = list_concat(pathkeys, attr_pathkey);
+    }
+
+	/*
+	 * Create a ForeignPath node and add it as only possible path.  We use the
+	 * fdw_private list of the path to carry the convert_selectively option;
+	 * it will be propagated into the fdw_private list of the Plan node.
+	 */
+	add_path(baserel, (Path *)
+			 create_foreignscan_path(root, baserel,
+									 NULL,	/* default pathtarget */
+									 ntuples,
+									 startup_cost,
+									 total_cost,
+									 pathkeys,
+									 NULL,	/* no outer rel either */
+									 NULL,	/* no extra plan */
+									 (List *) fdw_private));
+}
+
+extern "C" ForeignScan *
+parquetGetForeignPlan(PlannerInfo *root,
+                      RelOptInfo *baserel,
+                      Oid foreigntableid,
+                      ForeignPath *best_path,
+                      List *tlist,
+                      List *scan_clauses,
+                      Plan *outer_plan)
+{
+    ParquetFdwPlanState *fdw_private = (ParquetFdwPlanState *) best_path->fdw_private;
+	Index		scan_relid = baserel->relid;
+    List       *attrs_used = NIL;
+    AttrNumber  attr;
+    List       *params;
+
+	/*
+	 * We have no native ability to evaluate restriction clauses, so we just
+	 * put all the scan_clauses into the plan node's qual list for the
+	 * executor to check.  So all we have to do here is strip RestrictInfo
+	 * nodes from the clauses and ignore pseudoconstants (which will be
+	 * handled elsewhere).
+	 */
+	scan_clauses = extract_actual_clauses(scan_clauses, false);
+
+    /*
+     * We can't just pass arbitrary structure into make_foreignscan() because
+     * in some cases (i.e. plan caching) postgres may want to make a copy of
+     * the plan and it can only make copy of something it knows of, namely
+     * Nodes. So we need to convert everything in nodes and store it in a List.
+     */
+    attr = -1;
+    while ((attr = bms_next_member(fdw_private->attrs_used, attr)) >= 0)
+        attrs_used = lappend_int(attrs_used, attr);
+
+    params = list_make5(makeString(fdw_private->filename),
+                        attrs_used,
+                        makeInteger(fdw_private->use_mmap),
+                        makeInteger(fdw_private->use_threads),
+                        fdw_private->rowgroups);
+
+	/* Create the ForeignScan node */
+	return make_foreignscan(tlist,
+							scan_clauses,
+							scan_relid,
+							NIL,	/* no expressions to evaluate */
+							params,
+							NIL,	/* no custom tlist */
+							NIL,	/* no remote quals */
+							outer_plan);
+}
+
+extern "C" void
+parquetBeginForeignScan(ForeignScanState *node, int eflags)
+{
+    ParquetFdwExecutionState *festate; 
+	ForeignScan    *plan = (ForeignScan *) node->ss.ps.plan;
+	EState         *estate = node->ss.ps.state;
+    List           *fdw_private = plan->fdw_private;
+    List           *attrs_used_list;
+    List           *rowgroups_list;
+    ListCell       *lc;
+    char           *filename;
+    std::set<int>   attrs_used;
+    bool            use_mmap; 
+    bool            use_threads;
+
+    /* Unwrap fdw_private */
+    filename = strVal((Value *) linitial(fdw_private));
+
+    attrs_used_list = (List *) lsecond(fdw_private);
+    foreach (lc, attrs_used_list)
+        attrs_used.insert(lfirst_int(lc));
+
+    use_mmap = (bool) intVal((Value *) lthird(fdw_private));
+    use_threads = (bool) intVal((Value *) lfourth(fdw_private));
+
+    try
+    {
+        festate = create_parquet_state(node,
+                                       filename,
+                                       attrs_used,
+                                       use_mmap,
+                                       use_threads);
+    }
+    catch(const std::exception& e)
+    {
+        elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
+    }
+
+    rowgroups_list = (List *) llast(fdw_private);
+    foreach (lc, rowgroups_list)
+        festate->rowgroups.push_back(lfirst_int(lc));
+
+    node->fdw_state = festate;
 }
 
 static int
@@ -1141,91 +1323,6 @@ find_cmp_func(FmgrInfo *finfo, Oid type1, Oid type2)
     fmgr_info(cmp_proc_oid, finfo);
 }
 
-/*
- * row_group_matches_filter
- *      Check if min/max values of the column of the row group match filter.
- */
-static bool
-row_group_matches_filter(parquet::RowGroupStatistics *stats,
-                         arrow::DataType *arrow_type,
-                         RowGroupFilter *filter)
-{
-    FmgrInfo finfo;
-    Datum    val = filter->value->constvalue;
-    int      collid = filter->value->constcollid;
-    int      strategy = filter->strategy;
-
-    find_cmp_func(&finfo,
-                  filter->value->consttype,
-                  to_postgres_type(arrow_type->id()));
-
-    switch (filter->strategy)
-    {
-        case BTLessStrategyNumber:
-        case BTLessEqualStrategyNumber:
-            {
-                Datum   lower;
-                int     cmpres;
-                bool    satisfies;
-
-                lower = bytes_to_postgres_type(stats->EncodeMin().c_str(),
-                                               arrow_type);
-                cmpres = FunctionCall2Coll(&finfo, collid, val, lower);
-
-                satisfies =
-                    (strategy == BTLessStrategyNumber      && cmpres > 0) ||
-                    (strategy == BTLessEqualStrategyNumber && cmpres >= 0);
-
-                if (!satisfies)
-                    return false;
-                break;
-            }
-
-        case BTGreaterStrategyNumber:
-        case BTGreaterEqualStrategyNumber:
-            {
-                Datum   upper;
-                int     cmpres;
-                bool    satisfies;
-
-                upper = bytes_to_postgres_type(stats->EncodeMax().c_str(),
-                                               arrow_type);
-                cmpres = FunctionCall2Coll(&finfo, collid, val, upper);
-
-                satisfies =
-                    (strategy == BTGreaterStrategyNumber      && cmpres < 0) ||
-                    (strategy == BTGreaterEqualStrategyNumber && cmpres <= 0);
-
-                if (!satisfies)
-                    return false;
-                break;
-            }
-
-        case BTEqualStrategyNumber:
-            {
-                Datum   lower,
-                        upper;
-
-                lower = bytes_to_postgres_type(stats->EncodeMin().c_str(),
-                                               arrow_type);
-                upper = bytes_to_postgres_type(stats->EncodeMax().c_str(),
-                                               arrow_type);
-
-                int l = FunctionCall2Coll(&finfo, collid, val, lower);
-                int u = FunctionCall2Coll(&finfo, collid, val, upper);
-
-                if (l < 0 || u > 0)
-                    return false;
-            }
-
-        default:
-            /* should not happen */
-            Assert(true);
-    }
-
-    return true;
-}
-
 static bool
 read_next_rowgroup(ForeignScanState *node)
 {
@@ -1246,34 +1343,16 @@ read_next_rowgroup(ForeignScanState *node)
         elog(ERROR, "parquet_fdw: error reading parquet schema");
 
 next_rowgroup:
-    if (festate->row_group >= festate->reader->num_row_groups())
+    //if (festate->row_group >= festate->reader->num_row_groups())
+    if (festate->row_group >= festate->rowgroups.size())
         return false;
 
     auto rowgroup = festate->reader
                         ->parquet_reader()
                         ->metadata()
-                        ->RowGroup(festate->row_group);
+                        ->RowGroup(festate->rowgroups[festate->row_group]);
     
-    /* Check whether row group matches filters */
-    for (auto it = festate->filters.begin(); it != festate->filters.end(); it++)
-    {
-        RowGroupFilter &filter = *it;
-        std::shared_ptr<parquet::RowGroupStatistics>  stats;
-        std::shared_ptr<arrow::DataType>              type;
-        int     arrow_col, parquet_col;
-
-        arrow_col = festate->map[filter.attnum - 1];
-        parquet_col = festate->indices[arrow_col];
-        stats = rowgroup->ColumnChunk(parquet_col)->statistics();
-        type = schema->field(parquet_col)->type();
-
-        if (stats && !row_group_matches_filter(stats.get(), type.get(), &filter))
-        {
-            elog(DEBUG1, "parquet_fdw: skip rowgroup %d", festate->row_group);
-            festate->row_group++;
-            goto next_rowgroup;
-        }
-    }
+    //берем следующую rowgroup-у из списка
 
     /* Determine which columns has null values */
     for (int i = 0; i < festate->map.size(); i++)
@@ -1393,3 +1472,36 @@ parquetReScanForeignScan(ForeignScanState *node)
     festate->num_rows = 0;
 }
 
+/*
+ * parquetExplainForeignScan
+ *      Additional explain information, namely row groups list.
+ */
+extern "C" void
+parquetExplainForeignScan(ForeignScanState *node, ExplainState *es)
+{
+    List	   *fdw_private;
+    List       *rowgroups;
+    ListCell   *lc;
+    StringInfoData str;
+    bool        is_first = true;
+
+    initStringInfo(&str);
+
+	fdw_private = ((ForeignScan *) node->ss.ps.plan)->fdw_private;
+    rowgroups = (List *) llast(fdw_private);
+
+    foreach(lc, rowgroups)
+    {
+        int rowgroup = lfirst_int(lc) + 1;
+
+        if (is_first)
+        {
+            appendStringInfo(&str, "%i", rowgroup);
+            is_first = false;
+        }
+        else
+            appendStringInfo(&str, ", %i", rowgroup);
+    }
+
+    ExplainPropertyText("Row groups", str.data, es);
+}
