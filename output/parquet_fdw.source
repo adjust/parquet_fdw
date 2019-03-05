@@ -50,7 +50,8 @@ EXPLAIN (COSTS OFF) SELECT * FROM example ORDER BY one;
        QUERY PLAN        
 -------------------------
  Foreign Scan on example
-(1 row)
+   Row groups: 1, 2
+(2 rows)
 
 EXPLAIN (COSTS OFF) SELECT * FROM example ORDER BY three;
           QUERY PLAN           
@@ -58,54 +59,55 @@ EXPLAIN (COSTS OFF) SELECT * FROM example ORDER BY three;
  Sort
    Sort Key: three
    ->  Foreign Scan on example
-(3 rows)
+         Row groups: 1, 2
+(4 rows)
 
 -- filtering
 SET client_min_messages = DEBUG1;
 SELECT * FROM example WHERE one < 1;
-DEBUG:  parquet_fdw: skip rowgroup 0
 DEBUG:  parquet_fdw: skip rowgroup 1
+DEBUG:  parquet_fdw: skip rowgroup 2
  one | two | three | four | five | six 
 -----+-----+-------+------+------+-----
 (0 rows)
 
 SELECT * FROM example WHERE one <= 1;
-DEBUG:  parquet_fdw: skip rowgroup 1
+DEBUG:  parquet_fdw: skip rowgroup 2
  one |   two   | three |        four         |    five    | six 
 -----+---------+-------+---------------------+------------+-----
    1 | {1,2,3} | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t
 (1 row)
 
 SELECT * FROM example WHERE one > 6;
-DEBUG:  parquet_fdw: skip rowgroup 0
 DEBUG:  parquet_fdw: skip rowgroup 1
+DEBUG:  parquet_fdw: skip rowgroup 2
  one | two | three | four | five | six 
 -----+-----+-------+------+------+-----
 (0 rows)
 
 SELECT * FROM example WHERE one >= 6;
-DEBUG:  parquet_fdw: skip rowgroup 0
+DEBUG:  parquet_fdw: skip rowgroup 1
  one |    two     | three |        four         |    five    | six 
 -----+------------+-------+---------------------+------------+-----
    6 | {16,17,18} | tres  | 2018-01-06 00:00:00 | 2018-01-06 | f
 (1 row)
 
 SELECT * FROM example WHERE one = 2;
-DEBUG:  parquet_fdw: skip rowgroup 1
+DEBUG:  parquet_fdw: skip rowgroup 2
  one |    two     | three |        four         |    five    | six 
 -----+------------+-------+---------------------+------------+-----
    2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f
 (1 row)
 
 SELECT * FROM example WHERE one = 7;
-DEBUG:  parquet_fdw: skip rowgroup 0
 DEBUG:  parquet_fdw: skip rowgroup 1
+DEBUG:  parquet_fdw: skip rowgroup 2
  one | two | three | four | five | six 
 -----+-----+-------+------+------+-----
 (0 rows)
 
 SELECT * FROM example WHERE six = true;
-DEBUG:  parquet_fdw: skip rowgroup 1
+DEBUG:  parquet_fdw: skip rowgroup 2
  one |   two   | three |        four         |    five    | six 
 -----+---------+-------+---------------------+------------+-----
    1 | {1,2,3} | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t
@@ -124,7 +126,7 @@ SELECT * FROM example WHERE six = false;
 -- prepared statements
 prepare prep(date) as select * from example where five < $1;
 execute prep('2018-01-03');
-DEBUG:  parquet_fdw: skip rowgroup 1
+DEBUG:  parquet_fdw: skip rowgroup 2
  one |    two     | three |        four         |    five    | six 
 -----+------------+-------+---------------------+------------+-----
    1 | {1,2,3}    | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t
@@ -132,8 +134,8 @@ DEBUG:  parquet_fdw: skip rowgroup 1
 (2 rows)
 
 execute prep('2018-01-01');
-DEBUG:  parquet_fdw: skip rowgroup 0
 DEBUG:  parquet_fdw: skip rowgroup 1
+DEBUG:  parquet_fdw: skip rowgroup 2
  one | two | three | four | five | six 
 -----+-----+-------+------+------+-----
 (0 rows)

@@ -89,6 +89,7 @@ struct ParquetFdwPlanState
     bool        use_mmap;
     bool        use_threads;
     List       *rowgroups;
+    uint64      ntuples;
 };
 
 struct ChunkInfo
@@ -536,90 +537,126 @@ row_group_matches_filter(parquet::RowGroupStatistics *stats,
     return true;
 }
 
+/*
+ * extract_rowgroups_list
+ *      Analyze query predicates and using min/max statistics determine which
+ *      row groups satisfy clauses. Store resulting row group list to
+ *      fdw_private.
+ */
 static void
-estimate_costs(PlannerInfo *root, RelOptInfo *baserel,
-			   Cost *startup_cost, Cost *total_cost, int64 *ntuples)
+extract_rowgroups_list(PlannerInfo *root, RelOptInfo *baserel)
 {
+    std::unique_ptr<parquet::arrow::FileReader> reader;
     std::list<RowGroupFilter>       filters;
-    TupleDesc       tupleDesc;
+    RangeTblEntry  *rte;
     Relation        rel;
-	Cost		    run_cost;  /* TODO */
+    TupleDesc       tupleDesc;
+    auto            fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
 
-    rel = heap_open(root->simple_rte_array[baserel->relid]->relid,
-                    AccessShareLock);
+    /*
+     * Open relation to be able to access tuple descriptor
+     */
+    rte = root->simple_rte_array[baserel->relid];
+    rel = heap_open(rte->relid, AccessShareLock);
     tupleDesc = RelationGetDescr(rel);
 
+    /* Analyze query clauses and extract ones that can be of interest to us*/
     extract_rowgroup_filters(baserel->baserestrictinfo, filters);
 
-    auto fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
-
-    /* TODO: check if file exists and stuff */
-    std::unique_ptr<parquet::arrow::FileReader> reader(
-        new parquet::arrow::FileReader(
-            arrow::default_memory_pool(),
-            parquet::ParquetFileReader::OpenFile(fdw_private->filename, false)));
+    /* Open parquet file to read meta information */
+    try
+    {
+        reader.reset(
+            new parquet::arrow::FileReader(
+                    arrow::default_memory_pool(),
+                    parquet::ParquetFileReader::OpenFile(fdw_private->filename,
+                                                         false)));
+    }
+    catch(const std::exception& e)
+    {
+        elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
+    }
     auto meta = reader->parquet_reader()->metadata();
 
-    *ntuples = 0;
-
-    /* Check whether row group matches filters */
+    /* Check each row group whether it matches the filters */
     for (int r = 0; r < reader->num_row_groups(); r++)
     {
         bool match = true;
-        auto rowgroup = reader
-                    ->parquet_reader()
-                    ->metadata()
-                    ->RowGroup(r);
+        auto rowgroup = meta->RowGroup(r);
 
         for (auto it = filters.begin(); it != filters.end(); it++)
         {
             RowGroupFilter &filter = *it;
+            AttrNumber      attnum;
+            const char     *attname;
 
+            attnum = filter.attnum - 1;
+            attname = NameStr(TupleDescAttr(tupleDesc, attnum)->attname);
+
+            /*
+             * Search for the column with the same name as filtered attribute
+             */
             for (int k = 0; k < rowgroup->num_columns(); k++)
             {
-                auto column = rowgroup->ColumnChunk(k);
-                AttrNumber attr = filter.attnum - 1;
+                auto    column = rowgroup->ColumnChunk(k);
                 std::vector<std::string> path = column->path_in_schema()->ToDotVector();
 
-                if (strcmp(NameStr(TupleDescAttr(tupleDesc, attr)->attname),
-                           path[0].c_str()) == 0)
+                if (strcmp(attname, path[0].c_str()) == 0)
                 {
+                    /* Found it! */
                     std::shared_ptr<parquet::RowGroupStatistics>  stats;
-                    std::shared_ptr<arrow::Field>                 field;
-                    std::shared_ptr<arrow::DataType>              type;
-                    const parquet::schema::GroupNode& schema_node = *meta->schema()->group_node();
+                    std::shared_ptr<arrow::Field>       field;
+                    std::shared_ptr<arrow::DataType>    type;
+                    const auto  &schema_node = *meta->schema()->group_node();
 
-                    parquet::arrow::NodeToField(*schema_node.field(k), &field);
                     stats = column->statistics();
+
+                    /* Convert to arrow field to get appropriate type */
+                    parquet::arrow::NodeToField(*schema_node.field(k), &field);
                     type = field->type();
 
-                    if (stats && !row_group_matches_filter(stats.get(),
-                                                           type.get(),
-                                                           &filter))
+                    /*
+                     * If at least one filter doesn't match rowgroup exclude
+                     * the current row group and proceed with the next one.
+                     */
+                    if (stats &&
+                        !row_group_matches_filter(stats.get(), type.get(), &filter))
                     {
                         match = false;
+                        elog(DEBUG1, "parquet_fdw: skip rowgroup %d", r + 1);
                     }
+                    break;
                 }
             }  /* loop over columns */
+
+            if (!match)
+                break;
+
         }  /* loop over filters */
         
         /* All the filters match this rowgroup */
         if (match)
         {
-            elog(LOG, "row group valid %i", r);
             fdw_private->rowgroups = lappend_int(fdw_private->rowgroups, r);
-            *ntuples += rowgroup->num_rows();
-        }  /* loop over rowgroups */
-    }
+            fdw_private->ntuples += rowgroup->num_rows();
+        } 
+    }  /* loop over rowgroups */
 
     heap_close(rel, AccessShareLock);
+}
+
+static void
+estimate_costs(RelOptInfo *baserel, Cost *startup_cost, Cost *total_cost)
+{
+    auto    fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
+    Cost    run_cost = 0;
 
     /*
-     * Actual cost estimation. Here we assume that parquet tuple cost is the
+     * Here we assume that parquet tuple cost is the
      * same as regular tuple cost even that this is probably not true in many
      * cases. Maybe we'll come up with a smarter idea later.
      */
-    run_cost = *ntuples * cpu_tuple_cost;
+    run_cost = fdw_private->ntuples * cpu_tuple_cost;
 	*startup_cost = baserel->baserestrictcost.startup;
 	*total_cost = *startup_cost + run_cost;
 }
@@ -660,12 +697,16 @@ parquetGetForeignPaths(PlannerInfo *root,
 	Cost		total_cost;
     List       *pathkeys = NIL;
     ListCell   *lc;
-    int64       ntuples;
 
     fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
 
-    /* Estimate costs */
-    estimate_costs(root, baserel, &startup_cost, &total_cost, &ntuples);
+    /*
+     * Extract list of row groups that match query clauses. Also calculate
+     * approximate number of rows in result set based on total number of tuples
+     * in those row groups. It isn't very precise but it is best we got.
+     */
+    extract_rowgroups_list(root, baserel);
+    estimate_costs(baserel, &startup_cost, &total_cost);
 
     /* Collect used attributes to reduce number of read columns during scan */
     extract_used_attributes(baserel);
@@ -706,7 +747,7 @@ parquetGetForeignPaths(PlannerInfo *root,
 	add_path(baserel, (Path *)
 			 create_foreignscan_path(root, baserel,
 									 NULL,	/* default pathtarget */
-									 ntuples,
+									 fdw_private->ntuples,
 									 startup_cost,
 									 total_cost,
 									 pathkeys,
@@ -1343,17 +1384,15 @@ read_next_rowgroup(ForeignScanState *node)
         elog(ERROR, "parquet_fdw: error reading parquet schema");
 
 next_rowgroup:
-    //if (festate->row_group >= festate->reader->num_row_groups())
     if (festate->row_group >= festate->rowgroups.size())
         return false;
 
-    auto rowgroup = festate->reader
-                        ->parquet_reader()
-                        ->metadata()
-                        ->RowGroup(festate->rowgroups[festate->row_group]);
+    int  rowgroup = festate->rowgroups[festate->row_group];
+    auto rowgroup_meta = festate->reader
+                            ->parquet_reader()
+                            ->metadata()
+                            ->RowGroup(rowgroup);
     
-    //берем следующую rowgroup-у из списка
-
     /* Determine which columns has null values */
     for (int i = 0; i < festate->map.size(); i++)
     {
@@ -1363,7 +1402,9 @@ next_rowgroup:
         if (arrow_col < 0)
             continue;
 
-        stats = rowgroup->ColumnChunk(festate->indices[arrow_col])->statistics();
+        stats = rowgroup_meta
+            ->ColumnChunk(festate->indices[arrow_col])
+            ->statistics();
 
         if (stats)
             festate->has_nulls[arrow_col] = (stats->null_count() > 0);
@@ -1372,7 +1413,7 @@ next_rowgroup:
     }
 
     status = festate->reader
-        ->RowGroup(festate->row_group)
+        ->RowGroup(rowgroup)
         ->ReadTable(festate->indices, &festate->table);
 
     if (!status.ok())
@@ -1492,6 +1533,10 @@ parquetExplainForeignScan(ForeignScanState *node, ExplainState *es)
 
     foreach(lc, rowgroups)
     {
+        /*
+         * As parquet-tools use 1 based indexing for row groups it's probably
+         * a good idea to output row groups numbers in the same way.
+         */
         int rowgroup = lfirst_int(lc) + 1;
 
         if (is_first)
