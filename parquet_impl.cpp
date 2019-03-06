@@ -18,6 +18,7 @@ extern "C"
 {
 #include "postgres.h"
 
+#include "access/parallel.h"
 #include "access/sysattr.h"
 #include "access/nbtree.h"
 #include "catalog/pg_type.h"
@@ -99,6 +100,11 @@ struct ChunkInfo
     int64   len;        /* current chunk length */
 };
 
+struct ParallelCoordinator
+{
+    pg_atomic_uint32 next_rowgroup; 
+};
+
 class ParquetFdwExecutionState
 {
 public:
@@ -131,7 +137,7 @@ public:
 
     bool           *has_nulls;          /* per-column info on nulls */
 
-    uint32_t        row_group;          /* current row group index */
+    int             row_group;          /* current row group index */
     uint32_t        row;                /* current row within row group */
     uint32_t        num_rows;           /* total rows in row group */
     std::vector<ChunkInfo> chunk_info;  /* current chunk and position per-column */
@@ -143,7 +149,7 @@ public:
     std::list<RowGroupFilter>       filters;
 
     /*
-     *
+     * List of row group indexes to scan
      */
     std::vector<int>                rowgroups;
 
@@ -156,12 +162,15 @@ public:
     char                           *segment_last_ptr;
     std::list<char *>               garbage_segments;
 
+    /* Coordinator for parallel query execution */
+    ParallelCoordinator            *coordinator;
 
     /* Wether object is properly initialized */
     bool     initialized;
 
     ParquetFdwExecutionState(const char *filename, bool use_mmap)
-        : row_group(0), row(0), num_rows(0), initialized(false)
+        : row_group(-1), row(0), num_rows(0), coordinator(NULL),
+          initialized(false)
     {
         reader.reset(
             new parquet::arrow::FileReader(
@@ -646,19 +655,19 @@ extract_rowgroups_list(PlannerInfo *root, RelOptInfo *baserel)
 }
 
 static void
-estimate_costs(RelOptInfo *baserel, Cost *startup_cost, Cost *total_cost)
+estimate_costs(RelOptInfo *baserel, Cost *startup_cost, Cost *run_cost,
+               Cost *total_cost)
 {
     auto    fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
-    Cost    run_cost = 0;
 
     /*
      * Here we assume that parquet tuple cost is the
      * same as regular tuple cost even that this is probably not true in many
      * cases. Maybe we'll come up with a smarter idea later.
      */
-    run_cost = fdw_private->ntuples * cpu_tuple_cost;
+    *run_cost = fdw_private->ntuples * cpu_tuple_cost;
 	*startup_cost = baserel->baserestrictcost.startup;
-	*total_cost = *startup_cost + run_cost;
+	*total_cost = *startup_cost + *run_cost;
 }
 
 static void
@@ -695,6 +704,7 @@ parquetGetForeignPaths(PlannerInfo *root,
 	ParquetFdwPlanState *fdw_private;
 	Cost		startup_cost;
 	Cost		total_cost;
+    Cost        run_cost;
     List       *pathkeys = NIL;
     ListCell   *lc;
 
@@ -706,7 +716,8 @@ parquetGetForeignPaths(PlannerInfo *root,
      * in those row groups. It isn't very precise but it is best we got.
      */
     extract_rowgroups_list(root, baserel);
-    estimate_costs(baserel, &startup_cost, &total_cost);
+    estimate_costs(baserel, &startup_cost, &run_cost, &total_cost);
+    baserel->rows = fdw_private->ntuples;
 
     /* Collect used attributes to reduce number of read columns during scan */
     extract_used_attributes(baserel);
@@ -754,6 +765,28 @@ parquetGetForeignPaths(PlannerInfo *root,
 									 NULL,	/* no outer rel either */
 									 NULL,	/* no extra plan */
 									 (List *) fdw_private));
+
+    if (max_parallel_workers_per_gather > 0)
+    {
+        Path *parallel_path = (Path *)
+                 create_foreignscan_path(root, baserel,
+                                         NULL,	/* default pathtarget */
+                                         fdw_private->ntuples,
+                                         startup_cost,
+                                         total_cost,
+									     pathkeys,
+                                         NULL,	/* no outer rel either */
+                                         NULL,	/* no extra plan */
+                                         (List *) fdw_private);
+
+        int num_workers = max_parallel_workers_per_gather;
+
+        parallel_path->rows = fdw_private->ntuples / num_workers;
+        parallel_path->total_cost       = startup_cost + run_cost / num_workers;
+        parallel_path->parallel_aware   = true;
+        parallel_path->parallel_workers = num_workers;
+        add_partial_path(baserel, parallel_path);
+    }
 }
 
 extern "C" ForeignScan *
@@ -1367,12 +1400,19 @@ find_cmp_func(FmgrInfo *finfo, Oid type1, Oid type2)
 static bool
 read_next_rowgroup(ForeignScanState *node)
 {
-    ParquetFdwExecutionState   *festate = (ParquetFdwExecutionState *) node->fdw_state;
-	ForeignScan        *plan = (ForeignScan *) node->ss.ps.plan;
-    TupleTableSlot     *slot = node->ss.ss_ScanTupleSlot;
     std::shared_ptr<arrow::Schema> schema;
-    arrow::Status status;
-    int natts = slot->tts_tupleDescriptor->natts;
+    ParquetFdwExecutionState   *festate;
+    ParallelCoordinator        *coord;
+	ForeignScan                *plan;
+    TupleTableSlot             *slot;
+    arrow::Status               status;
+    int                         natts;
+
+    plan = (ForeignScan *) node->ss.ps.plan;
+    slot = node->ss.ss_ScanTupleSlot;
+    natts = slot->tts_tupleDescriptor->natts;
+    festate = (ParquetFdwExecutionState *) node->fdw_state;
+    coord = festate->coordinator;
 
     /* TODO: probably it is worth to build schema once and not for each row
      * group iteration */
@@ -1383,7 +1423,15 @@ read_next_rowgroup(ForeignScanState *node)
     if (!status.ok())
         elog(ERROR, "parquet_fdw: error reading parquet schema");
 
-next_rowgroup:
+    /*
+     * Use atomic increment for parallel query or just regular one for single
+     * threaded execution.
+     */
+    if (coord)
+        festate->row_group = pg_atomic_fetch_add_u32(&coord->next_rowgroup, 1);
+    else
+        festate->row_group++;
+
     if (festate->row_group >= festate->rowgroups.size())
         return false;
 
@@ -1392,7 +1440,8 @@ next_rowgroup:
                             ->parquet_reader()
                             ->metadata()
                             ->RowGroup(rowgroup);
-    
+    elog(LOG, "read %i row group", rowgroup);
+
     /* Determine which columns has null values */
     for (int i = 0; i < festate->map.size(); i++)
     {
@@ -1442,7 +1491,6 @@ next_rowgroup:
 
     festate->row = 0;
     festate->num_rows = festate->table->num_rows();
-    festate->row_group++;
 
     return true;
 }
@@ -1451,7 +1499,8 @@ extern "C" TupleTableSlot *
 parquetIterateForeignScan(ForeignScanState *node)
 {
     ParquetFdwExecutionState   *festate = (ParquetFdwExecutionState *) node->fdw_state;
-	TupleTableSlot     *slot = node->ss.ss_ScanTupleSlot;
+	TupleTableSlot             *slot = node->ss.ss_ScanTupleSlot;
+    ParallelCoordinator        *coord = festate->coordinator;
 
 	ExecClearTuple(slot);
 
@@ -1466,10 +1515,6 @@ parquetIterateForeignScan(ForeignScanState *node)
 
     if (festate->row >= festate->num_rows)
     {
-        /* Are there row groups left to read? */
-        if (festate->row_group >= festate->reader->num_row_groups())
-            return slot;
-
         /* Read next row group */
         try
         {
@@ -1550,3 +1595,61 @@ parquetExplainForeignScan(ForeignScanState *node, ExplainState *es)
 
     ExplainPropertyText("Row groups", str.data, es);
 }
+
+/* Parallel query execution */
+
+extern "C" bool
+parquetIsForeignScanParallelSafe(PlannerInfo *root, RelOptInfo *rel,
+                                 RangeTblEntry *rte)
+{
+    return true;
+}
+
+extern "C" Size
+parquetEstimateDSMForeignScan(ForeignScanState *node, ParallelContext *pcxt)
+{
+    return sizeof(ParallelCoordinator);
+}
+
+extern "C" void
+parquetInitializeDSMForeignScan(ForeignScanState *node, ParallelContext *pcxt,
+                                void *coordinate)
+{
+    ParallelCoordinator        *coord = (ParallelCoordinator *) coordinate;
+    ParquetFdwExecutionState   *festate;
+
+    pg_atomic_write_u32(&coord->next_rowgroup, 0);
+    festate = (ParquetFdwExecutionState *) node->fdw_state;
+    festate->coordinator = coord;
+}
+
+extern "C" void
+parquetReInitializeDSMForeignScan(ForeignScanState *node,
+                                  ParallelContext *pcxt, void *coordinate)
+{
+    ParallelCoordinator    *coord = (ParallelCoordinator *) coordinate;
+
+    pg_atomic_write_u32(&coord->next_rowgroup, 0);
+}
+
+extern "C" void
+parquetInitializeWorkerForeignScan(ForeignScanState *node,
+                                   shm_toc *toc,
+                                   void *coordinate)
+{
+    ParallelCoordinator        *coord   = (ParallelCoordinator *) coordinate;
+    ParquetFdwExecutionState   *festate;
+
+    festate = (ParquetFdwExecutionState *) node->fdw_state;
+    festate->coordinator = coord;
+}
+
+extern "C" void
+parquetShutdownForeignScan(ForeignScanState *node)
+{
+    ParquetFdwExecutionState   *festate;
+
+    festate = (ParquetFdwExecutionState *) node->fdw_state;
+    festate->coordinator = NULL;
+}
+
