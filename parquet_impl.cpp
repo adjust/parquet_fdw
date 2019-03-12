@@ -18,6 +18,7 @@ extern "C"
 {
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/parallel.h"
 #include "access/sysattr.h"
 #include "access/nbtree.h"
@@ -26,6 +27,7 @@ extern "C"
 #include "commands/explain.h"
 #include "executor/tuptable.h"
 #include "foreign/foreign.h"
+#include "foreign/fdwapi.h"
 #include "nodes/execnodes.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/makefuncs.h"
@@ -110,6 +112,8 @@ class ParquetFdwExecutionState
 public:
     std::unique_ptr<parquet::arrow::FileReader> reader;
 
+    std::shared_ptr<arrow::Schema>  schema;
+
     /* Arrow column indices that are used in query */
     std::vector<int>                indices;
 
@@ -180,25 +184,25 @@ public:
 };
 
 static ParquetFdwExecutionState *
-create_parquet_state(ForeignScanState *scanstate,
-                     const char *filename,
+create_parquet_state(const char *filename,
+                     TupleDesc tupleDesc,
+                     MemoryContext parent_cxt,
                      std::set<int> &attrs_used,
                      bool use_mmap,
                      bool use_threads)
 {
     ParquetFdwExecutionState *festate;
-	EState	   *estate = scanstate->ss.ps.state;
 
     festate = new ParquetFdwExecutionState(filename, use_mmap);
-    scanstate->fdw_state = festate;
     auto schema = festate->reader->parquet_reader()->metadata()->schema();
+
+    if (!parquet::arrow::FromParquetSchema(schema, &festate->schema).ok())
+        elog(ERROR, "parquet_fdw: error reading parquet schema");
+
 
     /* Enable parallel columns decoding/decompression if needed */
     festate->reader->set_use_threads(use_threads && parquet_fdw_use_threads);
  
-    TupleTableSlot *slot = scanstate->ss.ss_ScanTupleSlot;
-    TupleDesc tupleDesc = slot->tts_tupleDescriptor;
-
     /* Create mapping between tuple descriptor and parquet columns. */
     festate->map.resize(tupleDesc->natts);
     for (int i = 0; i < tupleDesc->natts; i++)
@@ -231,6 +235,8 @@ create_parquet_state(ForeignScanState *scanstate,
 
                 /* index of last element */
                 festate->map[i] = festate->indices.size() - 1; 
+
+                festate->types.push_back(festate->schema->field(k)->type().get());
                 break;
             }
         }
@@ -238,7 +244,7 @@ create_parquet_state(ForeignScanState *scanstate,
 
     festate->has_nulls = (bool *) palloc(sizeof(bool) * festate->map.size());
 
-    festate->segments_cxt = AllocSetContextCreate(estate->es_query_cxt,
+    festate->segments_cxt = AllocSetContextCreate(parent_cxt,
                                                   "parquet_fdw tuple data",
                                                   ALLOCSET_DEFAULT_SIZES);
     festate->segment_start_ptr = NULL;
@@ -774,14 +780,14 @@ parquetGetForeignPaths(PlannerInfo *root,
                                          fdw_private->ntuples,
                                          startup_cost,
                                          total_cost,
-									     pathkeys,
+									     NULL,
                                          NULL,	/* no outer rel either */
                                          NULL,	/* no extra plan */
                                          (List *) fdw_private);
 
         int num_workers = max_parallel_workers_per_gather;
 
-        parallel_path->rows = fdw_private->ntuples / num_workers;
+        parallel_path->rows = fdw_private->ntuples / (num_workers + 1);
         parallel_path->total_cost       = startup_cost + run_cost / num_workers;
         parallel_path->parallel_aware   = true;
         parallel_path->parallel_workers = num_workers;
@@ -865,10 +871,15 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
     use_mmap = (bool) intVal((Value *) lthird(fdw_private));
     use_threads = (bool) intVal((Value *) lfourth(fdw_private));
 
+    MemoryContext cxt = estate->es_query_cxt;
+    TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+    TupleDesc tupleDesc = slot->tts_tupleDescriptor;
+
     try
     {
-        festate = create_parquet_state(node,
-                                       filename,
+        festate = create_parquet_state(filename,
+                                       tupleDesc,
+                                       cxt,
                                        attrs_used,
                                        use_mmap,
                                        use_threads);
@@ -900,11 +911,8 @@ get_arrow_list_elem_type(arrow::DataType *type)
  *      call. For arrays find cast functions for its elements.
  */
 static void
-initialize_castfuncs(ForeignScanState *node)
+initialize_castfuncs(ParquetFdwExecutionState *festate, TupleDesc tupleDesc)
 {
-    ParquetFdwExecutionState *festate = (ParquetFdwExecutionState *) node->fdw_state;
-	TupleTableSlot     *slot = node->ss.ss_ScanTupleSlot;
-
     festate->castfuncs.resize(festate->map.size());
 
     for (int i = 0; i < festate->map.size(); ++i)
@@ -918,7 +926,6 @@ initialize_castfuncs(ForeignScanState *node)
             continue;
         }
 
-        std::shared_ptr<arrow::Column> column = festate->table->column(festate->map[i]);
         arrow::DataType *type = festate->types[arrow_col];
         int     type_id = type->id();
         int     src_type,
@@ -926,7 +933,6 @@ initialize_castfuncs(ForeignScanState *node)
         bool    src_is_list,
                 dst_is_array;
         Oid     funcid;
-        TupleDesc tupleDesc = slot->tts_tupleDescriptor;
         CoercionPathType ct;
 
         /* Find underlying type of list */
@@ -1226,9 +1232,15 @@ construct_array:
 /*
  * populate_slot
  *      Fill slot with the values from parquet row.
+ *
+ * If `fake` set to true the actual reading and populating the slot is skipped.
+ * The purpose of this feature is to correctly skip rows to collect sparse
+ * samples.
  */
 static void
-populate_slot(ParquetFdwExecutionState *festate, TupleTableSlot *slot)
+populate_slot(ParquetFdwExecutionState *festate,
+              TupleTableSlot *slot,
+              bool fake=false)
 {
     /* Fill slot values */
     for (int attr = 0; attr < slot->tts_tupleDescriptor->natts; attr++)
@@ -1248,24 +1260,28 @@ populate_slot(ParquetFdwExecutionState *festate, TupleTableSlot *slot)
 
             chunkInfo.len = array->length();
 
+            if (chunkInfo.pos >= chunkInfo.len)
+            {
+                auto column = festate->table->column(arrow_col);
+
+                /* There are no more chunks */
+                if (++chunkInfo.chunk >= column->data()->num_chunks())
+                    break;
+
+                array = column->data()->chunk(chunkInfo.chunk).get();
+                festate->chunks[arrow_col] = array;
+                chunkInfo.pos = 0;
+                chunkInfo.len = array->length();
+            }
+
+            /* Don't do actual reading data into slot in fake mode */
+            if (fake)
+                continue;
+
             /* Currently only primitive types and lists are supported */
             if (arrow_type_id != arrow::Type::LIST)
             {
                 int64   offset;
-
-                if (chunkInfo.pos >= chunkInfo.len)
-                {
-                    auto column = festate->table->column(arrow_col);
-
-                    /* There are no more chunks */
-                    if (++chunkInfo.chunk >= column->data()->num_chunks())
-                        break;
-
-                    array = column->data()->chunk(chunkInfo.chunk).get();
-                    festate->chunks[arrow_col] = array;
-                    chunkInfo.pos = 0;
-                    chunkInfo.len = array->length();
-                }
 
                 if (festate->has_nulls[arrow_col] && array->IsNull(chunkInfo.pos))
                 {
@@ -1297,19 +1313,6 @@ populate_slot(ParquetFdwExecutionState *festate, TupleTableSlot *slot)
                 pg_type_id = get_element_type(pg_type_id);
                 arrow_type_id = get_arrow_list_elem_type(arrow_type);
 
-                if (chunkInfo.pos >= chunkInfo.len)
-                {
-                    auto column = festate->table->column(arrow_col);
-
-                    /* There are no more chunks */
-                    if (++chunkInfo.chunk >= column->data()->num_chunks())
-                        break;
-
-                    array = column->data()->chunk(chunkInfo.chunk).get();
-                    festate->chunks[arrow_col] = array;
-                    chunkInfo.pos = 0;
-                    chunkInfo.len = array->length();
-                }
                 int64 pos = chunkInfo.pos;
                 arrow::ListArray   *larray = (arrow::ListArray *) array;
 
@@ -1398,30 +1401,12 @@ find_cmp_func(FmgrInfo *finfo, Oid type1, Oid type2)
 }
 
 static bool
-read_next_rowgroup(ForeignScanState *node)
+read_next_rowgroup(ParquetFdwExecutionState *festate, TupleDesc tupleDesc)
 {
-    std::shared_ptr<arrow::Schema> schema;
-    ParquetFdwExecutionState   *festate;
     ParallelCoordinator        *coord;
-	ForeignScan                *plan;
-    TupleTableSlot             *slot;
     arrow::Status               status;
-    int                         natts;
 
-    plan = (ForeignScan *) node->ss.ps.plan;
-    slot = node->ss.ss_ScanTupleSlot;
-    natts = slot->tts_tupleDescriptor->natts;
-    festate = (ParquetFdwExecutionState *) node->fdw_state;
     coord = festate->coordinator;
-
-    /* TODO: probably it is worth to build schema once and not for each row
-     * group iteration */
-    status =  parquet::arrow::FromParquetSchema(
-            festate->reader->parquet_reader()->metadata()->schema(),
-            &schema);
-
-    if (!status.ok())
-        elog(ERROR, "parquet_fdw: error reading parquet schema");
 
     /*
      * Use atomic increment for parallel query or just regular one for single
@@ -1440,7 +1425,6 @@ read_next_rowgroup(ForeignScanState *node)
                             ->parquet_reader()
                             ->metadata()
                             ->RowGroup(rowgroup);
-    elog(LOG, "read %i row group", rowgroup);
 
     /* Determine which columns has null values */
     for (int i = 0; i < festate->map.size(); i++)
@@ -1473,17 +1457,15 @@ read_next_rowgroup(ForeignScanState *node)
 
     /* Fill festate->columns and festate->types */
     /* TODO: don't clear each time */
-    festate->types.clear();
     festate->chunk_info.clear();
     festate->chunks.clear();
-    for (int i = 0; i < natts; i++)
+    for (int i = 0; i < tupleDesc->natts; i++)
     {
         if (festate->map[i] >= 0)
         {
             ChunkInfo chunkInfo = { .chunk = 0, .pos = 0, .len = 0 };
             auto column = festate->table->column(festate->map[i]);
 
-            festate->types.push_back(column->type().get());
             festate->chunk_info.push_back(chunkInfo);
             festate->chunks.push_back(column->data()->chunk(0).get());
         }
@@ -1518,7 +1500,7 @@ parquetIterateForeignScan(ForeignScanState *node)
         /* Read next row group */
         try
         {
-            if (!read_next_rowgroup(node))
+            if (!read_next_rowgroup(festate, slot->tts_tupleDescriptor))
                 return slot;
         }
         catch(const std::exception& e)
@@ -1530,7 +1512,7 @@ parquetIterateForeignScan(ForeignScanState *node)
 
         /* Lookup cast funcs */
         if (!festate->initialized)
-            initialize_castfuncs(node);
+            initialize_castfuncs(festate, slot->tts_tupleDescriptor);
     }
 
     populate_slot(festate, slot);
@@ -1556,6 +1538,108 @@ parquetReScanForeignScan(ForeignScanState *node)
     festate->row_group = 0;
     festate->row = 0;
     festate->num_rows = 0;
+}
+
+static int
+parquetAcquireSampleRowsFunc(Relation relation, int elevel,
+                             HeapTuple *rows, int targrows,
+                             double *totalrows,
+                             double *totaldeadrows)
+{
+    ParquetFdwExecutionState *festate;
+    TupleDesc       tupleDesc = RelationGetDescr(relation);
+    TupleTableSlot *slot;
+    std::set<int>   attrs_used;
+    std::string filename = "/home/zilder/projects/daily/005-parquet/tmp-r-00007.gz.parquet";
+    int cnt = 0;
+
+    for (int i = 0; i < tupleDesc->natts; ++i)
+        attrs_used.insert(i);
+
+    /* Open parquet file and build execution state */
+    try
+    {
+        festate = create_parquet_state(filename.c_str(),
+                                       tupleDesc,
+                                       CurrentMemoryContext,
+                                       attrs_used,
+                                       false,
+                                       false);
+    }
+    catch(const std::exception& e)
+    {
+        elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
+    }
+    auto meta = festate->reader->parquet_reader()->metadata();
+    int rate =  meta->num_rows() / targrows;
+
+    /* We need to scan all rowgroups */
+    for (int i = 0; i < meta->num_row_groups(); ++i)
+        festate->rowgroups.push_back(i);
+
+    slot = MakeSingleTupleTableSlot(tupleDesc);
+    initialize_castfuncs(festate, tupleDesc);
+
+    while (true)
+    {
+        /* recycle old segments if any */
+        if (!festate->garbage_segments.empty())
+        {
+            for (auto it : festate->garbage_segments)
+                pfree(it);
+            festate->garbage_segments.clear();
+            elog(DEBUG1, "parquet_fdw: garbage segments recycled");
+        }
+
+        if (festate->row >= festate->num_rows)
+        {
+            /* Read next row group */
+            try
+            {
+                if (!read_next_rowgroup(festate, tupleDesc))
+                    break;
+            }
+            catch(const std::exception& e)
+            {
+                elog(ERROR,
+                     "parquet_fdw: failed to read row group %d: %s",
+                     festate->row_group, e.what());
+            }
+        }
+
+        bool fake = (festate->row % rate) != 0;
+
+        populate_slot(festate, slot, fake);
+
+        if (!fake)
+        {
+            rows[cnt++] = heap_form_tuple(tupleDesc,
+                                          slot->tts_values,
+                                          slot->tts_isnull);
+        }
+
+        if (cnt > targrows)
+            break;
+
+        festate->row++;
+    }
+
+    *totalrows = meta->num_rows();
+    *totaldeadrows = 0;
+
+    ExecDropSingleTupleTableSlot(slot);
+    delete festate;
+
+    return cnt;
+}
+
+extern "C" bool
+parquetAnalyzeForeignTable (Relation relation,
+                            AcquireSampleRowsFunc *func,
+                            BlockNumber *totalpages)
+{
+    *func = parquetAcquireSampleRowsFunc;
+    return true;
 }
 
 /*
@@ -1602,7 +1686,8 @@ extern "C" bool
 parquetIsForeignScanParallelSafe(PlannerInfo *root, RelOptInfo *rel,
                                  RangeTblEntry *rte)
 {
-    return true;
+    /* Use parallel execution only when statistics are collected */
+    return (rel->tuples > 0);
 }
 
 extern "C" Size

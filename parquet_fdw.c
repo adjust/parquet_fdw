@@ -36,6 +36,13 @@ extern TupleTableSlot *parquetIterateForeignScan(ForeignScanState *node);
 extern void parquetBeginForeignScan(ForeignScanState *node, int eflags);
 extern void parquetEndForeignScan(ForeignScanState *node);
 extern void parquetReScanForeignScan(ForeignScanState *node);
+extern int parquetAcquireSampleRowsFunc(Relation relation, int elevel,
+                             HeapTuple *rows, int targrows,
+                             double *totalrows,
+                             double *totaldeadrows);
+extern bool parquetAnalyzeForeignTable (Relation relation,
+                            AcquireSampleRowsFunc *func,
+                            BlockNumber *totalpages);
 extern void parquetExplainForeignScan(ForeignScanState *node, ExplainState *es);
 extern bool parquetIsForeignScanParallelSafe(PlannerInfo *root, RelOptInfo *rel,
                                              RangeTblEntry *rte);
@@ -84,6 +91,7 @@ parquet_fdw_handler(PG_FUNCTION_ARGS)
     fdwroutine->IterateForeignScan = parquetIterateForeignScan;
     fdwroutine->ReScanForeignScan = parquetReScanForeignScan;
     fdwroutine->EndForeignScan = parquetEndForeignScan;
+    fdwroutine->AnalyzeForeignTable = parquetAnalyzeForeignTable;
     fdwroutine->ExplainForeignScan = parquetExplainForeignScan;
     fdwroutine->IsForeignScanParallelSafe = parquetIsForeignScanParallelSafe;
     fdwroutine->EstimateDSMForeignScan = parquetEstimateDSMForeignScan;
