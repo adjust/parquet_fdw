@@ -28,6 +28,7 @@ extern "C"
 #include "executor/tuptable.h"
 #include "foreign/foreign.h"
 #include "foreign/fdwapi.h"
+#include "miscadmin.h"
 #include "nodes/execnodes.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/makefuncs.h"
@@ -1546,12 +1547,14 @@ parquetAcquireSampleRowsFunc(Relation relation, int elevel,
                              double *totalrows,
                              double *totaldeadrows)
 {
-    ParquetFdwExecutionState *festate;
+    ParquetFdwExecutionState   *festate;
+    ParquetFdwPlanState         fdw_private;
     TupleDesc       tupleDesc = RelationGetDescr(relation);
     TupleTableSlot *slot;
     std::set<int>   attrs_used;
-    std::string filename = "/home/zilder/projects/daily/005-parquet/tmp-r-00007.gz.parquet";
     int cnt = 0;
+
+    get_table_options(RelationGetRelid(relation), &fdw_private);
 
     for (int i = 0; i < tupleDesc->natts; ++i)
         attrs_used.insert(i);
@@ -1559,75 +1562,89 @@ parquetAcquireSampleRowsFunc(Relation relation, int elevel,
     /* Open parquet file and build execution state */
     try
     {
-        festate = create_parquet_state(filename.c_str(),
+        festate = create_parquet_state(fdw_private.filename,
                                        tupleDesc,
                                        CurrentMemoryContext,
                                        attrs_used,
                                        false,
-                                       false);
+                                       fdw_private.use_threads);
     }
     catch(const std::exception& e)
     {
         elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
     }
-    auto meta = festate->reader->parquet_reader()->metadata();
-    int rate =  meta->num_rows() / targrows;
 
-    /* We need to scan all rowgroups */
-    for (int i = 0; i < meta->num_row_groups(); ++i)
-        festate->rowgroups.push_back(i);
-
-    slot = MakeSingleTupleTableSlot(tupleDesc);
-    initialize_castfuncs(festate, tupleDesc);
-
-    while (true)
+    PG_TRY();
     {
-        /* recycle old segments if any */
-        if (!festate->garbage_segments.empty())
-        {
-            for (auto it : festate->garbage_segments)
-                pfree(it);
-            festate->garbage_segments.clear();
-            elog(DEBUG1, "parquet_fdw: garbage segments recycled");
-        }
+        auto meta = festate->reader->parquet_reader()->metadata();
+        int rate =  meta->num_rows() / targrows;
 
-        if (festate->row >= festate->num_rows)
+        /* We need to scan all rowgroups */
+        for (int i = 0; i < meta->num_row_groups(); ++i)
+            festate->rowgroups.push_back(i);
+
+        slot = MakeSingleTupleTableSlot(tupleDesc);
+        initialize_castfuncs(festate, tupleDesc);
+
+        while (true)
         {
-            /* Read next row group */
-            try
+            CHECK_FOR_INTERRUPTS();
+
+            /* recycle old segments if any */
+            if (!festate->garbage_segments.empty())
             {
-                if (!read_next_rowgroup(festate, tupleDesc))
-                    break;
+                for (auto it : festate->garbage_segments)
+                    pfree(it);
+                festate->garbage_segments.clear();
+                elog(DEBUG1, "parquet_fdw: garbage segments recycled");
             }
-            catch(const std::exception& e)
+
+            if (festate->row >= festate->num_rows)
             {
-                elog(ERROR,
-                     "parquet_fdw: failed to read row group %d: %s",
-                     festate->row_group, e.what());
+                /* Read next row group */
+                try
+                {
+                    if (!read_next_rowgroup(festate, tupleDesc))
+                        break;
+                }
+                catch(const std::exception& e)
+                {
+                    elog(ERROR,
+                         "parquet_fdw: failed to read row group %d: %s",
+                         festate->row_group, e.what());
+                }
             }
+
+            bool fake = (festate->row % rate) != 0;
+
+            populate_slot(festate, slot, fake);
+
+            if (!fake)
+            {
+                rows[cnt++] = heap_form_tuple(tupleDesc,
+                                              slot->tts_values,
+                                              slot->tts_isnull);
+            }
+
+            if (cnt > targrows)
+                break;
+
+            festate->row++;
         }
 
-        bool fake = (festate->row % rate) != 0;
+        *totalrows = meta->num_rows();
+        *totaldeadrows = 0;
 
-        populate_slot(festate, slot, fake);
-
-        if (!fake)
-        {
-            rows[cnt++] = heap_form_tuple(tupleDesc,
-                                          slot->tts_values,
-                                          slot->tts_isnull);
-        }
-
-        if (cnt > targrows)
-            break;
-
-        festate->row++;
+        ExecDropSingleTupleTableSlot(slot);
     }
+    PG_CATCH();
+    {
+        elog(LOG, "Cancelled");
+        delete festate;
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
 
-    *totalrows = meta->num_rows();
-    *totaldeadrows = 0;
-
-    ExecDropSingleTupleTableSlot(slot);
     delete festate;
 
     return cnt;
