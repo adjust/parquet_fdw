@@ -200,7 +200,6 @@ create_parquet_state(const char *filename,
     if (!parquet::arrow::FromParquetSchema(schema, &festate->schema).ok())
         elog(ERROR, "parquet_fdw: error reading parquet schema");
 
-
     /* Enable parallel columns decoding/decompression if needed */
     festate->reader->set_use_threads(use_threads && parquet_fdw_use_threads);
  
@@ -1557,7 +1556,7 @@ parquetAcquireSampleRowsFunc(Relation relation, int elevel,
     get_table_options(RelationGetRelid(relation), &fdw_private);
 
     for (int i = 0; i < tupleDesc->natts; ++i)
-        attrs_used.insert(i);
+        attrs_used.insert(i + 1 - FirstLowInvalidHeapAttributeNumber);
 
     /* Open parquet file and build execution state */
     try
@@ -1577,7 +1576,10 @@ parquetAcquireSampleRowsFunc(Relation relation, int elevel,
     PG_TRY();
     {
         auto meta = festate->reader->parquet_reader()->metadata();
-        int rate =  meta->num_rows() / targrows;
+        int ratio = meta->num_rows() / targrows;
+
+        /* Set ratio to at least 1 to avoid devision by zero issue */
+        ratio = ratio < 1 ? 1 : ratio;
 
         /* We need to scan all rowgroups */
         for (int i = 0; i < meta->num_row_groups(); ++i)
@@ -1589,6 +1591,9 @@ parquetAcquireSampleRowsFunc(Relation relation, int elevel,
         while (true)
         {
             CHECK_FOR_INTERRUPTS();
+
+            if (cnt >= targrows)
+                break;
 
             /* recycle old segments if any */
             if (!festate->garbage_segments.empty())
@@ -1615,7 +1620,7 @@ parquetAcquireSampleRowsFunc(Relation relation, int elevel,
                 }
             }
 
-            bool fake = (festate->row % rate) != 0;
+            bool fake = (festate->row % ratio) != 0;
 
             populate_slot(festate, slot, fake);
 
@@ -1625,9 +1630,6 @@ parquetAcquireSampleRowsFunc(Relation relation, int elevel,
                                               slot->tts_values,
                                               slot->tts_isnull);
             }
-
-            if (cnt > targrows)
-                break;
 
             festate->row++;
         }
@@ -1647,7 +1649,7 @@ parquetAcquireSampleRowsFunc(Relation relation, int elevel,
 
     delete festate;
 
-    return cnt;
+    return cnt - 1;
 }
 
 extern "C" bool
