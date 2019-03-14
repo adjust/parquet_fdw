@@ -48,7 +48,7 @@ Following options are supported:
 * **filename** - path to Parquet file to read;
 * **sorted** - space separated list of columns that Parquet file is already sorted by; that would help postgres to avoid redundant sorting when running query with `ORDER BY` clause;
 * **use_mmap** - whether memory map operations will be used instead of file read operations (default `false`);
-* **use_threads** - enables parallel columns decoding/decompression (default `false`).
+* **use_threads** - enables `arrow`'s parallel columns decoding/decompression (default `false`).
 
 GUC variables:
 * **parquet_fdw.use_threads** - global switch that allow user to enable or disable threads (default `true`).
@@ -66,3 +66,6 @@ options (
     sorted 'id'
 );
 ```
+
+### Parallel queries
+`parquet_fdw` also supports [parallel query execution](https://www.postgresql.org/docs/current/parallel-query.html) (not to confuse with multi-threaded decoding feature of `arrow`). It is disabled by default; to enable it run `ANALYZE` command on the table. The reason behind this is that without statistics postgres may end up choosing a terrible parallel plan for certain queries which would be much worse than a serial one (e.g. grouping by a column with large number of distinct values).
