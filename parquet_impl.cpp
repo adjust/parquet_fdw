@@ -661,19 +661,42 @@ extract_rowgroups_list(PlannerInfo *root, RelOptInfo *baserel)
 }
 
 static void
-estimate_costs(RelOptInfo *baserel, Cost *startup_cost, Cost *run_cost,
-               Cost *total_cost)
+estimate_costs(PlannerInfo *root, RelOptInfo *baserel, Cost *startup_cost,
+               Cost *run_cost, Cost *total_cost)
 {
     auto    fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
+    double  ntuples;
+
+    /* Use statistics if we have it */
+    if (baserel->tuples)
+    {
+        ntuples = baserel->tuples *
+            clauselist_selectivity(root,
+                                   baserel->baserestrictinfo,
+                                   0,
+                                   JOIN_INNER,
+                                   NULL);
+
+    }
+    else
+    {
+        /*
+         * If there is no statistics then use estimate based on rows number
+         * in the selected row groups.
+         */
+        ntuples = fdw_private->ntuples;
+    }
 
     /*
-     * Here we assume that parquet tuple cost is the
-     * same as regular tuple cost even that this is probably not true in many
-     * cases. Maybe we'll come up with a smarter idea later.
+     * Here we assume that parquet tuple cost is the same as regular tuple cost
+     * even though this is probably not true in many cases. Maybe we'll come up
+     * with a smarter idea later.
      */
-    *run_cost = fdw_private->ntuples * cpu_tuple_cost;
+    *run_cost = ntuples * cpu_tuple_cost;
 	*startup_cost = baserel->baserestrictcost.startup;
 	*total_cost = *startup_cost + *run_cost;
+
+    baserel->rows = ntuples;
 }
 
 static void
@@ -722,8 +745,7 @@ parquetGetForeignPaths(PlannerInfo *root,
      * in those row groups. It isn't very precise but it is best we got.
      */
     extract_rowgroups_list(root, baserel);
-    estimate_costs(baserel, &startup_cost, &run_cost, &total_cost);
-    baserel->rows = fdw_private->ntuples;
+    estimate_costs(root, baserel, &startup_cost, &run_cost, &total_cost);
 
     /* Collect used attributes to reduce number of read columns during scan */
     extract_used_attributes(baserel);
@@ -764,7 +786,7 @@ parquetGetForeignPaths(PlannerInfo *root,
 	add_path(baserel, (Path *)
 			 create_foreignscan_path(root, baserel,
 									 NULL,	/* default pathtarget */
-									 fdw_private->ntuples,
+									 baserel->rows,
 									 startup_cost,
 									 total_cost,
 									 pathkeys,
@@ -777,7 +799,7 @@ parquetGetForeignPaths(PlannerInfo *root,
         Path *parallel_path = (Path *)
                  create_foreignscan_path(root, baserel,
                                          NULL,	/* default pathtarget */
-                                         fdw_private->ntuples,
+                                         baserel->rows,
                                          startup_cost,
                                          total_cost,
 									     NULL,
