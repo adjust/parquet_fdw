@@ -1147,21 +1147,19 @@ nested_list_get_datum(ParquetFdwExecutionState *festate,
     get_typlenbyvalalign(elem_type, &elem_len, &elem_byval, &elem_align);
 
     /* Fill values and nulls arrays */
-    if (array->null_count() == 0)
+    if (array->null_count() == 0 && type_id == arrow::Type::INT64)
     {
         /*
          * Ok, there are no nulls, so probably we could just memcpy the
-         * entire array
+         * entire array.
+         *
+         * Warning: the code below is based on the assumption that Datum is
+         * 8 bytes long, which is true for most contemporary systems but this
+         * will not work on some exotic or really old systems. In this case
+         * the entire "if" branch should just be removed.
          */
-        switch(type_id)
-        {
-            case arrow::Type::INT32:
-                copy_to_c_array<int32_t>((int32_t *) values, array, elem_len);
-                goto construct_array;
-            case arrow::Type::INT64:
-                copy_to_c_array<int64_t>((int64_t *) values, array, elem_len);
-                goto construct_array;
-        }
+        copy_to_c_array<int64_t>((int64_t *) values, array, elem_len);
+        goto construct_array;
     }
     for (int64_t i = 0; i < array->length(); ++i)
     {
