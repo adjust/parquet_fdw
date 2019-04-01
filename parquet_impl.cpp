@@ -811,8 +811,9 @@ parquetGetForeignPaths(PlannerInfo *root,
 
         parallel_path->rows = fdw_private->ntuples / (num_workers + 1);
         parallel_path->total_cost       = startup_cost + run_cost / num_workers;
-        parallel_path->parallel_aware   = true;
         parallel_path->parallel_workers = num_workers;
+        parallel_path->parallel_aware   = true;
+        parallel_path->parallel_safe    = true;
         add_partial_path(baserel, parallel_path);
     }
 }
