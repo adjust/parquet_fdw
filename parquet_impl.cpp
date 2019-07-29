@@ -1778,3 +1778,97 @@ parquetShutdownForeignScan(ForeignScanState *node)
     festate->coordinator = NULL;
 }
 
+/*
+ * autodiscover_parquet_file
+ *      Builds CREATE FOREIGN TABLE query based on specified parquet file
+ */
+static char *
+autodiscover_parquet_file(ImportForeignSchemaStmt *stmt, const char *filename)
+{
+    std::unique_ptr<parquet::arrow::FileReader> reader;
+    StringInfoData  str;
+    char           *path = psprintf("%s/%s", stmt->remote_schema, filename);
+    bool            is_first = true;
+
+    try
+    {
+        reader.reset(
+            new parquet::arrow::FileReader(
+                    arrow::default_memory_pool(),
+                    parquet::ParquetFileReader::OpenFile(path, false)));
+    }
+    catch(const std::exception& e)
+    {
+        elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
+    }
+
+    auto meta = reader->parquet_reader()->metadata();
+
+    initStringInfo(&str);
+    appendStringInfo(&str, "CREATE FOREIGN TABLE %s (", quote_identifier(filename));
+
+    for (int k = 0; k < meta->schema()->num_columns(); ++k)
+    {
+        parquet::schema::NodePtr node = meta->schema()->Column(k)->schema_node();
+        std::shared_ptr<arrow::Field>       field;
+        std::shared_ptr<arrow::DataType>    type;
+
+        /* Convert to arrow field to get appropriate type */
+        parquet::arrow::NodeToField(*node, &field);
+        type = field->type();
+
+        Oid pg_type = to_postgres_type(type->id());
+
+        if (pg_type != InvalidOid)
+        {
+            const char *type_name = format_type_be(pg_type);
+
+            if (!is_first)
+                appendStringInfo(&str, ", %s %s", field->name().c_str(), type_name);
+            else
+            {
+                appendStringInfo(&str, "%s %s", field->name().c_str(), type_name);
+                is_first = false;
+            }
+        }
+        else
+        {
+            /* TODO: should close file somehow */
+            elog(ERROR, "Cannot convert type");
+        }
+    }
+    appendStringInfo(&str, ") SERVER %s ", stmt->server_name);
+    appendStringInfo(&str, "OPTIONS (filename '%s')", path);
+    elog(NOTICE, str.data);
+
+    return str.data;
+}
+
+extern "C" List *
+parquetImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
+{
+    struct dirent  *f;
+    DIR            *d;
+    List           *cmds = NIL;
+
+    d = opendir(stmt->remote_schema);
+    while ((f = readdir(d)) != NULL)
+    {
+
+        /* TODO: use lstat if d_type == DT_UNKNOWN */
+        if (f->d_type == DT_REG)
+        {
+            /* check that file extension is "parquet" */
+            char *ext = strrchr(f->d_name, '.');
+
+            if (ext && strcmp(ext + 1, "parquet") == 0)
+            {
+                cmds = lappend(cmds, autodiscover_parquet_file(stmt, f->d_name));
+            }
+        }
+
+    }
+    closedir(d);
+
+    return cmds;
+}

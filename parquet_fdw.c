@@ -58,6 +58,7 @@ extern void parquetInitializeWorkerForeignScan(ForeignScanState *node,
                                                shm_toc *toc,
                                                void *coordinate);
 extern void parquetShutdownForeignScan(ForeignScanState *node);
+extern List *parquetImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid);
 
 /* GUC variable */
 extern bool parquet_fdw_use_threads;
@@ -99,6 +100,7 @@ parquet_fdw_handler(PG_FUNCTION_ARGS)
     fdwroutine->ReInitializeDSMForeignScan = parquetReInitializeDSMForeignScan;
     fdwroutine->InitializeWorkerForeignScan = parquetInitializeWorkerForeignScan;
     fdwroutine->ShutdownForeignScan = parquetShutdownForeignScan;
+    fdwroutine->ImportForeignSchema = parquetImportForeignSchema;
 
     PG_RETURN_POINTER(fdwroutine);
 }
