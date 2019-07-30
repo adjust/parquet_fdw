@@ -1779,16 +1779,15 @@ parquetShutdownForeignScan(ForeignScanState *node)
 }
 
 /*
- * autodiscover_parquet_file
- *      Builds CREATE FOREIGN TABLE query based on specified parquet file
+ * extract_parquet_fields
+ *      Read parquet file and return a list of its fields
  */
-static char *
-autodiscover_parquet_file(ImportForeignSchemaStmt *stmt, const char *filename)
+std::list<std::pair<std::string, Oid> >
+extract_parquet_fields(ImportForeignSchemaStmt *stmt, const char *path)
 {
+    std::list<std::pair<std::string, Oid> > res;
     std::unique_ptr<parquet::arrow::FileReader> reader;
-    StringInfoData  str;
-    char           *path = psprintf("%s/%s", stmt->remote_schema, filename);
-    bool            is_first = true;
+    std::shared_ptr<arrow::Schema> schema;
 
     try
     {
@@ -1804,32 +1803,40 @@ autodiscover_parquet_file(ImportForeignSchemaStmt *stmt, const char *filename)
 
     auto meta = reader->parquet_reader()->metadata();
 
-    initStringInfo(&str);
-    appendStringInfo(&str, "CREATE FOREIGN TABLE %s (", quote_identifier(filename));
+    if (!parquet::arrow::FromParquetSchema(meta->schema(), &schema).ok())
+        elog(ERROR, "parquet_fdw: error reading parquet schema");
 
-    for (int k = 0; k < meta->schema()->num_columns(); ++k)
+    for (int k = 0; k < schema->num_fields(); ++k)
     {
-        parquet::schema::NodePtr node = meta->schema()->Column(k)->schema_node();
         std::shared_ptr<arrow::Field>       field;
         std::shared_ptr<arrow::DataType>    type;
+        Oid     pg_type;
 
         /* Convert to arrow field to get appropriate type */
-        parquet::arrow::NodeToField(*node, &field);
+        field = schema->field(k);
         type = field->type();
 
-        Oid pg_type = to_postgres_type(type->id());
+        if (type->id() == arrow::Type::LIST)
+        {
+            int subtype_id;
+            Oid pg_subtype;
+
+            if (type->children().size() != 1)
+                elog(ERROR, "parquet_fdw: lists of structs are not supported");
+
+            subtype_id = get_arrow_list_elem_type(type.get());
+            pg_subtype = to_postgres_type(subtype_id);
+
+            pg_type = get_array_type(pg_subtype);
+        }
+        else
+        {
+            pg_type = to_postgres_type(type->id());
+        }
 
         if (pg_type != InvalidOid)
         {
-            const char *type_name = format_type_be(pg_type);
-
-            if (!is_first)
-                appendStringInfo(&str, ", %s %s", field->name().c_str(), type_name);
-            else
-            {
-                appendStringInfo(&str, "%s %s", field->name().c_str(), type_name);
-                is_first = false;
-            }
+            res.push_back(std::pair<std::string, Oid>(field->name(), pg_type));
         }
         else
         {
@@ -1837,8 +1844,43 @@ autodiscover_parquet_file(ImportForeignSchemaStmt *stmt, const char *filename)
             elog(ERROR, "Cannot convert type");
         }
     }
+
+    return res;
+}
+
+/*
+ * autodiscover_parquet_file
+ *      Builds CREATE FOREIGN TABLE query based on specified parquet file
+ */
+static char *
+autodiscover_parquet_file(ImportForeignSchemaStmt *stmt, const char *filename)
+{
+    char           *path = psprintf("%s/%s", stmt->remote_schema, filename);
+    StringInfoData  str;
+    auto            fields = extract_parquet_fields(stmt, path);
+    bool            is_first = true;
+
+    initStringInfo(&str);
+    appendStringInfo(&str, "CREATE FOREIGN TABLE %s (", quote_identifier(filename));
+
+    for (auto field: fields)
+    {
+        std::string &name = field.first;
+        Oid pg_type = field.second;
+
+        const char *type_name = format_type_be(pg_type);
+
+        if (!is_first)
+            appendStringInfo(&str, ", %s %s", name.c_str(), type_name);
+        else
+        {
+            appendStringInfo(&str, "%s %s", name.c_str(), type_name);
+            is_first = false;
+        }
+    }
     appendStringInfo(&str, ") SERVER %s ", stmt->server_name);
     appendStringInfo(&str, "OPTIONS (filename '%s')", path);
+
     elog(NOTICE, str.data);
 
     return str.data;
