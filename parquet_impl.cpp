@@ -454,6 +454,10 @@ to_postgres_type(int arrow_type)
             return INT4OID;
         case arrow::Type::INT64:
             return INT8OID;
+        case arrow::Type::FLOAT:
+            return FLOAT4OID;
+        case arrow::Type::DOUBLE:
+            return FLOAT8OID;
         case arrow::Type::STRING:
             return TEXTOID;
         case arrow::Type::BINARY:
@@ -1105,6 +1109,22 @@ read_primitive_type(ParquetFdwExecutionState *festate,
             res = Int64GetDatum(value);
             break;
         }
+        case arrow::Type::FLOAT:
+        {
+            arrow::FloatArray *farray = (arrow::FloatArray *) array;
+            float value = farray->Value(i);
+
+            res = Float4GetDatum(value);
+            break;
+        }
+        case arrow::Type::DOUBLE:
+        {
+            arrow::DoubleArray *darray = (arrow::DoubleArray *) array;
+            double value = darray->Value(i);
+
+            res = Float8GetDatum(value);
+            break;
+        }
         case arrow::Type::STRING:
         case arrow::Type::BINARY:
         {
@@ -1382,6 +1402,10 @@ bytes_to_postgres_type(const char *bytes, arrow::DataType *arrow_type)
             return Int32GetDatum(*(int32 *) bytes);
         case arrow::Type::INT64:
             return Int64GetDatum(*(int64 *) bytes);
+        case arrow::Type::FLOAT:
+            return Int32GetDatum(*(float *) bytes);
+        case arrow::Type::DOUBLE:
+            return Int64GetDatum(*(double *) bytes);
         case arrow::Type::STRING:
         case arrow::Type::BINARY:
             return CStringGetTextDatum(bytes);
@@ -1842,7 +1866,9 @@ extract_parquet_fields(ImportForeignSchemaStmt *stmt, const char *path)
             }
             else
             {
-                elog(ERROR, "parquet_fdw: cannot convert type");
+                elog(ERROR,
+                     "parquet_fdw: cannot convert field '%s' of type '%s' in %s",
+                     field->name().c_str(), type->name().c_str(), path);
             }
         }
     }
@@ -1862,19 +1888,27 @@ extract_parquet_fields(ImportForeignSchemaStmt *stmt, const char *path)
  *      Builds CREATE FOREIGN TABLE query based on specified parquet file
  */
 static char *
-autodiscover_parquet_file(ImportForeignSchemaStmt *stmt, const char *filename)
+autodiscover_parquet_file(ImportForeignSchemaStmt *stmt, char *filename)
 {
     char           *path = psprintf("%s/%s", stmt->remote_schema, filename);
     StringInfoData  str;
     auto            fields = extract_parquet_fields(stmt, path);
     bool            is_first = true;
+    char           *ext;
+
 
     initStringInfo(&str);
     appendStringInfo(&str, "CREATE FOREIGN TABLE ");
+
+    /* append table name */
+    ext = strrchr(filename, '.');
+    *ext = '\0';
     if (stmt->local_schema)
-        appendStringInfo(&str, "%s.%s (", stmt->local_schema, quote_identifier(filename));
+        appendStringInfo(&str, "%s.%s (",
+                         stmt->local_schema, quote_identifier(filename));
     else
         appendStringInfo(&str, "%s (", quote_identifier(filename));
+    *ext = '.';
 
     for (auto field: fields)
     {

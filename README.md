@@ -36,6 +36,8 @@ Now you should be able to create foreign table from Parquet files. Currently `pa
 |--------------|-----------|
 |        INT32 |      INT4 |
 |        INT64 |      INT8 |
+|        FLOAT |    FLOAT4 |
+|       DOUBLE |    FLOAT8 |
 |    TIMESTAMP | TIMESTAMP |
 |       DATE32 |      DATE |
 |       STRING |      TEXT |
@@ -69,3 +71,15 @@ options (
 
 ### Parallel queries
 `parquet_fdw` also supports [parallel query execution](https://www.postgresql.org/docs/current/parallel-query.html) (not to confuse with multi-threaded decoding feature of `arrow`). It is disabled by default; to enable it run `ANALYZE` command on the table. The reason behind this is that without statistics postgres may end up choosing a terrible parallel plan for certain queries which would be much worse than a serial one (e.g. grouping by a column with large number of distinct values).
+
+### Experimental
+
+`parquet_fdw` also supports [`IMPORT FOREIGN SCHEMA`](https://www.postgresql.org/docs/current/sql-importforeignschema.html) command to discover parquet files in the specified directory on filesystem and create foreign tables according to those files. It can be used as follows:
+
+```
+IMPORT FOREIGN SCHEMA "/path/to/directory"
+FROM SERVER parquet_srv
+INTO public;
+```
+
+It is important that `remote_schema` here is a path to a local filesystem directory and is double quoted.
