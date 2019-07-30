@@ -1785,9 +1785,9 @@ parquetShutdownForeignScan(ForeignScanState *node)
 std::list<std::pair<std::string, Oid> >
 extract_parquet_fields(ImportForeignSchemaStmt *stmt, const char *path)
 {
-    std::list<std::pair<std::string, Oid> > res;
+    std::list<std::pair<std::string, Oid> >     res;
     std::unique_ptr<parquet::arrow::FileReader> reader;
-    std::shared_ptr<arrow::Schema> schema;
+    std::shared_ptr<arrow::Schema>              schema;
 
     try
     {
@@ -1801,49 +1801,58 @@ extract_parquet_fields(ImportForeignSchemaStmt *stmt, const char *path)
         elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
     }
 
-    auto meta = reader->parquet_reader()->metadata();
-
-    if (!parquet::arrow::FromParquetSchema(meta->schema(), &schema).ok())
-        elog(ERROR, "parquet_fdw: error reading parquet schema");
-
-    for (int k = 0; k < schema->num_fields(); ++k)
+    PG_TRY();
     {
-        std::shared_ptr<arrow::Field>       field;
-        std::shared_ptr<arrow::DataType>    type;
-        Oid     pg_type;
+        auto meta = reader->parquet_reader()->metadata();
 
-        /* Convert to arrow field to get appropriate type */
-        field = schema->field(k);
-        type = field->type();
+        if (!parquet::arrow::FromParquetSchema(meta->schema(), &schema).ok())
+            elog(ERROR, "parquet_fdw: error reading parquet schema");
 
-        if (type->id() == arrow::Type::LIST)
+        for (int k = 0; k < schema->num_fields(); ++k)
         {
-            int subtype_id;
-            Oid pg_subtype;
+            std::shared_ptr<arrow::Field>       field;
+            std::shared_ptr<arrow::DataType>    type;
+            Oid     pg_type;
 
-            if (type->children().size() != 1)
-                elog(ERROR, "parquet_fdw: lists of structs are not supported");
+            /* Convert to arrow field to get appropriate type */
+            field = schema->field(k);
+            type = field->type();
 
-            subtype_id = get_arrow_list_elem_type(type.get());
-            pg_subtype = to_postgres_type(subtype_id);
+            if (type->id() == arrow::Type::LIST)
+            {
+                int subtype_id;
+                Oid pg_subtype;
 
-            pg_type = get_array_type(pg_subtype);
-        }
-        else
-        {
-            pg_type = to_postgres_type(type->id());
-        }
+                if (type->children().size() != 1)
+                    elog(ERROR, "parquet_fdw: lists of structs are not supported");
 
-        if (pg_type != InvalidOid)
-        {
-            res.push_back(std::pair<std::string, Oid>(field->name(), pg_type));
-        }
-        else
-        {
-            /* TODO: should close file somehow */
-            elog(ERROR, "Cannot convert type");
+                subtype_id = get_arrow_list_elem_type(type.get());
+                pg_subtype = to_postgres_type(subtype_id);
+
+                pg_type = get_array_type(pg_subtype);
+            }
+            else
+            {
+                pg_type = to_postgres_type(type->id());
+            }
+
+            if (pg_type != InvalidOid)
+            {
+                res.push_back(std::pair<std::string, Oid>(field->name(), pg_type));
+            }
+            else
+            {
+                elog(ERROR, "parquet_fdw: cannot convert type");
+            }
         }
     }
+    PG_CATCH();
+    {
+        /* Destroy the reader on error */
+        reader.reset();
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
 
     return res;
 }
@@ -1861,7 +1870,11 @@ autodiscover_parquet_file(ImportForeignSchemaStmt *stmt, const char *filename)
     bool            is_first = true;
 
     initStringInfo(&str);
-    appendStringInfo(&str, "CREATE FOREIGN TABLE %s (", quote_identifier(filename));
+    appendStringInfo(&str, "CREATE FOREIGN TABLE ");
+    if (stmt->local_schema)
+        appendStringInfo(&str, "%s.%s (", stmt->local_schema, quote_identifier(filename));
+    else
+        appendStringInfo(&str, "%s (", quote_identifier(filename));
 
     for (auto field: fields)
     {
@@ -1900,13 +1913,50 @@ parquetImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
         /* TODO: use lstat if d_type == DT_UNKNOWN */
         if (f->d_type == DT_REG)
         {
-            /* check that file extension is "parquet" */
-            char *ext = strrchr(f->d_name, '.');
+            ListCell   *lc;
+            bool        skip = false;
+            char       *filename = f->d_name;
 
-            if (ext && strcmp(ext + 1, "parquet") == 0)
+            /* check that file extension is "parquet" */
+            char *ext = strrchr(filename, '.');
+
+            if (ext && strcmp(ext + 1, "parquet") != 0)
+                continue;
+
+            /*
+             * Set terminal symbol to be able to run strcmp on filename
+             * without file extension
+             */
+            *ext = '\0';
+
+            foreach (lc, stmt->table_list)
             {
-                cmds = lappend(cmds, autodiscover_parquet_file(stmt, f->d_name));
+                RangeVar *rv = (RangeVar *) lfirst(lc);
+
+                switch (stmt->list_type)
+                {
+                    case FDW_IMPORT_SCHEMA_LIMIT_TO:
+                        if (strcmp(filename, rv->relname) != 0)
+                        {
+                            skip = true;
+                            break;
+                        }
+                        break;
+                    case FDW_IMPORT_SCHEMA_EXCEPT:
+                        if (strcmp(filename, rv->relname) == 0)
+                        {
+                            skip = true;
+                            break;
+                        }
+                        break;
+                }
             }
+            if (skip)
+                continue;
+
+            /* Return dot back */
+            *ext = '.';
+            cmds = lappend(cmds, autodiscover_parquet_file(stmt, filename));
         }
 
     }
