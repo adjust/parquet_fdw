@@ -167,6 +167,10 @@ public:
     char                           *segment_last_ptr;
     std::list<char *>               garbage_segments;
 
+    /* Callback to delete this state object in case of ERROR */
+    MemoryContextCallback           callback;
+    bool                            autodestroy;
+
     /* Coordinator for parallel query execution */
     ParallelCoordinator            *coordinator;
 
@@ -183,6 +187,15 @@ public:
                     parquet::ParquetFileReader::OpenFile(filename, use_mmap)));
     }
 };
+
+static void
+destroy_parquet_state(void *arg)
+{
+    ParquetFdwExecutionState *festate = (ParquetFdwExecutionState *) arg;
+
+    if (festate->autodestroy)
+        delete festate;
+}
 
 static ParquetFdwExecutionState *
 create_parquet_state(const char *filename,
@@ -250,6 +263,16 @@ create_parquet_state(const char *filename,
     festate->segment_start_ptr = NULL;
     festate->segment_cur_ptr = NULL;
     festate->segment_last_ptr = NULL;
+
+    /*
+     * Enable automatic execution state destruction by using memory context
+     * callback
+     */
+    festate->callback.func = destroy_parquet_state;
+    festate->callback.arg = (void *) festate;
+    MemoryContextRegisterResetCallback(festate->segments_cxt,
+                                       &festate->callback);
+    festate->autodestroy = true;
 
     return festate;
 }
@@ -1572,7 +1595,16 @@ parquetEndForeignScan(ForeignScanState *node)
 {
     ParquetFdwExecutionState *festate = (ParquetFdwExecutionState *) node->fdw_state;
 
+    /* 
+     * Disable autodestruction to prevent double freeing of the execution
+     * state object. I could just remove `delete festate` below and let the
+     * memory context callback do its job. But it is more obvious for readers
+     * to see an explicit destruction of the execution state.
+     */
+    festate->autodestroy = false;
+
     delete festate;
+
 }
 
 extern "C" void
@@ -1612,6 +1644,7 @@ parquetAcquireSampleRowsFunc(Relation relation, int elevel,
                                        attrs_used,
                                        false,
                                        fdw_private.use_threads);
+        festate->autodestroy = false;
     }
     catch(const std::exception& e)
     {
