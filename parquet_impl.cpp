@@ -1895,7 +1895,7 @@ autodiscover_parquet_file(ImportForeignSchemaStmt *stmt, char *filename)
     auto            fields = extract_parquet_fields(stmt, path);
     bool            is_first = true;
     char           *ext;
-
+    ListCell       *lc;
 
     initStringInfo(&str);
     appendStringInfo(&str, "CREATE FOREIGN TABLE ");
@@ -1910,6 +1910,7 @@ autodiscover_parquet_file(ImportForeignSchemaStmt *stmt, char *filename)
         appendStringInfo(&str, "%s (", quote_identifier(filename));
     *ext = '.';
 
+    /* append columns */
     for (auto field: fields)
     {
         std::string &name = field.first;
@@ -1926,9 +1927,18 @@ autodiscover_parquet_file(ImportForeignSchemaStmt *stmt, char *filename)
         }
     }
     appendStringInfo(&str, ") SERVER %s ", stmt->server_name);
-    appendStringInfo(&str, "OPTIONS (filename '%s')", path);
+    appendStringInfo(&str, "OPTIONS (filename '%s'", path);
 
-    elog(NOTICE, str.data);
+    /* append options */
+    foreach (lc, stmt->options)
+    {
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+        appendStringInfo(&str, ", %s '%s'", def->defname, defGetString(def));
+    }
+    appendStringInfo(&str, ")");
+
+    elog(DEBUG1, "parquet_fdw: %s", str.data);
 
     return str.data;
 }
