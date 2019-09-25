@@ -821,7 +821,7 @@ parquetGetForeignPaths(PlannerInfo *root,
 									 NULL,	/* no extra plan */
 									 (List *) fdw_private));
 
-    if (max_parallel_workers_per_gather > 0)
+    if (baserel->consider_parallel > 0)
     {
         Path *parallel_path = (Path *)
                  create_foreignscan_path(root, baserel,
