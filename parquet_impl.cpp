@@ -1983,7 +1983,12 @@ parquetImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
     DIR            *d;
     List           *cmds = NIL;
 
-    d = opendir(stmt->remote_schema);
+    d = AllocateDir(stmt->remote_schema);
+    if (!d)
+        elog(ERROR, "parquet_fdw: failed to open directory '%s': %s",
+             stmt->remote_schema,
+             strerror(errno));
+
     while ((f = readdir(d)) != NULL)
     {
 
@@ -2037,7 +2042,7 @@ parquetImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
         }
 
     }
-    closedir(d);
+    FreeDir(d);
 
     return cmds;
 }
