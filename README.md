@@ -1,4 +1,4 @@
-[![Build Status](https://travis-ci.org/zilder/parquet_fdw.svg?branch=master)](https://travis-ci.org/adjust/parquet_fdw)
+[![Build Status](https://travis-ci.org/adjust/parquet_fdw.svg?branch=master)](https://travis-ci.org/adjust/parquet_fdw)
 
 [WIP]
 
