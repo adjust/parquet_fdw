@@ -128,9 +128,11 @@ parquet_fdw_validator(PG_FUNCTION_ARGS)
 
             if (stat(defGetString(def), &stat_buf) != 0)
             {
+                int e = errno;
+
                 ereport(ERROR,
                         (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
-                         errmsg("parquet_fdw: %s", strerror(errno))));
+                         errmsg("parquet_fdw: %s", strerror(e))));
             }
             filename_provided = true;
         }
