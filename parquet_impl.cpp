@@ -32,13 +32,11 @@ extern "C"
 #include "nodes/execnodes.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/makefuncs.h"
-#include "nodes/relation.h"
 #include "optimizer/cost.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
-#include "optimizer/var.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_oper.h"
 #include "utils/builtins.h"
@@ -48,6 +46,15 @@ extern "C"
 #include "utils/rel.h"
 #include "utils/timestamp.h"
 #include "utils/typcache.h"
+
+#if PG_VERSION_NUM < 120000
+#include "nodes/relation.h"
+#include "optimizer/var.h"
+#else
+#include "access/table.h"
+#include "access/relation.h"
+#include "optimizer/optimizer.h"
+#endif
 }
 
 #define SEGMENT_SIZE (1024 * 1024)
@@ -1663,7 +1670,12 @@ parquetAcquireSampleRowsFunc(Relation relation, int elevel,
         for (int i = 0; i < meta->num_row_groups(); ++i)
             festate->rowgroups.push_back(i);
 
+#if PG_VERSION_NUM < 120000
         slot = MakeSingleTupleTableSlot(tupleDesc);
+#else
+        slot = MakeSingleTupleTableSlot(tupleDesc, &TTSOpsHeapTuple);
+#endif
+
         initialize_castfuncs(festate, tupleDesc);
 
         while (true)
@@ -1985,9 +1997,13 @@ parquetImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 
     d = AllocateDir(stmt->remote_schema);
     if (!d)
+    {
+        int e = errno;
+
         elog(ERROR, "parquet_fdw: failed to open directory '%s': %s",
              stmt->remote_schema,
-             strerror(errno));
+             strerror(e));
+    }
 
     while ((f = readdir(d)) != NULL)
     {
