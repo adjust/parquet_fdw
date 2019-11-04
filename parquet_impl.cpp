@@ -188,10 +188,11 @@ public:
         : row_group(-1), row(0), num_rows(0), coordinator(NULL),
           initialized(false)
     {
-        reader.reset(
-            new parquet::arrow::FileReader(
-                    arrow::default_memory_pool(),
-                    parquet::ParquetFileReader::OpenFile(filename, use_mmap)));
+        parquet::arrow::FileReader::Make(
+                arrow::default_memory_pool(),
+                parquet::ParquetFileReader::OpenFile(filename, use_mmap),
+                &reader
+        );
     }
 };
 
@@ -216,8 +217,9 @@ create_parquet_state(const char *filename,
 
     festate = new ParquetFdwExecutionState(filename, use_mmap);
     auto schema = festate->reader->parquet_reader()->metadata()->schema();
+    parquet::ArrowReaderProperties props;
 
-    if (!parquet::arrow::FromParquetSchema(schema, &festate->schema).ok())
+    if (!parquet::arrow::FromParquetSchema(schema, props, &festate->schema).ok())
         elog(ERROR, "parquet_fdw: error reading parquet schema");
 
     /* Enable parallel columns decoding/decompression if needed */
@@ -506,7 +508,7 @@ to_postgres_type(int arrow_type)
  *      Check if min/max values of the column of the row group match filter.
  */
 static bool
-row_group_matches_filter(parquet::RowGroupStatistics *stats,
+row_group_matches_filter(parquet::Statistics *stats,
                          arrow::DataType *arrow_type,
                          RowGroupFilter *filter)
 {
@@ -615,17 +617,21 @@ extract_rowgroups_list(PlannerInfo *root, RelOptInfo *baserel)
     /* Open parquet file to read meta information */
     try
     {
-        reader.reset(
-            new parquet::arrow::FileReader(
-                    arrow::default_memory_pool(),
-                    parquet::ParquetFileReader::OpenFile(fdw_private->filename,
-                                                         false)));
+        parquet::arrow::FileReader::Make(
+                arrow::default_memory_pool(),
+                parquet::ParquetFileReader::OpenFile(fdw_private->filename, false),
+                &reader
+        );
+
     }
     catch(const std::exception& e)
     {
         elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
     }
     auto meta = reader->parquet_reader()->metadata();
+    parquet::ArrowReaderProperties  props;
+    std::shared_ptr<arrow::Schema>  schema;
+    parquet::arrow::FromParquetSchema(meta->schema(), props, &schema);
 
     /* Check each row group whether it matches the filters */
     for (int r = 0; r < reader->num_row_groups(); r++)
@@ -653,7 +659,7 @@ extract_rowgroups_list(PlannerInfo *root, RelOptInfo *baserel)
                 if (strcmp(attname, path[0].c_str()) == 0)
                 {
                     /* Found it! */
-                    std::shared_ptr<parquet::RowGroupStatistics>  stats;
+                    std::shared_ptr<parquet::Statistics>  stats;
                     std::shared_ptr<arrow::Field>       field;
                     std::shared_ptr<arrow::DataType>    type;
                     const auto  &schema_node = *meta->schema()->group_node();
@@ -661,7 +667,7 @@ extract_rowgroups_list(PlannerInfo *root, RelOptInfo *baserel)
                     stats = column->statistics();
 
                     /* Convert to arrow field to get appropriate type */
-                    parquet::arrow::NodeToField(*schema_node.field(k), &field);
+                    field = schema->field(k);
                     type = field->type();
 
                     /*
@@ -1015,7 +1021,7 @@ initialize_castfuncs(ParquetFdwExecutionState *festate, TupleDesc tupleDesc)
             ereport(ERROR,
                     (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
                      errmsg("parquet_fdw: incompatible types in column \"%s\"",
-                            festate->table->column(arrow_col)->name().c_str()),
+                            festate->table->field(arrow_col)->name().c_str()),
                      errhint(src_is_list ?
                          "parquet column is of type list while postgres type is scalar" :
                          "parquet column is of scalar type while postgres type is array")));
@@ -1336,10 +1342,10 @@ populate_slot(ParquetFdwExecutionState *festate,
                 auto column = festate->table->column(arrow_col);
 
                 /* There are no more chunks */
-                if (++chunkInfo.chunk >= column->data()->num_chunks())
+                if (++chunkInfo.chunk >= column->num_chunks())
                     break;
 
-                array = column->data()->chunk(chunkInfo.chunk).get();
+                array = column->chunk(chunkInfo.chunk).get();
                 festate->chunks[arrow_col] = array;
                 chunkInfo.pos = 0;
                 chunkInfo.len = array->length();
@@ -1504,7 +1510,7 @@ read_next_rowgroup(ParquetFdwExecutionState *festate, TupleDesc tupleDesc)
     /* Determine which columns has null values */
     for (int i = 0; i < festate->map.size(); i++)
     {
-        std::shared_ptr<parquet::RowGroupStatistics>  stats;
+        std::shared_ptr<parquet::Statistics>  stats;
         int arrow_col = festate->map[i];
 
         if (arrow_col < 0)
@@ -1542,7 +1548,7 @@ read_next_rowgroup(ParquetFdwExecutionState *festate, TupleDesc tupleDesc)
             auto column = festate->table->column(festate->map[i]);
 
             festate->chunk_info.push_back(chunkInfo);
-            festate->chunks.push_back(column->data()->chunk(0).get());
+            festate->chunks.push_back(column->chunk(0).get());
         }
     }
 
@@ -1860,10 +1866,12 @@ extract_parquet_fields(ImportForeignSchemaStmt *stmt, const char *path)
 
     try
     {
-        reader.reset(
-            new parquet::arrow::FileReader(
-                    arrow::default_memory_pool(),
-                    parquet::ParquetFileReader::OpenFile(path, false)));
+        parquet::arrow::FileReader::Make(
+                arrow::default_memory_pool(),
+                parquet::ParquetFileReader::OpenFile(path, false),
+                &reader
+        );
+
     }
     catch(const std::exception& e)
     {
@@ -1873,8 +1881,9 @@ extract_parquet_fields(ImportForeignSchemaStmt *stmt, const char *path)
     PG_TRY();
     {
         auto meta = reader->parquet_reader()->metadata();
+        parquet::ArrowReaderProperties props;
 
-        if (!parquet::arrow::FromParquetSchema(meta->schema(), &schema).ok())
+        if (!parquet::arrow::FromParquetSchema(meta->schema(), props, &schema).ok())
             elog(ERROR, "parquet_fdw: error reading parquet schema");
 
         for (int k = 0; k < schema->num_fields(); ++k)
