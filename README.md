@@ -8,7 +8,7 @@ Parquet foreign data wrapper for PostgreSQL.
 
 ## Installation
 
-`parquet_fdw` requires `libarrow` and `libparquet` installed in your system (tested with version 0.13.0). Please refer to [libarrow installation page](https://arrow.apache.org/install/) or [building guide](https://github.com/apache/arrow/blob/master/cpp/README.md).
+`parquet_fdw` requires `libarrow` and `libparquet` installed in your system (requires version 0.15, for previous versions use branch [arrow-0.14](https://github.com/adjust/parquet_fdw/tree/arrow-0.14)). Please refer to [libarrow installation page](https://arrow.apache.org/install/) or [building guide](https://github.com/apache/arrow/blob/master/cpp/README.md).
 To build `parquet_fdw` run:
 ```sh
 make install
