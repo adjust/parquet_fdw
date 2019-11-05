@@ -662,7 +662,6 @@ extract_rowgroups_list(PlannerInfo *root, RelOptInfo *baserel)
                     std::shared_ptr<parquet::Statistics>  stats;
                     std::shared_ptr<arrow::Field>       field;
                     std::shared_ptr<arrow::DataType>    type;
-                    const auto  &schema_node = *meta->schema()->group_node();
 
                     stats = column->statistics();
 
@@ -775,7 +774,6 @@ parquetGetForeignPaths(PlannerInfo *root,
 	Cost		total_cost;
     Cost        run_cost;
     List       *pathkeys = NIL;
-    ListCell   *lc;
 
     fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
 
@@ -978,7 +976,7 @@ initialize_castfuncs(ParquetFdwExecutionState *festate, TupleDesc tupleDesc)
 {
     festate->castfuncs.resize(festate->map.size());
 
-    for (int i = 0; i < festate->map.size(); ++i)
+    for (uint i = 0; i < festate->map.size(); ++i)
     {
         int arrow_col = festate->map[i];
 
@@ -1070,9 +1068,11 @@ initialize_castfuncs(ParquetFdwExecutionState *festate, TupleDesc tupleDesc)
  *      SEGMENT_SIZE then just palloc is used.
  */
 static inline void *
-fast_alloc(ParquetFdwExecutionState *festate, Size size)
+fast_alloc(ParquetFdwExecutionState *festate, long size)
 {
     void   *ret;
+
+    Assert(size >= 0);
 
     /* If allocation is bigger than segment then just palloc */
     if (size > SEGMENT_SIZE)
@@ -1333,7 +1333,6 @@ populate_slot(ParquetFdwExecutionState *festate,
             arrow::Array       *array = festate->chunks[arrow_col];
             arrow::DataType    *arrow_type = festate->types[arrow_col];
             int                 arrow_type_id = arrow_type->id();
-            MemoryContext       oldcxt;
 
             chunkInfo.len = array->length();
 
@@ -1358,8 +1357,6 @@ populate_slot(ParquetFdwExecutionState *festate,
             /* Currently only primitive types and lists are supported */
             if (arrow_type_id != arrow::Type::LIST)
             {
-                int64   offset;
-
                 if (festate->has_nulls[arrow_col] && array->IsNull(chunkInfo.pos))
                 {
                     slot->tts_isnull[attr] = true;
@@ -1378,7 +1375,6 @@ populate_slot(ParquetFdwExecutionState *festate,
             else
             {
                 Oid     pg_type_id;
-                int64   row;
 
                 pg_type_id = TupleDescAttr(slot->tts_tupleDescriptor, attr)->atttypid;
                 if (!type_is_array(pg_type_id))
@@ -1498,7 +1494,11 @@ read_next_rowgroup(ParquetFdwExecutionState *festate, TupleDesc tupleDesc)
     else
         festate->row_group++;
 
-    if (festate->row_group >= festate->rowgroups.size())
+    /*
+     * row_group cannot be less than zero at this point so it is safe to cast
+     * it to unsigned int
+     */
+    if ((uint) festate->row_group >= festate->rowgroups.size())
         return false;
 
     int  rowgroup = festate->rowgroups[festate->row_group];
@@ -1508,7 +1508,7 @@ read_next_rowgroup(ParquetFdwExecutionState *festate, TupleDesc tupleDesc)
                             ->RowGroup(rowgroup);
 
     /* Determine which columns has null values */
-    for (int i = 0; i < festate->map.size(); i++)
+    for (uint i = 0; i < festate->map.size(); i++)
     {
         std::shared_ptr<parquet::Statistics>  stats;
         int arrow_col = festate->map[i];
@@ -1563,7 +1563,6 @@ parquetIterateForeignScan(ForeignScanState *node)
 {
     ParquetFdwExecutionState   *festate = (ParquetFdwExecutionState *) node->fdw_state;
 	TupleTableSlot             *slot = node->ss.ss_ScanTupleSlot;
-    ParallelCoordinator        *coord = festate->coordinator;
 
 	ExecClearTuple(slot);
 
@@ -2056,6 +2055,8 @@ parquetImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
                             break;
                         }
                         break;
+                    default:
+                        ;
                 }
             }
             if (skip)
