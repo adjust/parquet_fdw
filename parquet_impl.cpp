@@ -115,6 +115,17 @@ struct ParallelCoordinator
     pg_atomic_uint32 next_rowgroup; 
 };
 
+
+static int
+get_arrow_list_elem_type(arrow::DataType *type)
+{
+    auto children = type->children();
+
+    Assert(children.size() == 1);
+    return children[0]->type()->id();
+}
+
+
 class ParquetFdwExecutionState
 {
 public:
@@ -193,6 +204,356 @@ public:
                 parquet::ParquetFileReader::OpenFile(filename, use_mmap),
                 &reader
         );
+    }
+
+    /*
+     * fast_alloc
+     *      Preallocate a big memory segment and distribute blocks from it. When
+     *      segment is exhausted it is added to garbage_segments list and freed
+     *      on the next executor's iteration. If requested size is bigger that
+     *      SEGMENT_SIZE then just palloc is used.
+     */
+    inline void *fast_alloc(long size)
+    {
+        void   *ret;
+
+        Assert(size >= 0);
+
+        /* If allocation is bigger than segment then just palloc */
+        if (size > SEGMENT_SIZE)
+            return palloc(size);
+
+        size = MAXALIGN(size);
+
+        /* If there is not enough space in current segment create a new one */
+        if (this->segment_last_ptr - this->segment_cur_ptr < size)
+        {
+            MemoryContext oldcxt;
+            
+            /*
+             * Recycle the last segment at the next iteration (if there
+             * was one)
+             */
+            if (this->segment_start_ptr)
+                this->garbage_segments.
+                    push_back(this->segment_start_ptr);
+
+            oldcxt = MemoryContextSwitchTo(this->segments_cxt);
+            this->segment_start_ptr = (char *) palloc(SEGMENT_SIZE);
+            this->segment_cur_ptr = this->segment_start_ptr;
+            this->segment_last_ptr =
+                this->segment_start_ptr + SEGMENT_SIZE - 1;
+            MemoryContextSwitchTo(oldcxt);
+        }
+
+        ret = (void *) this->segment_cur_ptr;
+        this->segment_cur_ptr += size;
+
+        return ret;
+    }
+
+    /*
+     * populate_slot
+     *      Fill slot with the values from parquet row.
+     *
+     * If `fake` set to true the actual reading and populating the slot is skipped.
+     * The purpose of this feature is to correctly skip rows to collect sparse
+     * samples.
+     */
+    void populate_slot(TupleTableSlot *slot, bool fake=false)
+    {
+        /* Fill slot values */
+        for (int attr = 0; attr < slot->tts_tupleDescriptor->natts; attr++)
+        {
+            int arrow_col = this->map[attr];
+            /*
+             * We only fill slot attributes if column was referred in targetlist
+             * or clauses. In other cases mark attribute as NULL.
+             * */
+            if (arrow_col >= 0)
+            {
+                ChunkInfo &chunkInfo = this->chunk_info[arrow_col];
+                arrow::Array       *array = this->chunks[arrow_col];
+                arrow::DataType    *arrow_type = this->types[arrow_col];
+                int                 arrow_type_id = arrow_type->id();
+
+                chunkInfo.len = array->length();
+
+                if (chunkInfo.pos >= chunkInfo.len)
+                {
+                    auto column = this->table->column(arrow_col);
+
+                    /* There are no more chunks */
+                    if (++chunkInfo.chunk >= column->num_chunks())
+                        break;
+
+                    array = column->chunk(chunkInfo.chunk).get();
+                    this->chunks[arrow_col] = array;
+                    chunkInfo.pos = 0;
+                    chunkInfo.len = array->length();
+                }
+
+                /* Don't do actual reading data into slot in fake mode */
+                if (fake)
+                    continue;
+
+                /* Currently only primitive types and lists are supported */
+                if (arrow_type_id != arrow::Type::LIST)
+                {
+                    if (this->has_nulls[arrow_col] && array->IsNull(chunkInfo.pos))
+                    {
+                        slot->tts_isnull[attr] = true;
+                    }
+                    else
+                    {
+                        slot->tts_values[attr] = 
+                            this->read_primitive_type(array,
+                                                      arrow_type_id,
+                                                      chunkInfo.pos,
+                                                      this->castfuncs[attr]);
+                        slot->tts_isnull[attr] = false;
+                    }
+                }
+                else
+                {
+                    Oid     pg_type_id;
+
+                    pg_type_id = TupleDescAttr(slot->tts_tupleDescriptor, attr)->atttypid;
+                    if (!type_is_array(pg_type_id))
+                        elog(ERROR,
+                             "parquet_fdw: cannot convert parquet column of type "
+                             "LIST to postgres column of scalar type");
+
+                    /* Figure out the base element types */
+                    pg_type_id = get_element_type(pg_type_id);
+                    arrow_type_id = get_arrow_list_elem_type(arrow_type);
+
+                    int64 pos = chunkInfo.pos;
+                    arrow::ListArray   *larray = (arrow::ListArray *) array;
+
+                    if (this->has_nulls[arrow_col] && array->IsNull(pos))
+                    {
+                        slot->tts_isnull[attr] = true;
+                    }
+                    else
+                    {
+                        std::shared_ptr<arrow::Array> slice =
+                            larray->values()->Slice(larray->value_offset(pos),
+                                                    larray->value_length(pos));
+
+                        slot->tts_values[attr] =
+                            this->nested_list_get_datum(slice.get(),
+                                                        arrow_type_id,
+                                                        pg_type_id,
+                                                        this->castfuncs[attr]);
+                        slot->tts_isnull[attr] = false;
+                    }
+                }
+
+                chunkInfo.pos++;
+            }
+            else
+            {
+                slot->tts_isnull[attr] = true;
+            }
+        }
+    }
+
+    /*
+     * read_primitive_type
+     *      Returns primitive type value from arrow array
+     */
+    Datum
+    read_primitive_type(arrow::Array *array,
+                        int type_id, int64_t i,
+                        FmgrInfo *castfunc)
+    {
+        Datum   res;
+
+        /* Get datum depending on the column type */
+        switch (type_id)
+        {
+            case arrow::Type::BOOL:
+            {
+                arrow::BooleanArray *boolarray = (arrow::BooleanArray *) array;
+
+                res = BoolGetDatum(boolarray->Value(i));
+                break;
+            }
+            case arrow::Type::INT32:
+            {
+                arrow::Int32Array *intarray = (arrow::Int32Array *) array;
+                int value = intarray->Value(i);
+
+                res = Int32GetDatum(value);
+                break;
+            }
+            case arrow::Type::INT64:
+            {
+                arrow::Int64Array *intarray = (arrow::Int64Array *) array;
+                int64 value = intarray->Value(i);
+
+                res = Int64GetDatum(value);
+                break;
+            }
+            case arrow::Type::FLOAT:
+            {
+                arrow::FloatArray *farray = (arrow::FloatArray *) array;
+                float value = farray->Value(i);
+
+                res = Float4GetDatum(value);
+                break;
+            }
+            case arrow::Type::DOUBLE:
+            {
+                arrow::DoubleArray *darray = (arrow::DoubleArray *) array;
+                double value = darray->Value(i);
+
+                res = Float8GetDatum(value);
+                break;
+            }
+            case arrow::Type::STRING:
+            case arrow::Type::BINARY:
+            {
+                arrow::BinaryArray *binarray = (arrow::BinaryArray *) array;
+
+                int32_t vallen = 0;
+                const char *value = reinterpret_cast<const char*>(binarray->GetValue(i, &vallen));
+
+                /* Build bytea */
+                int64 bytea_len = vallen + VARHDRSZ;
+                bytea *b = (bytea *) this->fast_alloc(bytea_len);
+                SET_VARSIZE(b, bytea_len);
+                memcpy(VARDATA(b), value, vallen);
+
+                res = PointerGetDatum(b);
+                break;
+            }
+            case arrow::Type::TIMESTAMP:
+            {
+                /* TODO: deal with timezones */
+                TimestampTz ts;
+                arrow::TimestampArray *tsarray = (arrow::TimestampArray *) array;
+                auto tstype = (arrow::TimestampType *) array->type().get();
+
+                to_postgres_timestamp(tstype, tsarray->Value(i), ts);
+                res = TimestampGetDatum(ts);
+                break;
+            }
+            case arrow::Type::DATE32:
+            {
+                arrow::Date32Array *tsarray = (arrow::Date32Array *) array;
+                int32 d = tsarray->Value(i);
+
+                /*
+                 * Postgres date starts with 2000-01-01 while unix date (which
+                 * Parquet is using) starts with 1970-01-01. So we need to do
+                 * simple calculations here.
+                 */
+                res = DateADTGetDatum(d + (UNIX_EPOCH_JDATE - POSTGRES_EPOCH_JDATE));
+                break;
+            }
+            /* TODO: add other types */
+            default:
+                elog(ERROR,
+                     "parquet_fdw: unsupported column type: %d",
+                     type_id);
+        }
+
+        /* Call cast function if needed */
+        if (castfunc != NULL)
+            return FunctionCall1(castfunc, res);
+
+        return res;
+    }
+
+    /*
+     * nested_list_get_datum
+     *      Returns postgres array build from elements of array. Only one
+     *      dimensional arrays are supported.
+     */
+    Datum
+    nested_list_get_datum(arrow::Array *array, int type_id,
+                          Oid elem_type, FmgrInfo *castfunc)
+    {
+        ArrayType  *res;
+        Datum      *values;
+        bool       *nulls = NULL;
+        int16       elem_len;
+        bool        elem_byval;
+        char        elem_align;
+        int         dims[1];
+        int         lbs[1];
+
+        values = (Datum *) this->fast_alloc(sizeof(Datum) * array->length());
+        get_typlenbyvalalign(elem_type, &elem_len, &elem_byval, &elem_align);
+
+        /* Fill values and nulls arrays */
+        if (array->null_count() == 0 && type_id == arrow::Type::INT64)
+        {
+            /*
+             * Ok, there are no nulls, so probably we could just memcpy the
+             * entire array.
+             *
+             * Warning: the code below is based on the assumption that Datum is
+             * 8 bytes long, which is true for most contemporary systems but this
+             * will not work on some exotic or really old systems. In this case
+             * the entire "if" branch should just be removed.
+             */
+            copy_to_c_array<int64_t>((int64_t *) values, array, elem_len);
+            goto construct_array;
+        }
+        for (int64_t i = 0; i < array->length(); ++i)
+        {
+            if (!array->IsNull(i))
+                values[i] = this->read_primitive_type(array, type_id, i, castfunc);
+            else
+            {
+                if (!nulls)
+                {
+                    Size size = sizeof(bool) * array->length();
+
+                    nulls = (bool *) this->fast_alloc(size);
+                    memset(nulls, 0, size);
+                }
+                nulls[i] = true;
+            }
+        }
+
+    construct_array:
+        /* Construct one dimensional array */
+        dims[0] = array->length();
+        lbs[0] = 1;
+        res = construct_md_array(values, nulls, 1, dims, lbs,
+                                 elem_type, elem_len, elem_byval, elem_align);
+
+        return PointerGetDatum(res);
+    }
+
+    /* 
+     * copy_to_c_array
+     *      memcpy plain values from Arrow array to a C array.
+     */
+    template<typename T> static inline void
+    copy_to_c_array(T *values, const arrow::Array *array, int elem_size)
+    {
+        const T *in = GetPrimitiveValues<T>(*array);
+
+        memcpy(values, in, elem_size * array->length());
+    }
+
+    /*
+     * GetPrimitiveValues
+     *      Get plain C value array. Copy-pasted from Arrow.
+     */
+    template <typename T>
+    static inline const T* GetPrimitiveValues(const arrow::Array& arr) {
+        if (arr.length() == 0) {
+            return nullptr;
+        }
+        const auto& prim_arr = arrow::internal::checked_cast<const arrow::PrimitiveArray&>(arr);
+        const T* raw_values = reinterpret_cast<const T*>(prim_arr.values()->data());
+        return raw_values + arr.offset();
     }
 };
 
@@ -957,15 +1318,6 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
     node->fdw_state = festate;
 }
 
-static int
-get_arrow_list_elem_type(arrow::DataType *type)
-{
-    auto children = type->children();
-
-    Assert(children.size() == 1);
-    return children[0]->type()->id();
-}
-
 /*
  * initialize_castfuncs
  *      Check wether implicit cast will be required and prepare cast function
@@ -1058,364 +1410,6 @@ initialize_castfuncs(ParquetFdwExecutionState *festate, TupleDesc tupleDesc)
         }
     }
     festate->initialized = true;
-}
-
-/*
- * fast_alloc
- *      Preallocate a big memory segment and distribute blocks from it. When
- *      segment is exhausted it is added to garbage_segments list and freed
- *      on the next executor's iteration. If requested size is bigger that
- *      SEGMENT_SIZE then just palloc is used.
- */
-static inline void *
-fast_alloc(ParquetFdwExecutionState *festate, long size)
-{
-    void   *ret;
-
-    Assert(size >= 0);
-
-    /* If allocation is bigger than segment then just palloc */
-    if (size > SEGMENT_SIZE)
-        return palloc(size);
-
-    size = MAXALIGN(size);
-
-    /* If there is not enough space in current segment create a new one */
-    if (festate->segment_last_ptr - festate->segment_cur_ptr < size)
-    {
-        MemoryContext oldcxt;
-        
-        /*
-         * Recycle the last segment at the next iteration (if there
-         * was one)
-         */
-        if (festate->segment_start_ptr)
-            festate->garbage_segments.
-                push_back(festate->segment_start_ptr);
-
-        oldcxt = MemoryContextSwitchTo(festate->segments_cxt);
-        festate->segment_start_ptr = (char *) palloc(SEGMENT_SIZE);
-        festate->segment_cur_ptr = festate->segment_start_ptr;
-        festate->segment_last_ptr =
-            festate->segment_start_ptr + SEGMENT_SIZE - 1;
-        MemoryContextSwitchTo(oldcxt);
-    }
-
-    ret = (void *) festate->segment_cur_ptr;
-    festate->segment_cur_ptr += size;
-
-    return ret;
-}
-
-/*
- * read_primitive_type
- *      Returns primitive type value from arrow array
- */
-static Datum
-read_primitive_type(ParquetFdwExecutionState *festate,
-                    arrow::Array *array,
-                    int type_id, int64_t i,
-                    FmgrInfo *castfunc)
-{
-    Datum   res;
-
-    /* Get datum depending on the column type */
-    switch (type_id)
-    {
-        case arrow::Type::BOOL:
-        {
-            arrow::BooleanArray *boolarray = (arrow::BooleanArray *) array;
-
-            res = BoolGetDatum(boolarray->Value(i));
-            break;
-        }
-        case arrow::Type::INT32:
-        {
-            arrow::Int32Array *intarray = (arrow::Int32Array *) array;
-            int value = intarray->Value(i);
-
-            res = Int32GetDatum(value);
-            break;
-        }
-        case arrow::Type::INT64:
-        {
-            arrow::Int64Array *intarray = (arrow::Int64Array *) array;
-            int64 value = intarray->Value(i);
-
-            res = Int64GetDatum(value);
-            break;
-        }
-        case arrow::Type::FLOAT:
-        {
-            arrow::FloatArray *farray = (arrow::FloatArray *) array;
-            float value = farray->Value(i);
-
-            res = Float4GetDatum(value);
-            break;
-        }
-        case arrow::Type::DOUBLE:
-        {
-            arrow::DoubleArray *darray = (arrow::DoubleArray *) array;
-            double value = darray->Value(i);
-
-            res = Float8GetDatum(value);
-            break;
-        }
-        case arrow::Type::STRING:
-        case arrow::Type::BINARY:
-        {
-            arrow::BinaryArray *binarray = (arrow::BinaryArray *) array;
-
-            int32_t vallen = 0;
-            const char *value = reinterpret_cast<const char*>(binarray->GetValue(i, &vallen));
-
-            /* Build bytea */
-            int64 bytea_len = vallen + VARHDRSZ;
-            bytea *b = (bytea *) fast_alloc(festate, bytea_len);
-            SET_VARSIZE(b, bytea_len);
-            memcpy(VARDATA(b), value, vallen);
-
-            res = PointerGetDatum(b);
-            break;
-        }
-        case arrow::Type::TIMESTAMP:
-        {
-            /* TODO: deal with timezones */
-            TimestampTz ts;
-            arrow::TimestampArray *tsarray = (arrow::TimestampArray *) array;
-            auto tstype = (arrow::TimestampType *) array->type().get();
-
-            to_postgres_timestamp(tstype, tsarray->Value(i), ts);
-            res = TimestampGetDatum(ts);
-            break;
-        }
-        case arrow::Type::DATE32:
-        {
-            arrow::Date32Array *tsarray = (arrow::Date32Array *) array;
-            int32 d = tsarray->Value(i);
-
-            /*
-             * Postgres date starts with 2000-01-01 while unix date (which
-             * Parquet is using) starts with 1970-01-01. So we need to do
-             * simple calculations here.
-             */
-            res = DateADTGetDatum(d + (UNIX_EPOCH_JDATE - POSTGRES_EPOCH_JDATE));
-            break;
-        }
-        /* TODO: add other types */
-        default:
-            elog(ERROR,
-                 "parquet_fdw: unsupported column type: %d",
-                 type_id);
-    }
-
-    /* Call cast function if needed */
-    if (castfunc != NULL)
-        return FunctionCall1(castfunc, res);
-
-    return res;
-}
-
-/*
- * GetPrimitiveValues
- *      Get plain C value array. Copy-pasted from Arrow.
- */
-template <typename T>
-inline const T* GetPrimitiveValues(const arrow::Array& arr) {
-  if (arr.length() == 0) {
-    return nullptr;
-  }
-  const auto& prim_arr = arrow::internal::checked_cast<const arrow::PrimitiveArray&>(arr);
-  const T* raw_values = reinterpret_cast<const T*>(prim_arr.values()->data());
-  return raw_values + arr.offset();
-}
-
-/* 
- * copy_to_c_array
- *      memcpy plain values from Arrow array to a C array.
- */
-template<typename T> inline void
-copy_to_c_array(T *values, const arrow::Array *array, int elem_size)
-{
-    const T *in = GetPrimitiveValues<T>(*array);
-
-    memcpy(values, in, elem_size * array->length());
-}
-
-/*
- * nested_list_get_datum
- *      Returns postgres array build from elements of array. Only one
- *      dimensional arrays are supported.
- */
-static Datum
-nested_list_get_datum(ParquetFdwExecutionState *festate,
-                      arrow::Array *array, int type_id,
-                      Oid elem_type, FmgrInfo *castfunc)
-{
-    ArrayType  *res;
-    Datum      *values;
-    bool       *nulls = NULL;
-    int16       elem_len;
-    bool        elem_byval;
-    char        elem_align;
-    int         dims[1];
-    int         lbs[1];
-
-    values = (Datum *) fast_alloc(festate, sizeof(Datum) * array->length());
-    get_typlenbyvalalign(elem_type, &elem_len, &elem_byval, &elem_align);
-
-    /* Fill values and nulls arrays */
-    if (array->null_count() == 0 && type_id == arrow::Type::INT64)
-    {
-        /*
-         * Ok, there are no nulls, so probably we could just memcpy the
-         * entire array.
-         *
-         * Warning: the code below is based on the assumption that Datum is
-         * 8 bytes long, which is true for most contemporary systems but this
-         * will not work on some exotic or really old systems. In this case
-         * the entire "if" branch should just be removed.
-         */
-        copy_to_c_array<int64_t>((int64_t *) values, array, elem_len);
-        goto construct_array;
-    }
-    for (int64_t i = 0; i < array->length(); ++i)
-    {
-        if (!array->IsNull(i))
-            values[i] = read_primitive_type(festate, array, type_id, i, castfunc);
-        else
-        {
-            if (!nulls)
-            {
-                Size size = sizeof(bool) * array->length();
-
-                nulls = (bool *) fast_alloc(festate, size);
-                memset(nulls, 0, size);
-            }
-            nulls[i] = true;
-        }
-    }
-
-construct_array:
-    /* Construct one dimensional array */
-    dims[0] = array->length();
-    lbs[0] = 1;
-    res = construct_md_array(values, nulls, 1, dims, lbs,
-                             elem_type, elem_len, elem_byval, elem_align);
-
-    return PointerGetDatum(res);
-}
-
-/*
- * populate_slot
- *      Fill slot with the values from parquet row.
- *
- * If `fake` set to true the actual reading and populating the slot is skipped.
- * The purpose of this feature is to correctly skip rows to collect sparse
- * samples.
- */
-static void
-populate_slot(ParquetFdwExecutionState *festate,
-              TupleTableSlot *slot,
-              bool fake=false)
-{
-    /* Fill slot values */
-    for (int attr = 0; attr < slot->tts_tupleDescriptor->natts; attr++)
-    {
-        int arrow_col = festate->map[attr];
-        /*
-         * We only fill slot attributes if column was referred in targetlist
-         * or clauses. In other cases mark attribute as NULL.
-         * */
-        if (arrow_col >= 0)
-        {
-            ChunkInfo &chunkInfo = festate->chunk_info[arrow_col];
-            arrow::Array       *array = festate->chunks[arrow_col];
-            arrow::DataType    *arrow_type = festate->types[arrow_col];
-            int                 arrow_type_id = arrow_type->id();
-
-            chunkInfo.len = array->length();
-
-            if (chunkInfo.pos >= chunkInfo.len)
-            {
-                auto column = festate->table->column(arrow_col);
-
-                /* There are no more chunks */
-                if (++chunkInfo.chunk >= column->num_chunks())
-                    break;
-
-                array = column->chunk(chunkInfo.chunk).get();
-                festate->chunks[arrow_col] = array;
-                chunkInfo.pos = 0;
-                chunkInfo.len = array->length();
-            }
-
-            /* Don't do actual reading data into slot in fake mode */
-            if (fake)
-                continue;
-
-            /* Currently only primitive types and lists are supported */
-            if (arrow_type_id != arrow::Type::LIST)
-            {
-                if (festate->has_nulls[arrow_col] && array->IsNull(chunkInfo.pos))
-                {
-                    slot->tts_isnull[attr] = true;
-                }
-                else
-                {
-                    slot->tts_values[attr] = 
-                        read_primitive_type(festate,
-                                            array,
-                                            arrow_type_id,
-                                            chunkInfo.pos,
-                                            festate->castfuncs[attr]);
-                    slot->tts_isnull[attr] = false;
-                }
-            }
-            else
-            {
-                Oid     pg_type_id;
-
-                pg_type_id = TupleDescAttr(slot->tts_tupleDescriptor, attr)->atttypid;
-                if (!type_is_array(pg_type_id))
-                    elog(ERROR,
-                         "parquet_fdw: cannot convert parquet column of type "
-                         "LIST to postgres column of scalar type");
-
-                /* Figure out the base element types */
-                pg_type_id = get_element_type(pg_type_id);
-                arrow_type_id = get_arrow_list_elem_type(arrow_type);
-
-                int64 pos = chunkInfo.pos;
-                arrow::ListArray   *larray = (arrow::ListArray *) array;
-
-                if (festate->has_nulls[arrow_col] && array->IsNull(pos))
-                {
-                    slot->tts_isnull[attr] = true;
-                }
-                else
-                {
-                    std::shared_ptr<arrow::Array> slice =
-                        larray->values()->Slice(larray->value_offset(pos),
-                                                larray->value_length(pos));
-
-                    slot->tts_values[attr] =
-                        nested_list_get_datum(festate,
-                                              slice.get(),
-                                              arrow_type_id,
-                                              pg_type_id,
-                                              festate->castfuncs[attr]);
-                    slot->tts_isnull[attr] = false;
-                }
-            }
-
-            chunkInfo.pos++;
-        }
-        else
-        {
-            slot->tts_isnull[attr] = true;
-        }
-    }
 }
 
 /*
@@ -1595,7 +1589,7 @@ parquetIterateForeignScan(ForeignScanState *node)
             initialize_castfuncs(festate, slot->tts_tupleDescriptor);
     }
 
-    populate_slot(festate, slot);
+    festate->populate_slot(slot);
     festate->row++;
     ExecStoreVirtualTuple(slot);
 
@@ -1717,7 +1711,7 @@ parquetAcquireSampleRowsFunc(Relation relation, int elevel,
 
             bool fake = (festate->row % ratio) != 0;
 
-            populate_slot(festate, slot, fake);
+            festate->populate_slot(slot, fake);
 
             if (!fake)
             {
