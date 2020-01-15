@@ -76,6 +76,8 @@ extern "C"
 
 static void find_cmp_func(FmgrInfo *finfo, Oid type1, Oid type2);
 static Datum bytes_to_postgres_type(const char *bytes, arrow::DataType *arrow_type);
+static Oid to_postgres_type(int arrow_type);
+static void destroy_parquet_state(void *arg);
 
 bool parquet_fdw_use_threads = true;
 
@@ -204,6 +206,78 @@ public:
                 parquet::ParquetFileReader::OpenFile(filename, use_mmap),
                 &reader
         );
+    }
+
+    void init(TupleDesc tupleDesc,
+              MemoryContext parent_cxt,
+              std::set<int> &attrs_used,
+              bool use_threads)
+    {
+        auto schema = this->reader->parquet_reader()->metadata()->schema();
+        parquet::ArrowReaderProperties props;
+
+        if (!parquet::arrow::FromParquetSchema(schema, props, &this->schema).ok())
+            elog(ERROR, "parquet_fdw: error reading parquet schema");
+
+        /* Enable parallel columns decoding/decompression if needed */
+        this->reader->set_use_threads(use_threads && parquet_fdw_use_threads);
+
+        /* Create mapping between tuple descriptor and parquet columns. */
+        this->map.resize(tupleDesc->natts);
+        for (int i = 0; i < tupleDesc->natts; i++)
+        {
+            AttrNumber attnum = i + 1 - FirstLowInvalidHeapAttributeNumber;
+
+            this->map[i] = -1;
+
+            /* Skip columns we don't intend to use in query */
+            if (attrs_used.find(attnum) == attrs_used.end())
+                continue;
+
+            for (int k = 0; k < schema->num_columns(); k++)
+            {
+                parquet::schema::NodePtr node = schema->Column(k)->schema_node();
+                std::vector<std::string> path = node->path()->ToDotVector();
+
+                /*
+                 * Compare postgres attribute name to the top level column name in
+                 * parquet.
+                 *
+                 * XXX If we will ever want to support structs then this should be
+                 * changed.
+                 */
+                if (strcmp(NameStr(TupleDescAttr(tupleDesc, i)->attname),
+                           path[0].c_str()) == 0)
+                {
+                    /* Found mapping! */
+                    this->indices.push_back(k);
+
+                    /* index of last element */
+                    this->map[i] = this->indices.size() - 1;
+
+                    this->types.push_back(this->schema->field(k)->type().get());
+                    break;
+                }
+            }
+        }
+
+        this->has_nulls = (bool *) palloc(sizeof(bool) * this->map.size());
+        this->segments_cxt = AllocSetContextCreate(parent_cxt,
+                                                   "parquet_fdw tuple data",
+                                                   ALLOCSET_DEFAULT_SIZES);
+        this->segment_start_ptr = NULL;
+        this->segment_cur_ptr = NULL;
+        this->segment_last_ptr = NULL;
+
+        /*
+         * Enable automatic execution state destruction by using memory context
+         * callback
+         */
+        this->callback.func = destroy_parquet_state;
+        this->callback.arg = (void *) this;
+        MemoryContextRegisterResetCallback(this->segments_cxt,
+                                           &this->callback);
+        this->autodestroy = true;
     }
 
     /*
@@ -530,6 +604,99 @@ public:
         return PointerGetDatum(res);
     }
 
+    /*
+     * initialize_castfuncs
+     *      Check wether implicit cast will be required and prepare cast function
+     *      call. For arrays find cast functions for its elements.
+     */
+    void initialize_castfuncs(TupleDesc tupleDesc)
+    {
+        this->castfuncs.resize(this->map.size());
+
+        for (uint i = 0; i < this->map.size(); ++i)
+        {
+            int arrow_col = this->map[i];
+
+            if (this->map[i] < 0)
+            {
+                /* Null column */
+                this->castfuncs[i] = NULL;
+                continue;
+            }
+
+            arrow::DataType *type = this->types[arrow_col];
+            int     type_id = type->id();
+            int     src_type,
+                    dst_type;
+            bool    src_is_list,
+                    dst_is_array;
+            Oid     funcid;
+            CoercionPathType ct;
+
+            /* Find underlying type of list */
+            src_is_list = (type_id == arrow::Type::LIST);
+            if (src_is_list)
+                type_id = get_arrow_list_elem_type(type);
+
+            src_type = to_postgres_type(type_id);
+            dst_type = TupleDescAttr(tupleDesc, i)->atttypid;
+
+            if (!OidIsValid(src_type))
+                elog(ERROR, "parquet_fdw: unsupported column type: %s",
+                     type->name().c_str());
+
+            /* Find underlying type of array */
+            dst_is_array = type_is_array(dst_type);
+            if (dst_is_array)
+                dst_type = get_element_type(dst_type);
+
+            /* Make sure both types are compatible */
+            if (src_is_list != dst_is_array)
+            {
+                ereport(ERROR,
+                        (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
+                         errmsg("parquet_fdw: incompatible types in column \"%s\"",
+                                this->table->field(arrow_col)->name().c_str()),
+                         errhint(src_is_list ?
+                             "parquet column is of type list while postgres type is scalar" :
+                             "parquet column is of scalar type while postgres type is array")));
+            }
+
+            if (IsBinaryCoercible(src_type, dst_type))
+            {
+                this->castfuncs[i] = NULL;
+                continue;
+            }
+
+            ct = find_coercion_pathway(dst_type,
+                                       src_type,
+                                       COERCION_EXPLICIT,
+                                       &funcid);
+            switch (ct)
+            {
+                case COERCION_PATH_FUNC:
+                    {
+                        MemoryContext   oldctx;
+
+                        oldctx = MemoryContextSwitchTo(CurTransactionContext);
+                        this->castfuncs[i] = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
+                        fmgr_info(funcid, this->castfuncs[i]);
+                        MemoryContextSwitchTo(oldctx);
+                        break;
+                    }
+                case COERCION_PATH_RELABELTYPE:
+                case COERCION_PATH_COERCEVIAIO:  /* TODO: double check that we
+                                                  * shouldn't do anything here*/
+                    /* Cast is not needed */
+                    this->castfuncs[i] = NULL;
+                    break;
+                default:
+                    elog(ERROR, "parquet_fdw: cast function is not found");
+            }
+        }
+        this->initialized = true;
+    }
+
     /* 
      * copy_to_c_array
      *      memcpy plain values from Arrow array to a C array.
@@ -564,87 +731,6 @@ destroy_parquet_state(void *arg)
 
     if (festate->autodestroy)
         delete festate;
-}
-
-static ParquetFdwExecutionState *
-create_parquet_state(const char *filename,
-                     TupleDesc tupleDesc,
-                     MemoryContext parent_cxt,
-                     std::set<int> &attrs_used,
-                     bool use_mmap,
-                     bool use_threads)
-{
-    ParquetFdwExecutionState *festate;
-
-    festate = new ParquetFdwExecutionState(filename, use_mmap);
-    auto schema = festate->reader->parquet_reader()->metadata()->schema();
-    parquet::ArrowReaderProperties props;
-
-    if (!parquet::arrow::FromParquetSchema(schema, props, &festate->schema).ok())
-        elog(ERROR, "parquet_fdw: error reading parquet schema");
-
-    /* Enable parallel columns decoding/decompression if needed */
-    festate->reader->set_use_threads(use_threads && parquet_fdw_use_threads);
- 
-    /* Create mapping between tuple descriptor and parquet columns. */
-    festate->map.resize(tupleDesc->natts);
-    for (int i = 0; i < tupleDesc->natts; i++)
-    {
-        AttrNumber attnum = i + 1 - FirstLowInvalidHeapAttributeNumber;
-
-        festate->map[i] = -1;
-
-        /* Skip columns we don't intend to use in query */
-        if (attrs_used.find(attnum) == attrs_used.end())
-            continue;
-
-        for (int k = 0; k < schema->num_columns(); k++)
-        {
-            parquet::schema::NodePtr node = schema->Column(k)->schema_node();
-            std::vector<std::string> path = node->path()->ToDotVector();
-
-            /*
-             * Compare postgres attribute name to the top level column name in
-             * parquet.
-             *
-             * XXX If we will ever want to support structs then this should be
-             * changed.
-             */
-            if (strcmp(NameStr(TupleDescAttr(tupleDesc, i)->attname),
-                       path[0].c_str()) == 0)
-            {
-                /* Found mapping! */
-                festate->indices.push_back(k);
-
-                /* index of last element */
-                festate->map[i] = festate->indices.size() - 1; 
-
-                festate->types.push_back(festate->schema->field(k)->type().get());
-                break;
-            }
-        }
-    }
-
-    festate->has_nulls = (bool *) palloc(sizeof(bool) * festate->map.size());
-
-    festate->segments_cxt = AllocSetContextCreate(parent_cxt,
-                                                  "parquet_fdw tuple data",
-                                                  ALLOCSET_DEFAULT_SIZES);
-    festate->segment_start_ptr = NULL;
-    festate->segment_cur_ptr = NULL;
-    festate->segment_last_ptr = NULL;
-
-    /*
-     * Enable automatic execution state destruction by using memory context
-     * callback
-     */
-    festate->callback.func = destroy_parquet_state;
-    festate->callback.arg = (void *) festate;
-    MemoryContextRegisterResetCallback(festate->segments_cxt,
-                                       &festate->callback);
-    festate->autodestroy = true;
-
-    return festate;
 }
 
 /*
@@ -1299,12 +1385,8 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
 
     try
     {
-        festate = create_parquet_state(filename,
-                                       tupleDesc,
-                                       cxt,
-                                       attrs_used,
-                                       use_mmap,
-                                       use_threads);
+        festate = new ParquetFdwExecutionState(filename, use_mmap);
+        festate->init(tupleDesc, cxt, attrs_used, use_threads);
     }
     catch(const std::exception& e)
     {
@@ -1316,100 +1398,6 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
         festate->rowgroups.push_back(lfirst_int(lc));
 
     node->fdw_state = festate;
-}
-
-/*
- * initialize_castfuncs
- *      Check wether implicit cast will be required and prepare cast function
- *      call. For arrays find cast functions for its elements.
- */
-static void
-initialize_castfuncs(ParquetFdwExecutionState *festate, TupleDesc tupleDesc)
-{
-    festate->castfuncs.resize(festate->map.size());
-
-    for (uint i = 0; i < festate->map.size(); ++i)
-    {
-        int arrow_col = festate->map[i];
-
-        if (festate->map[i] < 0)
-        {
-            /* Null column */
-            festate->castfuncs[i] = NULL;
-            continue;
-        }
-
-        arrow::DataType *type = festate->types[arrow_col];
-        int     type_id = type->id();
-        int     src_type,
-                dst_type;
-        bool    src_is_list,
-                dst_is_array;
-        Oid     funcid;
-        CoercionPathType ct;
-
-        /* Find underlying type of list */
-        src_is_list = (type_id == arrow::Type::LIST);
-        if (src_is_list)
-            type_id = get_arrow_list_elem_type(type);
-
-        src_type = to_postgres_type(type_id);
-        dst_type = TupleDescAttr(tupleDesc, i)->atttypid;
-
-        if (!OidIsValid(src_type))
-            elog(ERROR, "parquet_fdw: unsupported column type: %s",
-                 type->name().c_str());
-
-        /* Find underlying type of array */
-        dst_is_array = type_is_array(dst_type);
-        if (dst_is_array)
-            dst_type = get_element_type(dst_type);
-
-        /* Make sure both types are compatible */
-        if (src_is_list != dst_is_array)
-        {
-            ereport(ERROR,
-                    (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
-                     errmsg("parquet_fdw: incompatible types in column \"%s\"",
-                            festate->table->field(arrow_col)->name().c_str()),
-                     errhint(src_is_list ?
-                         "parquet column is of type list while postgres type is scalar" :
-                         "parquet column is of scalar type while postgres type is array")));
-        }
-
-        if (IsBinaryCoercible(src_type, dst_type))
-        {
-            festate->castfuncs[i] = NULL;
-            continue;
-        }
-
-        ct = find_coercion_pathway(dst_type,
-                                   src_type,
-                                   COERCION_EXPLICIT,
-                                   &funcid);
-        switch (ct)
-        {
-            case COERCION_PATH_FUNC:
-                {
-                    MemoryContext   oldctx;
-                    
-                    oldctx = MemoryContextSwitchTo(CurTransactionContext);
-                    festate->castfuncs[i] = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
-                    fmgr_info(funcid, festate->castfuncs[i]);
-                    MemoryContextSwitchTo(oldctx);
-                    break;
-                }
-            case COERCION_PATH_RELABELTYPE:
-            case COERCION_PATH_COERCEVIAIO:  /* TODO: double check that we
-                                              * shouldn't do anything here*/
-                /* Cast is not needed */
-                festate->castfuncs[i] = NULL;
-                break;
-            default:
-                elog(ERROR, "parquet_fdw: cast function is not found");
-        }
-    }
-    festate->initialized = true;
 }
 
 /*
@@ -1586,7 +1574,7 @@ parquetIterateForeignScan(ForeignScanState *node)
 
         /* Lookup cast funcs */
         if (!festate->initialized)
-            initialize_castfuncs(festate, slot->tts_tupleDescriptor);
+            festate->initialize_castfuncs(slot->tts_tupleDescriptor);
     }
 
     festate->populate_slot(slot);
@@ -1644,12 +1632,11 @@ parquetAcquireSampleRowsFunc(Relation relation, int elevel,
     /* Open parquet file and build execution state */
     try
     {
-        festate = create_parquet_state(fdw_private.filename,
-                                       tupleDesc,
-                                       CurrentMemoryContext,
-                                       attrs_used,
-                                       false,
-                                       fdw_private.use_threads);
+        festate = new ParquetFdwExecutionState(fdw_private.filename, false);
+        festate->init(tupleDesc,
+                      CurrentMemoryContext,
+                      attrs_used,
+                      fdw_private.use_threads);
         festate->autodestroy = false;
     }
     catch(const std::exception& e)
@@ -1675,7 +1662,7 @@ parquetAcquireSampleRowsFunc(Relation relation, int elevel,
         slot = MakeSingleTupleTableSlot(tupleDesc, &TTSOpsHeapTuple);
 #endif
 
-        initialize_castfuncs(festate, tupleDesc);
+        festate->initialize_castfuncs(tupleDesc);
 
         while (true)
         {
