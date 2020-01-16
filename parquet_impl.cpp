@@ -127,8 +127,86 @@ get_arrow_list_elem_type(arrow::DataType *type)
     return children[0]->type()->id();
 }
 
+class FastAllocator
+{
+private:
+    /*
+     * Special memory segment to speed up bytea/Text allocations.
+     */
+    MemoryContext                   segments_cxt;
+    char                           *segment_start_ptr;
+    char                           *segment_cur_ptr;
+    char                           *segment_last_ptr;
+    std::list<char *>               garbage_segments;
+public:
+    FastAllocator(MemoryContext cxt)
+    {
+        this->segments_cxt = cxt;
+        this->segment_start_ptr = NULL;
+        this->segment_cur_ptr = NULL;
+        this->segment_last_ptr = NULL;
+    }
 
-class ParquetFdwExecutionState
+    /*
+     * fast_alloc
+     *      Preallocate a big memory segment and distribute blocks from it. When
+     *      segment is exhausted it is added to garbage_segments list and freed
+     *      on the next executor's iteration. If requested size is bigger that
+     *      SEGMENT_SIZE then just palloc is used.
+     */
+    inline void *fast_alloc(long size)
+    {
+        void   *ret;
+
+        Assert(size >= 0);
+
+        /* If allocation is bigger than segment then just palloc */
+        if (size > SEGMENT_SIZE)
+            return palloc(size);
+
+        size = MAXALIGN(size);
+
+        /* If there is not enough space in current segment create a new one */
+        if (this->segment_last_ptr - this->segment_cur_ptr < size)
+        {
+            MemoryContext oldcxt;
+
+            /*
+             * Recycle the last segment at the next iteration (if there
+             * was one)
+             */
+            if (this->segment_start_ptr)
+                this->garbage_segments.
+                    push_back(this->segment_start_ptr);
+
+            oldcxt = MemoryContextSwitchTo(this->segments_cxt);
+            this->segment_start_ptr = (char *) palloc(SEGMENT_SIZE);
+            this->segment_cur_ptr = this->segment_start_ptr;
+            this->segment_last_ptr =
+                this->segment_start_ptr + SEGMENT_SIZE - 1;
+            MemoryContextSwitchTo(oldcxt);
+        }
+
+        ret = (void *) this->segment_cur_ptr;
+        this->segment_cur_ptr += size;
+
+        return ret;
+    }
+
+    void recycle(void)
+    {
+        /* recycle old segments if any */
+        if (!this->garbage_segments.empty())
+        {
+            for (auto it : this->garbage_segments)
+                pfree(it);
+            this->garbage_segments.clear();
+            elog(DEBUG1, "parquet_fdw: garbage segments recycled");
+        }
+    }
+};
+
+class ParquetFdwReader
 {
 public:
     std::unique_ptr<parquet::arrow::FileReader> reader;
@@ -178,18 +256,7 @@ public:
      */
     std::vector<int>                rowgroups;
 
-    /*
-     * Special memory segment to speed up bytea/Text allocations.
-     */
-    MemoryContext                   segments_cxt;
-    char                           *segment_start_ptr;
-    char                           *segment_cur_ptr;
-    char                           *segment_last_ptr;
-    std::list<char *>               garbage_segments;
-
-    /* Callback to delete this state object in case of ERROR */
-    MemoryContextCallback           callback;
-    bool                            autodestroy;
+    FastAllocator                  *allocator;
 
     /* Coordinator for parallel query execution */
     ParallelCoordinator            *coordinator;
@@ -197,7 +264,7 @@ public:
     /* Wether object is properly initialized */
     bool     initialized;
 
-    ParquetFdwExecutionState(const char *filename, bool use_mmap)
+    ParquetFdwReader(const char *filename, bool use_mmap)
         : row_group(-1), row(0), num_rows(0), coordinator(NULL),
           initialized(false)
     {
@@ -208,13 +275,20 @@ public:
         );
     }
 
-    void init(TupleDesc tupleDesc,
-              MemoryContext parent_cxt,
+    ~ParquetFdwReader()
+    {
+        if (allocator)
+            delete allocator;
+    }
+
+    void init(MemoryContext cxt,
+              TupleDesc tupleDesc,
               std::set<int> &attrs_used,
               bool use_threads)
     {
         auto schema = this->reader->parquet_reader()->metadata()->schema();
         parquet::ArrowReaderProperties props;
+        MemoryContext estate_cxt;
 
         if (!parquet::arrow::FromParquetSchema(schema, props, &this->schema).ok())
             elog(ERROR, "parquet_fdw: error reading parquet schema");
@@ -262,68 +336,118 @@ public:
         }
 
         this->has_nulls = (bool *) palloc(sizeof(bool) * this->map.size());
-        this->segments_cxt = AllocSetContextCreate(parent_cxt,
-                                                   "parquet_fdw tuple data",
-                                                   ALLOCSET_DEFAULT_SIZES);
-        this->segment_start_ptr = NULL;
-        this->segment_cur_ptr = NULL;
-        this->segment_last_ptr = NULL;
 
-        /*
-         * Enable automatic execution state destruction by using memory context
-         * callback
-         */
-        this->callback.func = destroy_parquet_state;
-        this->callback.arg = (void *) this;
-        MemoryContextRegisterResetCallback(this->segments_cxt,
-                                           &this->callback);
-        this->autodestroy = true;
+        this->allocator = new FastAllocator(cxt);
     }
 
-    /*
-     * fast_alloc
-     *      Preallocate a big memory segment and distribute blocks from it. When
-     *      segment is exhausted it is added to garbage_segments list and freed
-     *      on the next executor's iteration. If requested size is bigger that
-     *      SEGMENT_SIZE then just palloc is used.
-     */
-    inline void *fast_alloc(long size)
+    bool read_next_rowgroup(TupleDesc tupleDesc)
     {
-        void   *ret;
+        ParallelCoordinator        *coord;
+        arrow::Status               status;
 
-        Assert(size >= 0);
+        coord = this->coordinator;
 
-        /* If allocation is bigger than segment then just palloc */
-        if (size > SEGMENT_SIZE)
-            return palloc(size);
+        /*
+         * Use atomic increment for parallel query or just regular one for single
+         * threaded execution.
+         */
+        if (coord)
+            this->row_group = pg_atomic_fetch_add_u32(&coord->next_rowgroup, 1);
+        else
+            this->row_group++;
 
-        size = MAXALIGN(size);
+        /*
+         * row_group cannot be less than zero at this point so it is safe to cast
+         * it to unsigned int
+         */
+        if ((uint) this->row_group >= this->rowgroups.size())
+            return false;
 
-        /* If there is not enough space in current segment create a new one */
-        if (this->segment_last_ptr - this->segment_cur_ptr < size)
+        int  rowgroup = this->rowgroups[this->row_group];
+        auto rowgroup_meta = this->reader
+                                ->parquet_reader()
+                                ->metadata()
+                                ->RowGroup(rowgroup);
+
+        /* Determine which columns has null values */
+        for (uint i = 0; i < this->map.size(); i++)
         {
-            MemoryContext oldcxt;
-            
-            /*
-             * Recycle the last segment at the next iteration (if there
-             * was one)
-             */
-            if (this->segment_start_ptr)
-                this->garbage_segments.
-                    push_back(this->segment_start_ptr);
+            std::shared_ptr<parquet::Statistics>  stats;
+            int arrow_col = this->map[i];
 
-            oldcxt = MemoryContextSwitchTo(this->segments_cxt);
-            this->segment_start_ptr = (char *) palloc(SEGMENT_SIZE);
-            this->segment_cur_ptr = this->segment_start_ptr;
-            this->segment_last_ptr =
-                this->segment_start_ptr + SEGMENT_SIZE - 1;
-            MemoryContextSwitchTo(oldcxt);
+            if (arrow_col < 0)
+                continue;
+
+            stats = rowgroup_meta
+                ->ColumnChunk(this->indices[arrow_col])
+                ->statistics();
+
+            if (stats)
+                this->has_nulls[arrow_col] = (stats->null_count() > 0);
+            else
+                this->has_nulls[arrow_col] = true;
         }
 
-        ret = (void *) this->segment_cur_ptr;
-        this->segment_cur_ptr += size;
+        status = this->reader
+            ->RowGroup(rowgroup)
+            ->ReadTable(this->indices, &this->table);
 
-        return ret;
+        if (!status.ok())
+            throw std::runtime_error(status.message().c_str());
+
+        if (!this->table)
+            throw std::runtime_error("got empty table");
+
+        /* Fill this->columns and this->types */
+        /* TODO: don't clear each time */
+        this->chunk_info.clear();
+        this->chunks.clear();
+        for (int i = 0; i < tupleDesc->natts; i++)
+        {
+            if (this->map[i] >= 0)
+            {
+                ChunkInfo chunkInfo = { .chunk = 0, .pos = 0, .len = 0 };
+                auto column = this->table->column(this->map[i]);
+
+                this->chunk_info.push_back(chunkInfo);
+                this->chunks.push_back(column->chunk(0).get());
+            }
+        }
+
+        this->row = 0;
+        this->num_rows = this->table->num_rows();
+
+        return true;
+    }
+
+    bool next(TupleTableSlot *slot)
+    {
+        allocator->recycle();
+
+        if (this->row >= this->num_rows)
+        {
+            /* Read next row group */
+            try
+            {
+                if (!this->read_next_rowgroup(slot->tts_tupleDescriptor))
+                    return false;
+            }
+            catch(const std::exception& e)
+            {
+                elog(ERROR,
+                     "parquet_fdw: failed to read row group %d: %s",
+                     this->row_group, e.what());
+            }
+
+            /* Lookup cast funcs */
+            if (!this->initialized)
+                this->initialize_castfuncs(slot->tts_tupleDescriptor);
+        }
+
+        this->populate_slot(slot);
+        this->row++;
+
+        return true;
     }
 
     /*
@@ -433,6 +557,13 @@ public:
         }
     }
 
+    void rescan(void)
+    {
+        this->row_group = 0;
+        this->row = 0;
+        this->num_rows = 0;
+    }
+
     /*
      * read_primitive_type
      *      Returns primitive type value from arrow array
@@ -496,7 +627,7 @@ public:
 
                 /* Build bytea */
                 int64 bytea_len = vallen + VARHDRSZ;
-                bytea *b = (bytea *) this->fast_alloc(bytea_len);
+                bytea *b = (bytea *) this->allocator->fast_alloc(bytea_len);
                 SET_VARSIZE(b, bytea_len);
                 memcpy(VARDATA(b), value, vallen);
 
@@ -559,7 +690,7 @@ public:
         int         dims[1];
         int         lbs[1];
 
-        values = (Datum *) this->fast_alloc(sizeof(Datum) * array->length());
+        values = (Datum *) this->allocator->fast_alloc(sizeof(Datum) * array->length());
         get_typlenbyvalalign(elem_type, &elem_len, &elem_byval, &elem_align);
 
         /* Fill values and nulls arrays */
@@ -587,7 +718,7 @@ public:
                 {
                     Size size = sizeof(bool) * array->length();
 
-                    nulls = (bool *) this->fast_alloc(size);
+                    nulls = (bool *) this->allocator->fast_alloc(size);
                     memset(nulls, 0, size);
                 }
                 nulls[i] = true;
@@ -721,6 +852,75 @@ public:
         const auto& prim_arr = arrow::internal::checked_cast<const arrow::PrimitiveArray&>(arr);
         const T* raw_values = reinterpret_cast<const T*>(prim_arr.values()->data());
         return raw_values + arr.offset();
+    }
+
+    void set_rowgroups_list(List *rowgroups)
+    {
+        ListCell *lc;
+
+        foreach (lc, rowgroups)
+            this->rowgroups.push_back(lfirst_int(lc));
+    }
+};
+
+class ParquetFdwExecutionState
+{
+private:
+    /* TODO: make it a list of readers */
+    ParquetFdwReader   *reader;
+
+    /* Callback to delete this state object in case of ERROR */
+    MemoryContextCallback           callback;
+
+public:
+    bool                            autodestroy;
+
+public:
+    MemoryContext       estate_cxt;
+
+    ParquetFdwExecutionState(const char *filename, bool use_mmap)
+    {
+        reader = new ParquetFdwReader(filename, use_mmap);
+    }
+
+    ~ParquetFdwExecutionState()
+    {
+        if (reader)
+            delete reader;
+    }
+
+    void init(MemoryContext cxt,
+              TupleDesc tupleDesc,
+              std::set<int> &attrs_used,
+              bool use_threads)
+    {
+        reader->init(cxt, tupleDesc, attrs_used, use_threads);
+
+        /*
+         * Enable automatic execution state destruction by using memory context
+         * callback
+         */
+        /* TODO: move it to the upper level */
+        this->callback.func = destroy_parquet_state;
+        this->callback.arg = (void *) this;
+        MemoryContextRegisterResetCallback(cxt,
+                                           &this->callback);
+        this->autodestroy = true;
+    }
+
+    bool next(TupleTableSlot *slot)
+    {
+        return reader->next(slot);
+    }
+
+    void rescan(void)
+    {
+        reader->rescan();
+    }
+
+    void set_rowgroups_list(List *list)
+    {
+        reader->set_rowgroups_list(list);
     }
 };
 
@@ -1358,6 +1558,7 @@ extern "C" void
 parquetBeginForeignScan(ForeignScanState *node, int eflags)
 {
     ParquetFdwExecutionState *festate; 
+    MemoryContext   reader_cxt;
 	ForeignScan    *plan = (ForeignScan *) node->ss.ps.plan;
 	EState         *estate = node->ss.ps.state;
     List           *fdw_private = plan->fdw_private;
@@ -1383,10 +1584,14 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
     TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
     TupleDesc tupleDesc = slot->tts_tupleDescriptor;
 
+    reader_cxt = AllocSetContextCreate(cxt,
+                                       "parquet_fdw tuple data",
+                                       ALLOCSET_DEFAULT_SIZES);
+
     try
     {
         festate = new ParquetFdwExecutionState(filename, use_mmap);
-        festate->init(tupleDesc, cxt, attrs_used, use_threads);
+        festate->init(reader_cxt, tupleDesc, attrs_used, use_threads);
     }
     catch(const std::exception& e)
     {
@@ -1394,9 +1599,7 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
     }
 
     rowgroups_list = (List *) llast(fdw_private);
-    foreach (lc, rowgroups_list)
-        festate->rowgroups.push_back(lfirst_int(lc));
-
+    festate->set_rowgroups_list(rowgroups_list);
     node->fdw_state = festate;
 }
 
@@ -1459,87 +1662,6 @@ find_cmp_func(FmgrInfo *finfo, Oid type1, Oid type2)
     fmgr_info(cmp_proc_oid, finfo);
 }
 
-static bool
-read_next_rowgroup(ParquetFdwExecutionState *festate, TupleDesc tupleDesc)
-{
-    ParallelCoordinator        *coord;
-    arrow::Status               status;
-
-    coord = festate->coordinator;
-
-    /*
-     * Use atomic increment for parallel query or just regular one for single
-     * threaded execution.
-     */
-    if (coord)
-        festate->row_group = pg_atomic_fetch_add_u32(&coord->next_rowgroup, 1);
-    else
-        festate->row_group++;
-
-    /*
-     * row_group cannot be less than zero at this point so it is safe to cast
-     * it to unsigned int
-     */
-    if ((uint) festate->row_group >= festate->rowgroups.size())
-        return false;
-
-    int  rowgroup = festate->rowgroups[festate->row_group];
-    auto rowgroup_meta = festate->reader
-                            ->parquet_reader()
-                            ->metadata()
-                            ->RowGroup(rowgroup);
-
-    /* Determine which columns has null values */
-    for (uint i = 0; i < festate->map.size(); i++)
-    {
-        std::shared_ptr<parquet::Statistics>  stats;
-        int arrow_col = festate->map[i];
-
-        if (arrow_col < 0)
-            continue;
-
-        stats = rowgroup_meta
-            ->ColumnChunk(festate->indices[arrow_col])
-            ->statistics();
-
-        if (stats)
-            festate->has_nulls[arrow_col] = (stats->null_count() > 0);
-        else
-            festate->has_nulls[arrow_col] = true;
-    }
-
-    status = festate->reader
-        ->RowGroup(rowgroup)
-        ->ReadTable(festate->indices, &festate->table);
-
-    if (!status.ok())
-        throw std::runtime_error(status.message().c_str());
-
-    if (!festate->table)
-        throw std::runtime_error("got empty table");
-
-    /* Fill festate->columns and festate->types */
-    /* TODO: don't clear each time */
-    festate->chunk_info.clear();
-    festate->chunks.clear();
-    for (int i = 0; i < tupleDesc->natts; i++)
-    {
-        if (festate->map[i] >= 0)
-        {
-            ChunkInfo chunkInfo = { .chunk = 0, .pos = 0, .len = 0 };
-            auto column = festate->table->column(festate->map[i]);
-
-            festate->chunk_info.push_back(chunkInfo);
-            festate->chunks.push_back(column->chunk(0).get());
-        }
-    }
-
-    festate->row = 0;
-    festate->num_rows = festate->table->num_rows();
-
-    return true;
-}
-
 extern "C" TupleTableSlot *
 parquetIterateForeignScan(ForeignScanState *node)
 {
@@ -1548,6 +1670,7 @@ parquetIterateForeignScan(ForeignScanState *node)
 
 	ExecClearTuple(slot);
 
+#if 0
     /* recycle old segments if any */
     if (!festate->garbage_segments.empty())
     {
@@ -1579,7 +1702,9 @@ parquetIterateForeignScan(ForeignScanState *node)
 
     festate->populate_slot(slot);
     festate->row++;
-    ExecStoreVirtualTuple(slot);
+#endif
+    if (festate->next(slot))
+        ExecStoreVirtualTuple(slot);
 
     return slot;
 }
@@ -1606,11 +1731,10 @@ parquetReScanForeignScan(ForeignScanState *node)
 {
     ParquetFdwExecutionState   *festate = (ParquetFdwExecutionState *) node->fdw_state;
 
-    festate->row_group = 0;
-    festate->row = 0;
-    festate->num_rows = 0;
+    festate->rescan();
 }
 
+#if 0
 static int
 parquetAcquireSampleRowsFunc(Relation relation, int elevel,
                              HeapTuple *rows, int targrows,
@@ -1619,6 +1743,7 @@ parquetAcquireSampleRowsFunc(Relation relation, int elevel,
 {
     ParquetFdwExecutionState   *festate;
     ParquetFdwPlanState         fdw_private;
+    MemoryContext               reader_cxt;
     TupleDesc       tupleDesc = RelationGetDescr(relation);
     TupleTableSlot *slot;
     std::set<int>   attrs_used;
@@ -1629,12 +1754,17 @@ parquetAcquireSampleRowsFunc(Relation relation, int elevel,
     for (int i = 0; i < tupleDesc->natts; ++i)
         attrs_used.insert(i + 1 - FirstLowInvalidHeapAttributeNumber);
 
+    reader_cxt = AllocSetContextCreate(CurrentMemoryContext,
+                                       "parquet_fdw tuple data",
+                                       ALLOCSET_DEFAULT_SIZES);
+
+
     /* Open parquet file and build execution state */
     try
     {
         festate = new ParquetFdwExecutionState(fdw_private.filename, false);
-        festate->init(tupleDesc,
-                      CurrentMemoryContext,
+        festate->init(reader_cxt,
+                      tupleDesc,
                       attrs_used,
                       fdw_private.use_threads);
         festate->autodestroy = false;
@@ -1727,15 +1857,18 @@ parquetAcquireSampleRowsFunc(Relation relation, int elevel,
 
     return cnt - 1;
 }
+#endif
 
+#if 0
 extern "C" bool
-parquetAnalyzeForeignTable (Relation relation,
-                            AcquireSampleRowsFunc *func,
-                            BlockNumber *totalpages)
+parquetAnalyzeForeignTable(Relation relation,
+                           AcquireSampleRowsFunc *func,
+                           BlockNumber *totalpages)
 {
     *func = parquetAcquireSampleRowsFunc;
     return true;
 }
+#endif
 
 /*
  * parquetExplainForeignScan
@@ -1782,9 +1915,11 @@ parquetIsForeignScanParallelSafe(PlannerInfo *root, RelOptInfo *rel,
                                  RangeTblEntry *rte)
 {
     /* Use parallel execution only when statistics are collected */
-    return (rel->tuples > 0);
+    // return (rel->tuples > 0);
+    return false;
 }
 
+#if 0
 extern "C" Size
 parquetEstimateDSMForeignScan(ForeignScanState *node, ParallelContext *pcxt)
 {
@@ -1823,6 +1958,7 @@ parquetInitializeWorkerForeignScan(ForeignScanState *node,
     festate = (ParquetFdwExecutionState *) node->fdw_state;
     festate->coordinator = coord;
 }
+#endif
 
 extern "C" void
 parquetShutdownForeignScan(ForeignScanState *node)
@@ -1830,7 +1966,7 @@ parquetShutdownForeignScan(ForeignScanState *node)
     ParquetFdwExecutionState   *festate;
 
     festate = (ParquetFdwExecutionState *) node->fdw_state;
-    festate->coordinator = NULL;
+    // festate->coordinator = NULL;
 }
 
 /*
