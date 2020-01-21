@@ -57,6 +57,7 @@ extern "C"
 #endif
 }
 
+
 #define SEGMENT_SIZE (1024 * 1024)
 
 #define to_postgres_timestamp(tstype, i, ts)                    \
@@ -73,6 +74,7 @@ extern "C"
             elog(ERROR, "Timestamp of unknown precision: %d",   \
                  (tstype)->unit());                             \
     }
+
 
 static void find_cmp_func(FmgrInfo *finfo, Oid type1, Oid type2);
 static Datum bytes_to_postgres_type(const char *bytes, arrow::DataType *arrow_type);
@@ -865,47 +867,45 @@ public:
 
 class ParquetFdwExecutionState
 {
-private:
-    /* TODO: make it a list of readers */
-    ParquetFdwReader   *reader;
-
-    /* Callback to delete this state object in case of ERROR */
-    MemoryContextCallback           callback;
-
 public:
-    bool                            autodestroy;
+    virtual void init() = 0;
+    virtual bool next(TupleTableSlot *slot) = 0;
+    virtual void rescan(void) = 0;
+    virtual void set_rowgroups_list(List *list) = 0;
+};
+
+class SingleFileExecutionState : public ParquetFdwExecutionState
+{
+private:
+    ParquetFdwReader   *reader;
+    MemoryContext       cxt;
+    TupleDesc           tupleDesc;
+    std::set<int>       attrs_used;
+    bool                use_threads;
 
 public:
     MemoryContext       estate_cxt;
 
-    ParquetFdwExecutionState(const char *filename, bool use_mmap)
+    SingleFileExecutionState(const char *filename,
+                             MemoryContext cxt,
+                             TupleDesc tupleDesc,
+                             bool use_threads,
+                             bool use_mmap)
+        : cxt(cxt), tupleDesc(tupleDesc), use_threads(use_threads),
+          attrs_used(attrs_used)
     {
         reader = new ParquetFdwReader(filename, use_mmap);
     }
 
-    ~ParquetFdwExecutionState()
+    ~SingleFileExecutionState()
     {
         if (reader)
             delete reader;
     }
 
-    void init(MemoryContext cxt,
-              TupleDesc tupleDesc,
-              std::set<int> &attrs_used,
-              bool use_threads)
+    void init()
     {
         reader->init(cxt, tupleDesc, attrs_used, use_threads);
-
-        /*
-         * Enable automatic execution state destruction by using memory context
-         * callback
-         */
-        /* TODO: move it to the upper level */
-        this->callback.func = destroy_parquet_state;
-        this->callback.arg = (void *) this;
-        MemoryContextRegisterResetCallback(cxt,
-                                           &this->callback);
-        this->autodestroy = true;
     }
 
     bool next(TupleTableSlot *slot)
@@ -924,91 +924,139 @@ public:
     }
 };
 
-static void
-destroy_parquet_state(void *arg)
+#if 0
+class MultifileMergeExecutionState : public ParquetFdwExecutionState
 {
-    ParquetFdwExecutionState *festate = (ParquetFdwExecutionState *) arg;
+private:
+    std::vector<ParquetFdwReader *>   readers;
 
-    if (festate->autodestroy)
-        delete festate;
-}
+public:
+    MemoryContext       estate_cxt;
 
-/*
- * C interface functions
- */
-
-static Bitmapset *
-parse_attributes_list(char *start, Oid relid)
-{
-    Bitmapset *attrs = NULL;
-    char      *token;
-    const char *delim = std::string(" ").c_str(); /* to satisfy g++ compiler */
-    AttrNumber attnum;
-
-    while ((token = strtok(start, delim)) != NULL)
+    MultifileExecutionState(const std::list<const char *> &filenames, bool use_mmap)
     {
-        if ((attnum = get_attnum(relid, token)) == InvalidAttrNumber)
-            elog(ERROR, "paruqet_fdw: invalid attribute name '%s'", token);
-        attrs = bms_add_member(attrs, attnum);
-        start = NULL;
+        for (auto it: filenames)
+            readers.push_back(new ParquetFdwReader(it, use_mmap));
     }
 
-    return attrs;
-}
-
-static void
-get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
-{
-	ForeignTable *table;
-    ListCell     *lc;
-
-    fdw_private->use_mmap = false;
-    fdw_private->use_threads = false;
-    table = GetForeignTable(relid);
-    
-    foreach(lc, table->options)
+    ~MultifileExecutionState()
     {
-		DefElem    *def = (DefElem *) lfirst(lc);
-
-        if (strcmp(def->defname, "filename") == 0)
-            fdw_private->filename = defGetString(def);
-        else if (strcmp(def->defname, "sorted") == 0)
-        {
-            fdw_private->attrs_sorted =
-                parse_attributes_list(defGetString(def), relid);
-        }
-        else if (strcmp(def->defname, "use_mmap") == 0)
-        { 
-            if (!parse_bool(defGetString(def), &fdw_private->use_mmap))
-                ereport(ERROR,
-                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                         errmsg("invalid value for boolean option \"%s\": %s",
-                                def->defname, defGetString(def))));
-        }
-        else if (strcmp(def->defname, "use_threads") == 0)
-        {
-            if (!parse_bool(defGetString(def), &fdw_private->use_threads))
-                ereport(ERROR,
-                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                         errmsg("invalid value for boolean option \"%s\": %s",
-                                def->defname, defGetString(def))));
-        }
-        else
-            elog(ERROR, "unknown option '%s'", def->defname);
+        for (auto it: readers)
+            if (*it)
+                delete *it;
     }
-}
 
-extern "C" void
-parquetGetForeignRelSize(PlannerInfo *root,
-					  RelOptInfo *baserel,
-					  Oid foreigntableid)
+    void init(MemoryContext cxt,
+              TupleDesc tupleDesc,
+              std::set<int> &attrs_used,
+              bool use_threads)
+    {
+        for (auto it: readers)
+            it->init(cxt, tupleDesc, attrs_used, use_threads);
+    }
+
+    bool next(TupleTableSlot *slot)
+    {
+        /* TODO: implement */
+        return false;
+    }
+
+    void rescan(void)
+    {
+        reader->rescan();
+    }
+
+    void set_rowgroups_list(List *list)
+    {
+        reader->set_rowgroups_list(list);
+    }
+};
+#endif
+
+class MultifileExecutionState : public ParquetFdwExecutionState
 {
-    ParquetFdwPlanState *fdw_private;
+private:
+    ParquetFdwReader       *reader;
+    std::list<std::string>  filenames;
+    std::list<std::string>::const_iterator it;
 
-    fdw_private = (ParquetFdwPlanState *) palloc0(sizeof(ParquetFdwPlanState));
-    get_table_options(foreigntableid, fdw_private);
-    baserel->fdw_private = fdw_private;
-}
+    MemoryContext           cxt;
+    TupleDesc               tupleDesc;
+    std::set<int>           attrs_used;
+    bool                    use_threads;
+    bool                    use_mmap;
+public:
+    MemoryContext       estate_cxt;
+
+    MultifileExecutionState(const std::list<std::string> &filenames,
+                            MemoryContext cxt,
+                            TupleDesc tupleDesc,
+                            std::set<int> attrs_used,
+                            bool use_threads,
+                            bool use_mmap)
+        : cxt(cxt), tupleDesc(tupleDesc), use_threads(use_threads),
+          attrs_used(attrs_used), use_mmap(use_mmap)
+    {
+        this->filenames = filenames;
+        it = this->filenames.begin(); 
+        reader = new ParquetFdwReader((*it).c_str(), use_mmap);
+        it++;
+    }
+
+    ~MultifileExecutionState()
+    {
+        if (reader)
+            delete reader;
+    }
+
+    void init()
+    {
+        reader->init(cxt, tupleDesc, attrs_used, use_threads);
+    }
+
+    bool next(TupleTableSlot *slot)
+    {
+        bool    res;
+
+        res = reader->next(slot);
+
+        /* Finished reading current reader? Proceed to the next one */
+        if (unlikely(!res))
+        {
+            try
+            {
+                while (it != filenames.end())
+                {
+                    if (reader)
+                        delete reader;
+
+                    reader = new ParquetFdwReader((*it).c_str(), use_mmap);
+                    reader->init(cxt, tupleDesc, attrs_used, use_threads);
+                    res = reader->next(slot);
+                    it++;
+                    if (res)
+                        break;
+                }
+            }
+            catch (const std::exception& e)
+            {
+                elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
+            }
+        }
+
+        return res;
+    }
+
+    void rescan(void)
+    {
+        reader->rescan();
+    }
+
+    void set_rowgroups_list(List *list)
+    {
+        reader->set_rowgroups_list(list);
+    }
+};
 
 /*
  * extract_rowgroup_filters
@@ -1122,34 +1170,6 @@ extract_rowgroup_filters(List *scan_clauses,
     }
 }
 
-static Oid
-to_postgres_type(int arrow_type)
-{
-    switch (arrow_type)
-    {
-        case arrow::Type::BOOL:
-            return BOOLOID;
-        case arrow::Type::INT32:
-            return INT4OID;
-        case arrow::Type::INT64:
-            return INT8OID;
-        case arrow::Type::FLOAT:
-            return FLOAT4OID;
-        case arrow::Type::DOUBLE:
-            return FLOAT8OID;
-        case arrow::Type::STRING:
-            return TEXTOID;
-        case arrow::Type::BINARY:
-            return BYTEAOID;
-        case arrow::Type::TIMESTAMP:
-            return TIMESTAMPOID;
-        case arrow::Type::DATE32:
-            return DATEOID;
-        default:
-            return InvalidOid;
-    }
-}
-
 /*
  * row_group_matches_filter
  *      Check if min/max values of the column of the row group match filter.
@@ -1241,7 +1261,7 @@ row_group_matches_filter(parquet::Statistics *stats,
  *      row groups satisfy clauses. Store resulting row group list to
  *      fdw_private.
  */
-static void
+void
 extract_rowgroups_list(PlannerInfo *root, RelOptInfo *baserel)
 {
     std::unique_ptr<parquet::arrow::FileReader> reader;
@@ -1344,6 +1364,264 @@ extract_rowgroups_list(PlannerInfo *root, RelOptInfo *baserel)
     }  /* loop over rowgroups */
 
     heap_close(rel, AccessShareLock);
+}
+
+/*
+ * extract_parquet_fields
+ *      Read parquet file and return a list of its fields
+ */
+static std::list<std::pair<std::string, Oid> >
+extract_parquet_fields(ImportForeignSchemaStmt *stmt, const char *path)
+{
+    std::list<std::pair<std::string, Oid> >     res;
+    std::unique_ptr<parquet::arrow::FileReader> reader;
+    std::shared_ptr<arrow::Schema>              schema;
+
+    try
+    {
+        parquet::arrow::FileReader::Make(
+                arrow::default_memory_pool(),
+                parquet::ParquetFileReader::OpenFile(path, false),
+                &reader
+        );
+
+    }
+    catch(const std::exception& e)
+    {
+        elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
+    }
+
+    PG_TRY();
+    {
+        auto meta = reader->parquet_reader()->metadata();
+        parquet::ArrowReaderProperties props;
+
+        if (!parquet::arrow::FromParquetSchema(meta->schema(), props, &schema).ok())
+            elog(ERROR, "parquet_fdw: error reading parquet schema");
+
+        for (int k = 0; k < schema->num_fields(); ++k)
+        {
+            std::shared_ptr<arrow::Field>       field;
+            std::shared_ptr<arrow::DataType>    type;
+            Oid     pg_type;
+
+            /* Convert to arrow field to get appropriate type */
+            field = schema->field(k);
+            type = field->type();
+
+            if (type->id() == arrow::Type::LIST)
+            {
+                int subtype_id;
+                Oid pg_subtype;
+
+                if (type->children().size() != 1)
+                    elog(ERROR, "parquet_fdw: lists of structs are not supported");
+
+                subtype_id = get_arrow_list_elem_type(type.get());
+                pg_subtype = to_postgres_type(subtype_id);
+
+                pg_type = get_array_type(pg_subtype);
+            }
+            else
+            {
+                pg_type = to_postgres_type(type->id());
+            }
+
+            if (pg_type != InvalidOid)
+            {
+                res.push_back(std::pair<std::string, Oid>(field->name(), pg_type));
+            }
+            else
+            {
+                elog(ERROR,
+                     "parquet_fdw: cannot convert field '%s' of type '%s' in %s",
+                     field->name().c_str(), type->name().c_str(), path);
+            }
+        }
+    }
+    PG_CATCH();
+    {
+        /* Destroy the reader on error */
+        reader.reset();
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
+    return res;
+}
+
+/*
+ * autodiscover_parquet_file
+ *      Builds CREATE FOREIGN TABLE query based on specified parquet file
+ */
+char *
+autodiscover_parquet_file(ImportForeignSchemaStmt *stmt, char *filename)
+{
+    char           *path = psprintf("%s/%s", stmt->remote_schema, filename);
+    StringInfoData  str;
+    auto            fields = extract_parquet_fields(stmt, path);
+    bool            is_first = true;
+    char           *ext;
+    ListCell       *lc;
+
+    initStringInfo(&str);
+    appendStringInfo(&str, "CREATE FOREIGN TABLE ");
+
+    /* append table name */
+    ext = strrchr(filename, '.');
+    *ext = '\0';
+    if (stmt->local_schema)
+        appendStringInfo(&str, "%s.%s (",
+                         stmt->local_schema, quote_identifier(filename));
+    else
+        appendStringInfo(&str, "%s (", quote_identifier(filename));
+    *ext = '.';
+
+    /* append columns */
+    for (auto field: fields)
+    {
+        std::string &name = field.first;
+        Oid pg_type = field.second;
+
+        const char *type_name = format_type_be(pg_type);
+
+        if (!is_first)
+            appendStringInfo(&str, ", %s %s", name.c_str(), type_name);
+        else
+        {
+            appendStringInfo(&str, "%s %s", name.c_str(), type_name);
+            is_first = false;
+        }
+    }
+    appendStringInfo(&str, ") SERVER %s ", stmt->server_name);
+    appendStringInfo(&str, "OPTIONS (filename '%s'", path);
+
+    /* append options */
+    foreach (lc, stmt->options)
+    {
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+        appendStringInfo(&str, ", %s '%s'", def->defname, defGetString(def));
+    }
+    appendStringInfo(&str, ")");
+
+    elog(DEBUG1, "parquet_fdw: %s", str.data);
+
+    return str.data;
+}
+
+static void
+destroy_parquet_state(void *arg)
+{
+    ParquetFdwExecutionState *festate = (ParquetFdwExecutionState *) arg;
+
+    if (festate)
+        delete festate;
+}
+
+/*
+ * C interface functions
+ */
+
+static Bitmapset *
+parse_attributes_list(char *start, Oid relid)
+{
+    Bitmapset *attrs = NULL;
+    char      *token;
+    const char *delim = std::string(" ").c_str(); /* to satisfy g++ compiler */
+    AttrNumber attnum;
+
+    while ((token = strtok(start, delim)) != NULL)
+    {
+        if ((attnum = get_attnum(relid, token)) == InvalidAttrNumber)
+            elog(ERROR, "paruqet_fdw: invalid attribute name '%s'", token);
+        attrs = bms_add_member(attrs, attnum);
+        start = NULL;
+    }
+
+    return attrs;
+}
+
+static void
+get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
+{
+	ForeignTable *table;
+    ListCell     *lc;
+
+    fdw_private->use_mmap = false;
+    fdw_private->use_threads = false;
+    table = GetForeignTable(relid);
+
+    foreach(lc, table->options)
+    {
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+        if (strcmp(def->defname, "filename") == 0)
+            fdw_private->filename = defGetString(def);
+        else if (strcmp(def->defname, "sorted") == 0)
+        {
+            fdw_private->attrs_sorted =
+                parse_attributes_list(defGetString(def), relid);
+        }
+        else if (strcmp(def->defname, "use_mmap") == 0)
+        {
+            if (!parse_bool(defGetString(def), &fdw_private->use_mmap))
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("invalid value for boolean option \"%s\": %s",
+                                def->defname, defGetString(def))));
+        }
+        else if (strcmp(def->defname, "use_threads") == 0)
+        {
+            if (!parse_bool(defGetString(def), &fdw_private->use_threads))
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("invalid value for boolean option \"%s\": %s",
+                                def->defname, defGetString(def))));
+        }
+        else
+            elog(ERROR, "unknown option '%s'", def->defname);
+    }
+}
+
+extern "C" void
+parquetGetForeignRelSize(PlannerInfo *root,
+					  RelOptInfo *baserel,
+					  Oid foreigntableid)
+{
+    ParquetFdwPlanState *fdw_private;
+
+    fdw_private = (ParquetFdwPlanState *) palloc0(sizeof(ParquetFdwPlanState));
+    get_table_options(foreigntableid, fdw_private);
+    baserel->fdw_private = fdw_private;
+}
+
+static Oid
+to_postgres_type(int arrow_type)
+{
+    switch (arrow_type)
+    {
+        case arrow::Type::BOOL:
+            return BOOLOID;
+        case arrow::Type::INT32:
+            return INT4OID;
+        case arrow::Type::INT64:
+            return INT8OID;
+        case arrow::Type::FLOAT:
+            return FLOAT4OID;
+        case arrow::Type::DOUBLE:
+            return FLOAT8OID;
+        case arrow::Type::STRING:
+            return TEXTOID;
+        case arrow::Type::BINARY:
+            return BYTEAOID;
+        case arrow::Type::TIMESTAMP:
+            return TIMESTAMPOID;
+        case arrow::Type::DATE32:
+            return DATEOID;
+        default:
+            return InvalidOid;
+    }
 }
 
 static void
@@ -1557,7 +1835,8 @@ parquetGetForeignPlan(PlannerInfo *root,
 extern "C" void
 parquetBeginForeignScan(ForeignScanState *node, int eflags)
 {
-    ParquetFdwExecutionState *festate; 
+    ParquetFdwExecutionState   *festate;
+    MemoryContextCallback      *callback;
     MemoryContext   reader_cxt;
 	ForeignScan    *plan = (ForeignScan *) node->ss.ps.plan;
 	EState         *estate = node->ss.ps.state;
@@ -1567,7 +1846,7 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
     ListCell       *lc;
     char           *filename;
     std::set<int>   attrs_used;
-    bool            use_mmap; 
+    bool            use_mmap;
     bool            use_threads;
 
     /* Unwrap fdw_private */
@@ -1590,13 +1869,27 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
 
     try
     {
-        festate = new ParquetFdwExecutionState(filename, use_mmap);
-        festate->init(reader_cxt, tupleDesc, attrs_used, use_threads);
+        std::list<std::string> filenames;
+        filenames.push_back(filename);
+
+        festate = new MultifileExecutionState(filenames, reader_cxt,
+                                              tupleDesc, attrs_used,
+                                              use_threads, use_mmap);
+        festate->init();
     }
     catch(const std::exception& e)
     {
         elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
     }
+
+    /*
+     * Enable automatic execution state destruction by using memory context
+     * callback
+     */
+    callback = (MemoryContextCallback *) palloc(sizeof(MemoryContextCallback));
+    callback->func = destroy_parquet_state;
+    callback->arg = (void *) festate;
+    MemoryContextRegisterResetCallback(reader_cxt, callback);
 
     rowgroups_list = (List *) llast(fdw_private);
     festate->set_rowgroups_list(rowgroups_list);
@@ -1712,18 +2005,10 @@ parquetIterateForeignScan(ForeignScanState *node)
 extern "C" void
 parquetEndForeignScan(ForeignScanState *node)
 {
-    ParquetFdwExecutionState *festate = (ParquetFdwExecutionState *) node->fdw_state;
-
-    /* 
-     * Disable autodestruction to prevent double freeing of the execution
-     * state object. I could just remove `delete festate` below and let the
-     * memory context callback do its job. But it is more obvious for readers
-     * to see an explicit destruction of the execution state.
+    /*
+     * Destruction of execution state is done by memory context callback. See
+     * destroy_parquet_state()
      */
-    festate->autodestroy = false;
-
-    delete festate;
-
 }
 
 extern "C" void
@@ -1969,150 +2254,6 @@ parquetShutdownForeignScan(ForeignScanState *node)
     // festate->coordinator = NULL;
 }
 
-/*
- * extract_parquet_fields
- *      Read parquet file and return a list of its fields
- */
-std::list<std::pair<std::string, Oid> >
-extract_parquet_fields(ImportForeignSchemaStmt *stmt, const char *path)
-{
-    std::list<std::pair<std::string, Oid> >     res;
-    std::unique_ptr<parquet::arrow::FileReader> reader;
-    std::shared_ptr<arrow::Schema>              schema;
-
-    try
-    {
-        parquet::arrow::FileReader::Make(
-                arrow::default_memory_pool(),
-                parquet::ParquetFileReader::OpenFile(path, false),
-                &reader
-        );
-
-    }
-    catch(const std::exception& e)
-    {
-        elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
-    }
-
-    PG_TRY();
-    {
-        auto meta = reader->parquet_reader()->metadata();
-        parquet::ArrowReaderProperties props;
-
-        if (!parquet::arrow::FromParquetSchema(meta->schema(), props, &schema).ok())
-            elog(ERROR, "parquet_fdw: error reading parquet schema");
-
-        for (int k = 0; k < schema->num_fields(); ++k)
-        {
-            std::shared_ptr<arrow::Field>       field;
-            std::shared_ptr<arrow::DataType>    type;
-            Oid     pg_type;
-
-            /* Convert to arrow field to get appropriate type */
-            field = schema->field(k);
-            type = field->type();
-
-            if (type->id() == arrow::Type::LIST)
-            {
-                int subtype_id;
-                Oid pg_subtype;
-
-                if (type->children().size() != 1)
-                    elog(ERROR, "parquet_fdw: lists of structs are not supported");
-
-                subtype_id = get_arrow_list_elem_type(type.get());
-                pg_subtype = to_postgres_type(subtype_id);
-
-                pg_type = get_array_type(pg_subtype);
-            }
-            else
-            {
-                pg_type = to_postgres_type(type->id());
-            }
-
-            if (pg_type != InvalidOid)
-            {
-                res.push_back(std::pair<std::string, Oid>(field->name(), pg_type));
-            }
-            else
-            {
-                elog(ERROR,
-                     "parquet_fdw: cannot convert field '%s' of type '%s' in %s",
-                     field->name().c_str(), type->name().c_str(), path);
-            }
-        }
-    }
-    PG_CATCH();
-    {
-        /* Destroy the reader on error */
-        reader.reset();
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
-
-    return res;
-}
-
-/*
- * autodiscover_parquet_file
- *      Builds CREATE FOREIGN TABLE query based on specified parquet file
- */
-static char *
-autodiscover_parquet_file(ImportForeignSchemaStmt *stmt, char *filename)
-{
-    char           *path = psprintf("%s/%s", stmt->remote_schema, filename);
-    StringInfoData  str;
-    auto            fields = extract_parquet_fields(stmt, path);
-    bool            is_first = true;
-    char           *ext;
-    ListCell       *lc;
-
-    initStringInfo(&str);
-    appendStringInfo(&str, "CREATE FOREIGN TABLE ");
-
-    /* append table name */
-    ext = strrchr(filename, '.');
-    *ext = '\0';
-    if (stmt->local_schema)
-        appendStringInfo(&str, "%s.%s (",
-                         stmt->local_schema, quote_identifier(filename));
-    else
-        appendStringInfo(&str, "%s (", quote_identifier(filename));
-    *ext = '.';
-
-    /* append columns */
-    for (auto field: fields)
-    {
-        std::string &name = field.first;
-        Oid pg_type = field.second;
-
-        const char *type_name = format_type_be(pg_type);
-
-        if (!is_first)
-            appendStringInfo(&str, ", %s %s", name.c_str(), type_name);
-        else
-        {
-            appendStringInfo(&str, "%s %s", name.c_str(), type_name);
-            is_first = false;
-        }
-    }
-    appendStringInfo(&str, ") SERVER %s ", stmt->server_name);
-    appendStringInfo(&str, "OPTIONS (filename '%s'", path);
-
-    /* append options */
-    foreach (lc, stmt->options)
-    {
-		DefElem    *def = (DefElem *) lfirst(lc);
-
-        appendStringInfo(&str, ", %s '%s'", def->defname, defGetString(def));
-    }
-    appendStringInfo(&str, ")");
-
-    elog(DEBUG1, "parquet_fdw: %s", str.data);
-
-    return str.data;
-}
-
 extern "C" List *
 parquetImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 {
@@ -2189,3 +2330,4 @@ parquetImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 
     return cmds;
 }
+

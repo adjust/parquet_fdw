@@ -79,32 +79,6 @@ _PG_init(void)
 
 }
 
-PG_FUNCTION_INFO_V1(parquet_fdw_handler);
-Datum
-parquet_fdw_handler(PG_FUNCTION_ARGS)
-{
-    FdwRoutine *fdwroutine = makeNode(FdwRoutine);
-
-    fdwroutine->GetForeignRelSize = parquetGetForeignRelSize;
-    fdwroutine->GetForeignPaths = parquetGetForeignPaths;
-    fdwroutine->GetForeignPlan = parquetGetForeignPlan;
-    fdwroutine->BeginForeignScan = parquetBeginForeignScan;
-    fdwroutine->IterateForeignScan = parquetIterateForeignScan;
-    fdwroutine->ReScanForeignScan = parquetReScanForeignScan;
-    fdwroutine->EndForeignScan = parquetEndForeignScan;
-    // fdwroutine->AnalyzeForeignTable = parquetAnalyzeForeignTable;
-    fdwroutine->ExplainForeignScan = parquetExplainForeignScan;
-    fdwroutine->IsForeignScanParallelSafe = parquetIsForeignScanParallelSafe;
-    // fdwroutine->EstimateDSMForeignScan = parquetEstimateDSMForeignScan;
-    // fdwroutine->InitializeDSMForeignScan = parquetInitializeDSMForeignScan;
-    // fdwroutine->ReInitializeDSMForeignScan = parquetReInitializeDSMForeignScan;
-    // fdwroutine->InitializeWorkerForeignScan = parquetInitializeWorkerForeignScan;
-    fdwroutine->ShutdownForeignScan = parquetShutdownForeignScan;
-    fdwroutine->ImportForeignSchema = parquetImportForeignSchema;
-
-    PG_RETURN_POINTER(fdwroutine);
-}
-
 PG_FUNCTION_INFO_V1(parquet_fdw_validator);
 Datum
 parquet_fdw_validator(PG_FUNCTION_ARGS)
@@ -176,5 +150,31 @@ parquet_fdw_validator(PG_FUNCTION_ARGS)
         elog(ERROR, "parquet_fdw: filename is required");
 
     PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(parquet_fdw_handler);
+Datum
+parquet_fdw_handler(PG_FUNCTION_ARGS)
+{
+    FdwRoutine *fdwroutine = makeNode(FdwRoutine);
+
+    fdwroutine->GetForeignRelSize = parquetGetForeignRelSize;
+    fdwroutine->GetForeignPaths = parquetGetForeignPaths;
+    fdwroutine->GetForeignPlan = parquetGetForeignPlan;
+    fdwroutine->BeginForeignScan = parquetBeginForeignScan;
+    fdwroutine->IterateForeignScan = parquetIterateForeignScan;
+    fdwroutine->ReScanForeignScan = parquetReScanForeignScan;
+    fdwroutine->EndForeignScan = parquetEndForeignScan;
+    // fdwroutine->AnalyzeForeignTable = parquetAnalyzeForeignTable;
+    fdwroutine->ExplainForeignScan = parquetExplainForeignScan;
+    fdwroutine->IsForeignScanParallelSafe = parquetIsForeignScanParallelSafe;
+    // fdwroutine->EstimateDSMForeignScan = parquetEstimateDSMForeignScan;
+    // fdwroutine->InitializeDSMForeignScan = parquetInitializeDSMForeignScan;
+    // fdwroutine->ReInitializeDSMForeignScan = parquetReInitializeDSMForeignScan;
+    // fdwroutine->InitializeWorkerForeignScan = parquetInitializeWorkerForeignScan;
+    fdwroutine->ShutdownForeignScan = parquetShutdownForeignScan;
+    fdwroutine->ImportForeignSchema = parquetImportForeignSchema;
+
+    PG_RETURN_POINTER(fdwroutine);
 }
 
