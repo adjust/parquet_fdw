@@ -1,6 +1,7 @@
 /*
  * Parquet processing implementation
  */
+#include <sys/stat.h>
 
 #include <list>
 #include <set>
@@ -22,6 +23,8 @@ extern "C"
 #include "access/parallel.h"
 #include "access/sysattr.h"
 #include "access/nbtree.h"
+#include "access/reloptions.h"
+#include "catalog/pg_foreign_table.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
@@ -1255,6 +1258,80 @@ row_group_matches_filter(parquet::Statistics *stats,
     return true;
 }
 
+typedef enum
+{
+    PS_START = 0,
+    PS_IDENT,
+    PS_QUOTE
+} ParserState;
+
+/*
+ * parse_filenames_list
+ *      Parse space separated list of filenames. This function modifies 
+ *      the original string.
+ */
+static List *
+parse_filenames_list(char *str)
+{
+    char       *f = str;
+    ParserState state = PS_START;
+    List       *filenames = NIL;
+
+    while (*str)
+    {
+        switch (state)
+        {
+            case PS_START:
+                switch (*str)
+                {
+                    case ' ':
+                        /* just skip */
+                        break;
+                    case '"':
+                        f = str + 1;
+                        state = PS_QUOTE;
+                        break;
+                    default:
+                        /* XXX we should check that *str is a valid path symbol
+                         * but let's skip it for now */
+                        state = PS_IDENT;
+                        f = str;
+                        break;
+                }
+                break;
+            case PS_IDENT:
+                switch (*str)
+                {
+                    case ' ':
+                        *str = '\0';
+                        filenames = lappend(filenames, f);
+                        state = PS_START;
+                        break;
+                    default:
+                        break;
+                }
+                break;
+            case PS_QUOTE:
+                switch (*str)
+                {
+                    case '"':
+                        *str = '\0';
+                        filenames = lappend(filenames, f);
+                        state = PS_START;
+                        break;
+                    default:
+                        break;
+                }
+            default:
+                elog(ERROR, "parquet_fdw: unknown parse state");
+        }
+        str++;
+    }
+    filenames = lappend(filenames, f);
+
+    return filenames;
+}
+
 /*
  * extract_rowgroups_list
  *      Analyze query predicates and using min/max statistics determine which
@@ -1270,6 +1347,11 @@ extract_rowgroups_list(PlannerInfo *root, RelOptInfo *baserel)
     Relation        rel;
     TupleDesc       tupleDesc;
     auto            fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
+    char           *filename;
+    List *filenames;
+
+    filename = pstrdup(fdw_private->filename);
+    filenames = parse_filenames_list(filename);
 
     /*
      * Open relation to be able to access tuple descriptor
@@ -1286,7 +1368,7 @@ extract_rowgroups_list(PlannerInfo *root, RelOptInfo *baserel)
     {
         parquet::arrow::FileReader::Make(
                 arrow::default_memory_pool(),
-                parquet::ParquetFileReader::OpenFile(fdw_private->filename, false),
+                parquet::ParquetFileReader::OpenFile((char *) linitial(filenames), false),
                 &reader
         );
 
@@ -1851,6 +1933,8 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
 
     /* Unwrap fdw_private */
     filename = strVal((Value *) linitial(fdw_private));
+    /* TODO */
+    List *fn_list = parse_filenames_list(filename);
 
     attrs_used_list = (List *) lsecond(fdw_private);
     foreach (lc, attrs_used_list)
@@ -1870,7 +1954,7 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
     try
     {
         std::list<std::string> filenames;
-        filenames.push_back(filename);
+        filenames.push_back((char *) linitial(fn_list));
 
         festate = new MultifileExecutionState(filenames, reader_cxt,
                                               tupleDesc, attrs_used,
@@ -1879,6 +1963,7 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
     }
     catch(const std::exception& e)
     {
+        /* TODO: delete already created states */
         elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
     }
 
@@ -2329,5 +2414,89 @@ parquetImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
     FreeDir(d);
 
     return cmds;
+}
+
+extern "C" Datum
+parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
+{
+    List       *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
+    Oid         catalog = PG_GETARG_OID(1);
+    ListCell   *lc;
+    bool        filename_provided = false;
+
+    /* Only check table options */
+    if (catalog != ForeignTableRelationId)
+        PG_RETURN_VOID();
+
+    foreach(lc, options_list)
+    {
+        DefElem    *def = (DefElem *) lfirst(lc);
+
+        if (strcmp(def->defname, "filename") == 0)
+        {
+            char   *filename = pstrdup(defGetString(def));
+            List   *filenames;
+            ListCell *lc;
+
+            filenames = parse_filenames_list(filename);
+
+            foreach(lc, filenames)
+            {
+                struct stat stat_buf;
+                char       *fn = (char *) lfirst(lc);
+
+                if (stat(fn, &stat_buf) != 0)
+                {
+                    int e = errno;
+
+                    ereport(ERROR,
+                            (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                             errmsg("parquet_fdw: %s", strerror(e))));
+                }
+            }
+            pfree(filenames);
+            pfree(filename);
+            filename_provided = true;
+        }
+        else if (strcmp(def->defname, "sorted") == 0)
+            ;  /* do nothing */
+        else if (strcmp(def->defname, "batch_size") == 0)
+            /* check that int value is valid */
+            strtol(defGetString(def), NULL, 10);
+        else if (strcmp(def->defname, "use_mmap") == 0)
+        {
+            /* Check that bool value is valid */
+            bool    use_mmap;
+
+            if (!parse_bool(defGetString(def), &use_mmap))
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("invalid value for boolean option \"%s\": %s",
+                                def->defname, defGetString(def))));
+        }
+        else if (strcmp(def->defname, "use_threads") == 0)
+        {
+            /* Check that bool value is valid */
+            bool    use_threads;
+
+            if (!parse_bool(defGetString(def), &use_threads))
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("invalid value for boolean option \"%s\": %s",
+                                def->defname, defGetString(def))));
+        }
+        else
+        {
+            ereport(ERROR,
+                    (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                     errmsg("parquet_fdw: invalid option \"%s\"",
+                            def->defname)));
+        }
+    }
+
+    if (!filename_provided)
+        elog(ERROR, "parquet_fdw: filename is required");
+
+    PG_RETURN_VOID();
 }
 
