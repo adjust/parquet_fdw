@@ -101,12 +101,12 @@ struct RowGroupFilter
  */
 struct ParquetFdwPlanState
 {
-    char       *filename;
+    List       *filenames;
     Bitmapset  *attrs_sorted;
-    Bitmapset  *attrs_used;    /* attributes actually used in query */
+    Bitmapset  *attrs_used;     /* attributes actually used in query */
     bool        use_mmap;
     bool        use_threads;
-    List       *rowgroups;
+    List       *rowgroups;      /* List of Lists (per filename) */
     uint64      ntuples;
 };
 
@@ -859,24 +859,21 @@ public:
         return raw_values + arr.offset();
     }
 
-    void set_rowgroups_list(List *rowgroups)
+    void set_rowgroups_list(const std::vector<int> &rowgroups)
     {
-        ListCell *lc;
-
-        foreach (lc, rowgroups)
-            this->rowgroups.push_back(lfirst_int(lc));
+        this->rowgroups = rowgroups;
     }
 };
 
 class ParquetFdwExecutionState
 {
 public:
-    virtual void init() = 0;
     virtual bool next(TupleTableSlot *slot) = 0;
     virtual void rescan(void) = 0;
-    virtual void set_rowgroups_list(List *list) = 0;
+    virtual void add_file(const char *filename, List *rowgroups) = 0;
 };
 
+#if 0
 class SingleFileExecutionState : public ParquetFdwExecutionState
 {
 private:
@@ -926,6 +923,7 @@ public:
         reader->set_rowgroups_list(list);
     }
 };
+#endif
 
 #if 0
 class MultifileMergeExecutionState : public ParquetFdwExecutionState
@@ -979,32 +977,53 @@ public:
 class MultifileExecutionState : public ParquetFdwExecutionState
 {
 private:
+        struct FileRowgroups
+        {
+            std::string         filename;
+            std::vector<int>    rowgroups;
+        };
+private:
     ParquetFdwReader       *reader;
-    std::list<std::string>  filenames;
-    std::list<std::string>::const_iterator it;
+    std::list<FileRowgroups> files;
+    std::list<FileRowgroups>::const_iterator it;
 
     MemoryContext           cxt;
     TupleDesc               tupleDesc;
     std::set<int>           attrs_used;
     bool                    use_threads;
     bool                    use_mmap;
+
+private:
+    ParquetFdwReader *get_next_reader()
+    {
+        ParquetFdwReader *r;
+
+        try
+        {
+            r = new ParquetFdwReader((*it).filename.c_str(), use_mmap);
+            r->init(cxt, tupleDesc, attrs_used, use_threads);
+        }
+        catch (const std::exception& e)
+        {
+            elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
+        }
+        r->set_rowgroups_list((*it).rowgroups);
+        it++;
+
+        return r;
+    }
+
 public:
     MemoryContext       estate_cxt;
 
-    MultifileExecutionState(const std::list<std::string> &filenames,
-                            MemoryContext cxt,
+    MultifileExecutionState(MemoryContext cxt,
                             TupleDesc tupleDesc,
                             std::set<int> attrs_used,
                             bool use_threads,
                             bool use_mmap)
         : cxt(cxt), tupleDesc(tupleDesc), use_threads(use_threads),
           attrs_used(attrs_used), use_mmap(use_mmap)
-    {
-        this->filenames = filenames;
-        it = this->filenames.begin(); 
-        reader = new ParquetFdwReader((*it).c_str(), use_mmap);
-        it++;
-    }
+    {}
 
     ~MultifileExecutionState()
     {
@@ -1012,14 +1031,15 @@ public:
             delete reader;
     }
 
-    void init()
-    {
-        reader->init(cxt, tupleDesc, attrs_used, use_threads);
-    }
-
     bool next(TupleTableSlot *slot)
     {
         bool    res;
+
+        if (unlikely(reader == NULL))
+        {
+            it = files.begin();
+            reader = this->get_next_reader();
+        }
 
         res = reader->next(slot);
 
@@ -1028,15 +1048,13 @@ public:
         {
             try
             {
-                while (it != filenames.end())
+                while (it != files.end())
                 {
                     if (reader)
                         delete reader;
 
-                    reader = new ParquetFdwReader((*it).c_str(), use_mmap);
-                    reader->init(cxt, tupleDesc, attrs_used, use_threads);
+                    reader = this->get_next_reader();
                     res = reader->next(slot);
-                    it++;
                     if (res)
                         break;
                 }
@@ -1055,9 +1073,15 @@ public:
         reader->rescan();
     }
 
-    void set_rowgroups_list(List *list)
+    void add_file(const char *filename, List *rowgroups)
     {
-        reader->set_rowgroups_list(list);
+        FileRowgroups   fr;
+        ListCell       *lc;
+
+        fr.filename = filename;
+        foreach (lc, rowgroups)
+            fr.rowgroups.push_back(lfirst_int(lc));
+        files.push_back(fr);
     }
 };
 
@@ -1271,39 +1295,40 @@ typedef enum
  *      the original string.
  */
 static List *
-parse_filenames_list(char *str)
+parse_filenames_list(const char *str)
 {
-    char       *f = str;
+    char       *cur = pstrdup(str);
+    char       *f = cur;
     ParserState state = PS_START;
     List       *filenames = NIL;
 
-    while (*str)
+    while (*cur)
     {
         switch (state)
         {
             case PS_START:
-                switch (*str)
+                switch (*cur)
                 {
                     case ' ':
                         /* just skip */
                         break;
                     case '"':
-                        f = str + 1;
+                        f = cur + 1;
                         state = PS_QUOTE;
                         break;
                     default:
-                        /* XXX we should check that *str is a valid path symbol
+                        /* XXX we should check that *cur is a valid path symbol
                          * but let's skip it for now */
                         state = PS_IDENT;
-                        f = str;
+                        f = cur;
                         break;
                 }
                 break;
             case PS_IDENT:
-                switch (*str)
+                switch (*cur)
                 {
                     case ' ':
-                        *str = '\0';
+                        *cur = '\0';
                         filenames = lappend(filenames, f);
                         state = PS_START;
                         break;
@@ -1312,10 +1337,10 @@ parse_filenames_list(char *str)
                 }
                 break;
             case PS_QUOTE:
-                switch (*str)
+                switch (*cur)
                 {
                     case '"':
-                        *str = '\0';
+                        *cur = '\0';
                         filenames = lappend(filenames, f);
                         state = PS_START;
                         break;
@@ -1325,7 +1350,7 @@ parse_filenames_list(char *str)
             default:
                 elog(ERROR, "parquet_fdw: unknown parse state");
         }
-        str++;
+        cur++;
     }
     filenames = lappend(filenames, f);
 
@@ -1338,6 +1363,7 @@ parse_filenames_list(char *str)
  *      row groups satisfy clauses. Store resulting row group list to
  *      fdw_private.
  */
+#if 0
 void
 extract_rowgroups_list(PlannerInfo *root, RelOptInfo *baserel)
 {
@@ -1447,6 +1473,102 @@ extract_rowgroups_list(PlannerInfo *root, RelOptInfo *baserel)
 
     heap_close(rel, AccessShareLock);
 }
+#endif
+
+List *
+extract_rowgroups_list(const char *filename,
+                       TupleDesc tupleDesc,
+                       std::list<RowGroupFilter> &filters,
+                       uint64 *ntuples)
+{
+    std::unique_ptr<parquet::arrow::FileReader> reader;
+    List       *rowgroups = NIL;
+
+    /* Open parquet file to read meta information */
+    try
+    {
+        parquet::arrow::FileReader::Make(
+                arrow::default_memory_pool(),
+                parquet::ParquetFileReader::OpenFile(filename, false),
+                &reader
+        );
+
+    }
+    catch(const std::exception& e)
+    {
+        elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
+    }
+    auto meta = reader->parquet_reader()->metadata();
+    parquet::ArrowReaderProperties  props;
+    std::shared_ptr<arrow::Schema>  schema;
+    parquet::arrow::FromParquetSchema(meta->schema(), props, &schema);
+
+    /* Check each row group whether it matches the filters */
+    for (int r = 0; r < reader->num_row_groups(); r++)
+    {
+        bool match = true;
+        auto rowgroup = meta->RowGroup(r);
+
+        for (auto it = filters.begin(); it != filters.end(); it++)
+        {
+            RowGroupFilter &filter = *it;
+            AttrNumber      attnum;
+            const char     *attname;
+
+            attnum = filter.attnum - 1;
+            attname = NameStr(TupleDescAttr(tupleDesc, attnum)->attname);
+
+            /*
+             * Search for the column with the same name as filtered attribute
+             */
+            for (int k = 0; k < rowgroup->num_columns(); k++)
+            {
+                auto    column = rowgroup->ColumnChunk(k);
+                std::vector<std::string> path = column->path_in_schema()->ToDotVector();
+
+                if (strcmp(attname, path[0].c_str()) == 0)
+                {
+                    /* Found it! */
+                    std::shared_ptr<parquet::Statistics>  stats;
+                    std::shared_ptr<arrow::Field>       field;
+                    std::shared_ptr<arrow::DataType>    type;
+
+                    stats = column->statistics();
+
+                    /* Convert to arrow field to get appropriate type */
+                    field = schema->field(k);
+                    type = field->type();
+
+                    /*
+                     * If at least one filter doesn't match rowgroup exclude
+                     * the current row group and proceed with the next one.
+                     */
+                    if (stats &&
+                        !row_group_matches_filter(stats.get(), type.get(), &filter))
+                    {
+                        match = false;
+                        elog(DEBUG1, "parquet_fdw: skip rowgroup %d", r + 1);
+                    }
+                    break;
+                }
+            }  /* loop over columns */
+
+            if (!match)
+                break;
+
+        }  /* loop over filters */
+
+        /* All the filters match this rowgroup */
+        if (match)
+        {
+            rowgroups = lappend_int(rowgroups, r);
+            *ntuples += rowgroup->num_rows();
+        }
+    }  /* loop over rowgroups */
+
+    return rowgroups;
+}
+
 
 /*
  * extract_parquet_fields
@@ -1639,7 +1761,9 @@ get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
 		DefElem    *def = (DefElem *) lfirst(lc);
 
         if (strcmp(def->defname, "filename") == 0)
-            fdw_private->filename = defGetString(def);
+        {
+            fdw_private->filenames = parse_filenames_list(defGetString(def));
+        }
         else if (strcmp(def->defname, "sorted") == 0)
         {
             fdw_private->attrs_sorted =
@@ -1781,15 +1905,36 @@ parquetGetForeignPaths(PlannerInfo *root,
 	Cost		total_cost;
     Cost        run_cost;
     List       *pathkeys = NIL;
+    RangeTblEntry  *rte;
+    Relation        rel;
+    TupleDesc       tupleDesc;
+    std::list<RowGroupFilter> filters;
+    ListCell       *lc;
 
     fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
+
+    /* Analyze query clauses and extract ones that can be of interest to us*/
+    extract_rowgroup_filters(baserel->baserestrictinfo, filters);
+
+    rte = root->simple_rte_array[baserel->relid];
+    rel = heap_open(rte->relid, AccessShareLock);
+    tupleDesc = RelationGetDescr(rel);
 
     /*
      * Extract list of row groups that match query clauses. Also calculate
      * approximate number of rows in result set based on total number of tuples
      * in those row groups. It isn't very precise but it is best we got.
      */
-    extract_rowgroups_list(root, baserel);
+    foreach (lc, fdw_private->filenames)
+    {
+        char *filename = (char *) lfirst(lc);
+        List *rowgroups = extract_rowgroups_list(filename, tupleDesc,
+                                                 filters, &fdw_private->ntuples);
+
+        fdw_private->rowgroups = lappend(fdw_private->rowgroups, rowgroups);
+    }
+    heap_close(rel, AccessShareLock);
+
     estimate_costs(root, baserel, &startup_cost, &run_cost, &total_cost);
 
     /* Collect used attributes to reduce number of read columns during scan */
@@ -1897,7 +2042,7 @@ parquetGetForeignPlan(PlannerInfo *root,
     while ((attr = bms_next_member(fdw_private->attrs_used, attr)) >= 0)
         attrs_used = lappend_int(attrs_used, attr);
 
-    params = list_make5(makeString(fdw_private->filename),
+    params = list_make5(fdw_private->filenames,
                         attrs_used,
                         makeInteger(fdw_private->use_mmap),
                         makeInteger(fdw_private->use_threads),
@@ -1925,16 +2070,14 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
     List           *fdw_private = plan->fdw_private;
     List           *attrs_used_list;
     List           *rowgroups_list;
-    ListCell       *lc;
-    char           *filename;
+    ListCell       *lc, *lc2;
+    List           *filenames;
     std::set<int>   attrs_used;
     bool            use_mmap;
     bool            use_threads;
 
     /* Unwrap fdw_private */
-    filename = strVal((Value *) linitial(fdw_private));
-    /* TODO */
-    List *fn_list = parse_filenames_list(filename);
+    filenames = (List *) linitial(fdw_private);
 
     attrs_used_list = (List *) lsecond(fdw_private);
     foreach (lc, attrs_used_list)
@@ -1942,6 +2085,8 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
 
     use_mmap = (bool) intVal((Value *) lthird(fdw_private));
     use_threads = (bool) intVal((Value *) lfourth(fdw_private));
+
+    rowgroups_list = (List *) llast(fdw_private);
 
     MemoryContext cxt = estate->es_query_cxt;
     TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
@@ -1951,20 +2096,16 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
                                        "parquet_fdw tuple data",
                                        ALLOCSET_DEFAULT_SIZES);
 
-    try
+    festate = new MultifileExecutionState(reader_cxt,
+                                          tupleDesc, attrs_used,
+                                          use_threads, use_mmap);
+    forboth (lc, filenames, lc2, rowgroups_list)
     {
-        std::list<std::string> filenames;
-        filenames.push_back((char *) linitial(fn_list));
+        /* TODO: should be Value, not char* */
+        char *filename = (char *) lfirst(lc);
+        List *rowgroups = (List *) lfirst(lc2);
 
-        festate = new MultifileExecutionState(filenames, reader_cxt,
-                                              tupleDesc, attrs_used,
-                                              use_threads, use_mmap);
-        festate->init();
-    }
-    catch(const std::exception& e)
-    {
-        /* TODO: delete already created states */
-        elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
+        festate->add_file(filename, rowgroups);
     }
 
     /*
@@ -1976,8 +2117,6 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
     callback->arg = (void *) festate;
     MemoryContextRegisterResetCallback(reader_cxt, callback);
 
-    rowgroups_list = (List *) llast(fdw_private);
-    festate->set_rowgroups_list(rowgroups_list);
     node->fdw_state = festate;
 }
 
