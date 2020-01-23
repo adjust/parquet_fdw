@@ -1329,7 +1329,7 @@ parse_filenames_list(const char *str)
                 {
                     case ' ':
                         *cur = '\0';
-                        filenames = lappend(filenames, f);
+                        filenames = lappend(filenames, makeString(f));
                         state = PS_START;
                         break;
                     default:
@@ -1341,7 +1341,7 @@ parse_filenames_list(const char *str)
                 {
                     case '"':
                         *cur = '\0';
-                        filenames = lappend(filenames, f);
+                        filenames = lappend(filenames, makeString(f));
                         state = PS_START;
                         break;
                     default:
@@ -1352,7 +1352,7 @@ parse_filenames_list(const char *str)
         }
         cur++;
     }
-    filenames = lappend(filenames, f);
+    filenames = lappend(filenames, makeString(f));
 
     return filenames;
 }
@@ -1927,7 +1927,7 @@ parquetGetForeignPaths(PlannerInfo *root,
      */
     foreach (lc, fdw_private->filenames)
     {
-        char *filename = (char *) lfirst(lc);
+        char *filename = strVal((Value *) lfirst(lc));
         List *rowgroups = extract_rowgroups_list(filename, tupleDesc,
                                                  filters, &fdw_private->ntuples);
 
@@ -2102,7 +2102,7 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
     forboth (lc, filenames, lc2, rowgroups_list)
     {
         /* TODO: should be Value, not char* */
-        char *filename = (char *) lfirst(lc);
+        char *filename = strVal((Value *) lfirst(lc));
         List *rowgroups = (List *) lfirst(lc2);
 
         festate->add_file(filename, rowgroups);
@@ -2387,31 +2387,40 @@ extern "C" void
 parquetExplainForeignScan(ForeignScanState *node, ExplainState *es)
 {
     List	   *fdw_private;
-    List       *rowgroups;
-    ListCell   *lc;
+    ListCell   *lc, *lc2, *lc3;
     StringInfoData str;
-    bool        is_first = true;
+    List       *filenames;
+    List       *rowgroups_list;
 
     initStringInfo(&str);
 
 	fdw_private = ((ForeignScan *) node->ss.ps.plan)->fdw_private;
-    rowgroups = (List *) llast(fdw_private);
+    filenames = (List *) linitial(fdw_private);
+    rowgroups_list = (List *) llast(fdw_private);
 
-    foreach(lc, rowgroups)
+    forboth(lc, filenames, lc2, rowgroups_list)
     {
-        /*
-         * As parquet-tools use 1 based indexing for row groups it's probably
-         * a good idea to output row groups numbers in the same way.
-         */
-        int rowgroup = lfirst_int(lc) + 1;
+        char   *filename = strVal((Value *) lfirst(lc));
+        List   *rowgroups = (List *) lfirst(lc2);
+        bool    is_first = true;
 
-        if (is_first)
+        appendStringInfo(&str, "\n%s: ", filename);
+        foreach(lc3, rowgroups)
         {
-            appendStringInfo(&str, "%i", rowgroup);
-            is_first = false;
+            /*
+             * As parquet-tools use 1 based indexing for row groups it's probably
+             * a good idea to output row groups numbers in the same way.
+             */
+            int rowgroup = lfirst_int(lc3) + 1;
+
+            if (is_first)
+            {
+                appendStringInfo(&str, "%i", rowgroup);
+                is_first = false;
+            }
+            else
+                appendStringInfo(&str, ", %i", rowgroup);
         }
-        else
-            appendStringInfo(&str, ", %i", rowgroup);
     }
 
     ExplainPropertyText("Row groups", str.data, es);
@@ -2582,7 +2591,7 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
             foreach(lc, filenames)
             {
                 struct stat stat_buf;
-                char       *fn = (char *) lfirst(lc);
+                char       *fn = strVal((Value *) lfirst(lc));
 
                 if (stat(fn, &stat_buf) != 0)
                 {
