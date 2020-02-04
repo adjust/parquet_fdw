@@ -138,13 +138,14 @@ private:
     /*
      * Special memory segment to speed up bytea/Text allocations.
      */
-    MemoryContext                   segments_cxt;
-    char                           *segment_start_ptr;
-    char                           *segment_cur_ptr;
-    char                           *segment_last_ptr;
-    std::list<char *>               garbage_segments;
+    MemoryContext       segments_cxt;
+    char               *segment_start_ptr;
+    char               *segment_cur_ptr;
+    char               *segment_last_ptr;
+    std::list<char *>   garbage_segments;
 public:
     FastAllocator(MemoryContext cxt)
+        : garbage_segments()
     {
         this->segments_cxt = cxt;
         this->segment_start_ptr = NULL;
@@ -1022,7 +1023,7 @@ public:
                             bool use_threads,
                             bool use_mmap)
         : cxt(cxt), tupleDesc(tupleDesc), use_threads(use_threads),
-          attrs_used(attrs_used), use_mmap(use_mmap)
+          attrs_used(attrs_used), use_mmap(use_mmap), reader(NULL)
     {}
 
     ~MultifileExecutionState()
@@ -1799,6 +1800,7 @@ parquetGetForeignRelSize(PlannerInfo *root,
 
     fdw_private = (ParquetFdwPlanState *) palloc0(sizeof(ParquetFdwPlanState));
     get_table_options(foreigntableid, fdw_private);
+    
     baserel->fdw_private = fdw_private;
 }
 
@@ -2404,7 +2406,11 @@ parquetExplainForeignScan(ForeignScanState *node, ExplainState *es)
         List   *rowgroups = (List *) lfirst(lc2);
         bool    is_first = true;
 
-        appendStringInfo(&str, "\n%s: ", filename);
+#ifdef _GNU_SOURCE
+        appendStringInfo(&str, "\n%s: ", basename(filename));
+#else
+        appendStringInfo(&str, "\n%s: ", basename(pstrdup(filename)));
+#endif
         foreach(lc3, rowgroups)
         {
             /*

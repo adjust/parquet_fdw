@@ -38,9 +38,10 @@ matrix:
 before_install:
     - ./install_arrow.sh
 
+
 script:
     - sudo chmod a+x /home/travis  # make files accessible from postgres users
     - make installcheck
       
 after_failure:
-  - cat regression.diffs
+    - cat regression.diffs

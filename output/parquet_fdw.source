@@ -47,21 +47,21 @@ SELECT count(*) as count FROM example;
 
 -- sorting
 EXPLAIN (COSTS OFF) SELECT * FROM example ORDER BY one;
-                          QUERY PLAN                          
---------------------------------------------------------------
+       QUERY PLAN        
+-------------------------
  Foreign Scan on example
    Row groups: 
- @abs_srcdir@/data/example.parquet: 1, 2
+ example.parquet: 1, 2
 (3 rows)
 
 EXPLAIN (COSTS OFF) SELECT * FROM example ORDER BY three;
-                          QUERY PLAN                          
---------------------------------------------------------------
+          QUERY PLAN           
+-------------------------------
  Sort
    Sort Key: three
    ->  Foreign Scan on example
          Row groups: 
- @abs_srcdir@/data/example.parquet: 1, 2
+ example.parquet: 1, 2
 (5 rows)
 
 -- filtering
