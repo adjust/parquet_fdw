@@ -18,7 +18,6 @@ include $(PGXS)
 COMPILE.cxx.bc = $(CLANG) -xc++ -Wno-ignored-attributes $(BITCODE_CXXFLAGS) $(CPPFLAGS) -emit-llvm -c
 
 parquet.bc:
-	# $(COMPILE.cxx.bc) $(CCFLAGS) $(CPPFLAGS) -fPIC -c -o $@ parquet_impl.cpp
 	$(COMPILE.cxx.bc) -o $@ parquet_impl.cpp
 	$(LLVM_BINPATH)/opt -module-summary -f $@ -o $@
 

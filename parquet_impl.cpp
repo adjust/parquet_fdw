@@ -212,6 +212,22 @@ public:
     }
 };
 
+static char *
+tolowercase(const char *input, char *output)
+{
+    int i = 0;
+
+    Assert(strlen(input) < 254);
+
+    do
+    {
+        output[i] = tolower(input[i]);
+    }
+    while (input[i++]);
+
+    return output;
+}
+
 class ParquetFdwReader
 {
 public:
@@ -270,16 +286,10 @@ public:
     /* Wether object is properly initialized */
     bool     initialized;
 
-    ParquetFdwReader(const char *filename, bool use_mmap)
+    ParquetFdwReader()
         : row_group(-1), row(0), num_rows(0), coordinator(NULL),
           initialized(false)
-    {
-        parquet::arrow::FileReader::Make(
-                arrow::default_memory_pool(),
-                parquet::ParquetFileReader::OpenFile(filename, use_mmap),
-                &reader
-        );
-    }
+    { }
 
     ~ParquetFdwReader()
     {
@@ -287,15 +297,29 @@ public:
             delete allocator;
     }
 
-    void init(MemoryContext cxt,
+    void open(const char *filename,
+              MemoryContext cxt,
               TupleDesc tupleDesc,
               std::set<int> &attrs_used,
-              bool use_threads)
+              bool use_threads,
+              bool use_mmap)
     {
-        auto schema = this->reader->parquet_reader()->metadata()->schema();
         parquet::ArrowReaderProperties props;
-        MemoryContext estate_cxt;
+        MemoryContext   estate_cxt;
+        arrow::Status   status;
+        std::unique_ptr<parquet::arrow::FileReader> reader;
 
+        status = parquet::arrow::FileReader::Make(
+                        arrow::default_memory_pool(),
+                        parquet::ParquetFileReader::OpenFile(filename, use_mmap),
+                        &reader);
+        if (!status.ok())
+            elog(ERROR,
+                 "parquet_fdw: failed to open Parquet file: %s",
+                 status.message().c_str());
+        this->reader = std::move(reader);
+
+        auto    schema = this->reader->parquet_reader()->metadata()->schema();
         if (!parquet::arrow::FromParquetSchema(schema, props, &this->schema).ok())
             elog(ERROR, "parquet_fdw: error reading parquet schema");
 
@@ -306,7 +330,8 @@ public:
         this->map.resize(tupleDesc->natts);
         for (int i = 0; i < tupleDesc->natts; i++)
         {
-            AttrNumber attnum = i + 1 - FirstLowInvalidHeapAttributeNumber;
+            AttrNumber  attnum = i + 1 - FirstLowInvalidHeapAttributeNumber;
+            char        pg_colname[255];
 
             this->map[i] = -1;
 
@@ -314,10 +339,15 @@ public:
             if (attrs_used.find(attnum) == attrs_used.end())
                 continue;
 
+            tolowercase(NameStr(TupleDescAttr(tupleDesc, i)->attname), pg_colname);
+
             for (int k = 0; k < schema->num_columns(); k++)
             {
                 parquet::schema::NodePtr node = schema->Column(k)->schema_node();
                 std::vector<std::string> path = node->path()->ToDotVector();
+                char    parquet_colname[255];
+
+                tolowercase(path[0].c_str(), parquet_colname);
 
                 /*
                  * Compare postgres attribute name to the top level column name in
@@ -326,8 +356,7 @@ public:
                  * XXX If we will ever want to support structs then this should be
                  * changed.
                  */
-                if (strcmp(NameStr(TupleDescAttr(tupleDesc, i)->attname),
-                           path[0].c_str()) == 0)
+                if (strcmp(pg_colname, parquet_colname) == 0)
                 {
                     /* Found mapping! */
                     this->indices.push_back(k);
@@ -1002,8 +1031,8 @@ private:
 
         try
         {
-            r = new ParquetFdwReader((*it).filename.c_str(), use_mmap);
-            r->init(cxt, tupleDesc, attrs_used, use_threads);
+            r = new ParquetFdwReader();
+            r->open((*it).filename.c_str(), cxt, tupleDesc, attrs_used, use_threads, use_mmap);
         }
         catch (const std::exception& e)
         {
