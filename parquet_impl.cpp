@@ -869,7 +869,7 @@ public:
 class ParquetFdwExecutionState
 {
 public:
-    virtual ~ParquetFdwExecutionState() = 0;
+    virtual ~ParquetFdwExecutionState() {};
     virtual bool next(TupleTableSlot *slot) = 0;
     virtual void rescan(void) = 0;
     virtual void add_file(const char *filename, List *rowgroups) = 0;
