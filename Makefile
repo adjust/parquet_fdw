@@ -15,8 +15,12 @@ PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
+COMPILE.cxx.bc = $(CLANG) -xc++ -Wno-ignored-attributes $(BITCODE_CXXFLAGS) $(CPPFLAGS) -emit-llvm -c
+
 parquet.bc:
-	$(COMPILE.cxx.bc) $(CCFLAGS) $(CPPFLAGS) -fPIC -c -o $@ parquet_impl.cpp
+	# $(COMPILE.cxx.bc) $(CCFLAGS) $(CPPFLAGS) -fPIC -c -o $@ parquet_impl.cpp
+	$(COMPILE.cxx.bc) -o $@ parquet_impl.cpp
+	$(LLVM_BINPATH)/opt -module-summary -f $@ -o $@
 
 parquet.o:
 	$(CXX) -std=c++11 -O3 $(CPPFLAGS) $(CCFLAGS) parquet_impl.cpp $(PG_LIBS) -c -fPIC $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)
