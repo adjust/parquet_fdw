@@ -86,6 +86,20 @@ static void destroy_parquet_state(void *arg);
 
 bool parquet_fdw_use_threads = true;
 
+struct Error : std::exception
+{
+    char text[1000];
+
+    Error(char const* fmt, ...) __attribute__((format(printf,2,3))) {
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(text, sizeof text, fmt, ap);
+        va_end(ap);
+    }
+
+    char const* what() const throw() { return text; }
+};
+
 /*
  * Restriction
  */
@@ -314,14 +328,13 @@ public:
                         parquet::ParquetFileReader::OpenFile(filename, use_mmap),
                         &reader);
         if (!status.ok())
-            elog(ERROR,
-                 "parquet_fdw: failed to open Parquet file: %s",
-                 status.message().c_str());
+            throw Error("failed to open Parquet file %s",
+                                 status.message().c_str());
         this->reader = std::move(reader);
 
         auto    schema = this->reader->parquet_reader()->metadata()->schema();
         if (!parquet::arrow::FromParquetSchema(schema, props, &this->schema).ok())
-            elog(ERROR, "parquet_fdw: error reading parquet schema");
+            throw Error("error reading parquet schema");
 
         /* Enable parallel columns decoding/decompression if needed */
         this->reader->set_use_threads(use_threads && parquet_fdw_use_threads);
@@ -455,7 +468,7 @@ public:
         return true;
     }
 
-    bool next(TupleTableSlot *slot)
+    bool next(TupleTableSlot *slot, bool fake=false)
     {
         allocator->recycle();
 
@@ -479,7 +492,7 @@ public:
                 this->initialize_castfuncs(slot->tts_tupleDescriptor);
         }
 
-        this->populate_slot(slot);
+        this->populate_slot(slot, fake);
         this->row++;
 
         return true;
@@ -899,7 +912,7 @@ class ParquetFdwExecutionState
 {
 public:
     virtual ~ParquetFdwExecutionState() {};
-    virtual bool next(TupleTableSlot *slot) = 0;
+    virtual bool next(TupleTableSlot *slot, bool fake=false) = 0;
     virtual void rescan(void) = 0;
     virtual void add_file(const char *filename, List *rowgroups) = 0;
 };
@@ -1062,7 +1075,7 @@ public:
             delete reader;
     }
 
-    bool next(TupleTableSlot *slot)
+    bool next(TupleTableSlot *slot, bool fake=false)
     {
         bool    res;
 
@@ -1072,7 +1085,7 @@ public:
             reader = this->get_next_reader();
         }
 
-        res = reader->next(slot);
+        res = reader->next(slot, fake);
 
         /* Finished reading current reader? Proceed to the next one */
         if (unlikely(!res))
@@ -1085,7 +1098,7 @@ public:
                         delete reader;
 
                     reader = this->get_next_reader();
-                    res = reader->next(slot);
+                    res = reader->next(slot, fake);
                     if (res)
                         break;
                 }
@@ -1394,118 +1407,6 @@ parse_filenames_list(const char *str)
  *      row groups satisfy clauses. Store resulting row group list to
  *      fdw_private.
  */
-#if 0
-void
-extract_rowgroups_list(PlannerInfo *root, RelOptInfo *baserel)
-{
-    std::unique_ptr<parquet::arrow::FileReader> reader;
-    std::list<RowGroupFilter>       filters;
-    RangeTblEntry  *rte;
-    Relation        rel;
-    TupleDesc       tupleDesc;
-    auto            fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
-    char           *filename;
-    List *filenames;
-
-    filename = pstrdup(fdw_private->filename);
-    filenames = parse_filenames_list(filename);
-
-    /*
-     * Open relation to be able to access tuple descriptor
-     */
-    rte = root->simple_rte_array[baserel->relid];
-    rel = heap_open(rte->relid, AccessShareLock);
-    tupleDesc = RelationGetDescr(rel);
-
-    /* Analyze query clauses and extract ones that can be of interest to us*/
-    extract_rowgroup_filters(baserel->baserestrictinfo, filters);
-
-    /* Open parquet file to read meta information */
-    try
-    {
-        parquet::arrow::FileReader::Make(
-                arrow::default_memory_pool(),
-                parquet::ParquetFileReader::OpenFile((char *) linitial(filenames), false),
-                &reader
-        );
-
-    }
-    catch(const std::exception& e)
-    {
-        elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
-    }
-    auto meta = reader->parquet_reader()->metadata();
-    parquet::ArrowReaderProperties  props;
-    std::shared_ptr<arrow::Schema>  schema;
-    parquet::arrow::FromParquetSchema(meta->schema(), props, &schema);
-
-    /* Check each row group whether it matches the filters */
-    for (int r = 0; r < reader->num_row_groups(); r++)
-    {
-        bool match = true;
-        auto rowgroup = meta->RowGroup(r);
-
-        for (auto it = filters.begin(); it != filters.end(); it++)
-        {
-            RowGroupFilter &filter = *it;
-            AttrNumber      attnum;
-            const char     *attname;
-
-            attnum = filter.attnum - 1;
-            attname = NameStr(TupleDescAttr(tupleDesc, attnum)->attname);
-
-            /*
-             * Search for the column with the same name as filtered attribute
-             */
-            for (int k = 0; k < rowgroup->num_columns(); k++)
-            {
-                auto    column = rowgroup->ColumnChunk(k);
-                std::vector<std::string> path = column->path_in_schema()->ToDotVector();
-
-                if (strcmp(attname, path[0].c_str()) == 0)
-                {
-                    /* Found it! */
-                    std::shared_ptr<parquet::Statistics>  stats;
-                    std::shared_ptr<arrow::Field>       field;
-                    std::shared_ptr<arrow::DataType>    type;
-
-                    stats = column->statistics();
-
-                    /* Convert to arrow field to get appropriate type */
-                    field = schema->field(k);
-                    type = field->type();
-
-                    /*
-                     * If at least one filter doesn't match rowgroup exclude
-                     * the current row group and proceed with the next one.
-                     */
-                    if (stats &&
-                        !row_group_matches_filter(stats.get(), type.get(), &filter))
-                    {
-                        match = false;
-                        elog(DEBUG1, "parquet_fdw: skip rowgroup %d", r + 1);
-                    }
-                    break;
-                }
-            }  /* loop over columns */
-
-            if (!match)
-                break;
-
-        }  /* loop over filters */
-        
-        /* All the filters match this rowgroup */
-        if (match)
-        {
-            fdw_private->rowgroups = lappend_int(fdw_private->rowgroups, r);
-            fdw_private->ntuples += rowgroup->num_rows();
-        } 
-    }  /* loop over rowgroups */
-
-    heap_close(rel, AccessShareLock);
-}
-#endif
-
 List *
 extract_rowgroups_list(const char *filename,
                        TupleDesc tupleDesc,
@@ -2400,7 +2301,121 @@ parquetAcquireSampleRowsFunc(Relation relation, int elevel,
 }
 #endif
 
-#if 0
+static int
+parquetAcquireSampleRowsFunc(Relation relation, int elevel,
+                             HeapTuple *rows, int targrows,
+                             double *totalrows,
+                             double *totaldeadrows)
+{
+    ParquetFdwExecutionState   *festate;
+    ParquetFdwPlanState         fdw_private;
+    MemoryContext               reader_cxt;
+    TupleDesc       tupleDesc = RelationGetDescr(relation);
+    TupleTableSlot *slot;
+    std::set<int>   attrs_used;
+    int             cnt = 0;
+    uint64          num_rows = 0;
+    ListCell       *lc;
+
+    get_table_options(RelationGetRelid(relation), &fdw_private);
+
+    for (int i = 0; i < tupleDesc->natts; ++i)
+        attrs_used.insert(i + 1 - FirstLowInvalidHeapAttributeNumber);
+
+    reader_cxt = AllocSetContextCreate(CurrentMemoryContext,
+                                       "parquet_fdw tuple data",
+                                       ALLOCSET_DEFAULT_SIZES);
+    festate = new MultifileExecutionState(reader_cxt,
+                                          tupleDesc,
+                                          attrs_used,
+                                          fdw_private.use_threads,
+                                          false);
+
+    foreach (lc, fdw_private.filenames)
+    {
+        char *filename = strVal((Value *) lfirst(lc));
+
+        try
+        {
+            std::unique_ptr<parquet::arrow::FileReader> reader;
+            arrow::Status   status;
+            List           *rowgroups = NIL;
+
+            status = parquet::arrow::FileReader::Make(
+                        arrow::default_memory_pool(),
+                        parquet::ParquetFileReader::OpenFile(filename, false),
+                        &reader);
+            if (!status.ok())
+                throw Error("failed to open Parquet file: %s",
+                                     status.message().c_str());
+            auto meta = reader->parquet_reader()->metadata();
+            num_rows += meta->num_rows();
+
+            /* We need to scan all rowgroups */
+            for (int i = 0; i < meta->num_row_groups(); ++i)
+                rowgroups = lappend_int(rowgroups, i);
+            festate->add_file(filename, rowgroups);
+        }
+        catch(const std::exception &e)
+        {
+            elog(ERROR, "parquet_fdw: %s", e.what());
+        }
+    }
+
+    PG_TRY();
+    {
+        uint64  row = 0;
+        int     ratio = num_rows / targrows;
+
+        /* Set ratio to at least 1 to avoid devision by zero issue */
+        ratio = ratio < 1 ? 1 : ratio;
+
+
+#if PG_VERSION_NUM < 120000
+        slot = MakeSingleTupleTableSlot(tupleDesc);
+#else
+        slot = MakeSingleTupleTableSlot(tupleDesc, &TTSOpsHeapTuple);
+#endif
+
+        while (true)
+        {
+            CHECK_FOR_INTERRUPTS();
+
+            if (cnt >= targrows)
+                break;
+
+            bool fake = (row % ratio) != 0;
+            if (!festate->next(slot, fake))
+                break;
+
+            if (!fake)
+            {
+                rows[cnt++] = heap_form_tuple(tupleDesc,
+                                              slot->tts_values,
+                                              slot->tts_isnull);
+            }
+
+            row++;
+        }
+
+        *totalrows = num_rows;
+        *totaldeadrows = 0;
+
+        ExecDropSingleTupleTableSlot(slot);
+    }
+    PG_CATCH();
+    {
+        elog(LOG, "Cancelled");
+        delete festate;
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
+    delete festate;
+
+    return cnt - 1;
+}
+
 extern "C" bool
 parquetAnalyzeForeignTable(Relation relation,
                            AcquireSampleRowsFunc *func,
@@ -2409,7 +2424,6 @@ parquetAnalyzeForeignTable(Relation relation,
     *func = parquetAcquireSampleRowsFunc;
     return true;
 }
-#endif
 
 /*
  * parquetExplainForeignScan
