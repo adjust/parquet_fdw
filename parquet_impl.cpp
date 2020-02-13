@@ -116,7 +116,7 @@ struct RowGroupFilter
 struct ParquetFdwPlanState
 {
     List       *filenames;
-    Bitmapset  *attrs_sorted;
+    List       *attrs_sorted;
     Bitmapset  *attrs_used;     /* attributes actually used in query */
     bool        use_mmap;
     bool        use_threads;
@@ -383,6 +383,7 @@ public:
             }
         }
 
+        /* TODO: use c++ compatible allocator */
         this->has_nulls = (bool *) palloc(sizeof(bool) * this->map.size());
 
         this->allocator = new FastAllocator(cxt);
@@ -969,63 +970,14 @@ public:
 };
 #endif
 
-#if 0
-class MultifileMergeExecutionState : public ParquetFdwExecutionState
-{
-private:
-    std::vector<ParquetFdwReader *>   readers;
-
-public:
-    MemoryContext       estate_cxt;
-
-    MultifileExecutionState(const std::list<const char *> &filenames, bool use_mmap)
-    {
-        for (auto it: filenames)
-            readers.push_back(new ParquetFdwReader(it, use_mmap));
-    }
-
-    ~MultifileExecutionState()
-    {
-        for (auto it: readers)
-            if (*it)
-                delete *it;
-    }
-
-    void init(MemoryContext cxt,
-              TupleDesc tupleDesc,
-              std::set<int> &attrs_used,
-              bool use_threads)
-    {
-        for (auto it: readers)
-            it->init(cxt, tupleDesc, attrs_used, use_threads);
-    }
-
-    bool next(TupleTableSlot *slot)
-    {
-        /* TODO: implement */
-        return false;
-    }
-
-    void rescan(void)
-    {
-        reader->rescan();
-    }
-
-    void set_rowgroups_list(List *list)
-    {
-        reader->set_rowgroups_list(list);
-    }
-};
-#endif
-
 class MultifileExecutionState : public ParquetFdwExecutionState
 {
 private:
-        struct FileRowgroups
-        {
-            std::string         filename;
-            std::vector<int>    rowgroups;
-        };
+    struct FileRowgroups
+    {
+        std::string         filename;
+        std::vector<int>    rowgroups;
+    };
 private:
     ParquetFdwReader       *reader;
     std::list<FileRowgroups> files;
@@ -1058,8 +1010,6 @@ private:
     }
 
 public:
-    MemoryContext       estate_cxt;
-
     MultifileExecutionState(MemoryContext cxt,
                             TupleDesc tupleDesc,
                             std::set<int> attrs_used,
@@ -1067,7 +1017,7 @@ public:
                             bool use_mmap)
         : cxt(cxt), tupleDesc(tupleDesc), use_threads(use_threads),
           attrs_used(attrs_used), use_mmap(use_mmap), reader(NULL)
-    {}
+    { }
 
     ~MultifileExecutionState()
     {
@@ -1126,6 +1076,190 @@ public:
         foreach (lc, rowgroups)
             fr.rowgroups.push_back(lfirst_int(lc));
         files.push_back(fr);
+    }
+};
+
+class MultifileMergeExecutionState : public ParquetFdwExecutionState
+{
+    struct FileSlot
+    {
+        int             reader_id;
+        TupleTableSlot *slot;
+    };
+    typedef std::vector<FileSlot> BinHeap;
+private:
+    std::vector<ParquetFdwReader *>   readers;
+
+    MemoryContext       cxt;
+    TupleDesc           tupleDesc;
+    std::set<int>       attrs_used;
+    std::list<SortSupportData> sort_keys;
+    bool                use_threads;
+    bool                use_mmap;
+
+    /*
+     * Heap is used to store tuples in prioritized manner along with file
+     * number. Priority is given to the tuples with minimal key. Once next
+     * tuple is requested it is being taken from the top of the heap and a new
+     * tuple from the same file is read and inserted back into the heap. Then
+     * heap is rebuilt to sustain its properties. The idea is taken from
+     * nodeGatherMerge.c in PostgreSQL but reimplemented using STL.
+     */
+    BinHeap             slots;
+    bool                slots_initialized;
+
+private:
+    bool FileTupleCmp(FileSlot &a, FileSlot &b)
+    {
+        /* TODO */
+        return true;
+    }
+
+    /* 
+     * Compares two slots according to sort keys. Returns true if a > b,
+     * false otherwise. The function is stolen from nodeGatherMerge.c
+     * (postgres) and adapted.
+     */
+    bool compare_slots(FileSlot &a, FileSlot &b)
+    {
+        PG_TRY();
+        {
+            TupleTableSlot *s1 = a.slot;
+            TupleTableSlot *s2 = b.slot;
+            int			nkey;
+
+            Assert(!TupIsNull(s1));
+            Assert(!TupIsNull(s2));
+
+            for (auto sort_key: sort_keys)
+            {
+                AttrNumber  attno = sort_key.ssup_attno;
+                Datum       datum1,
+                            datum2;
+                bool        isNull1,
+                            isNull2;
+                int         compare;
+
+                datum1 = slot_getattr(s1, attno, &isNull1);
+                datum2 = slot_getattr(s2, attno, &isNull2);
+
+                compare = ApplySortComparator(datum1, isNull1,
+                                              datum2, isNull2,
+                                              &sort_key);
+                if (compare != 0)
+                    return (compare > 0);
+            }
+            return false;
+        }
+        PG_CATCH();
+        {
+            throw std::runtime_error("slots comparison failed");
+        }
+        PG_END_TRY();
+    }
+
+public:
+    MultifileMergeExecutionState(MemoryContext cxt,
+                                 TupleDesc tupleDesc,
+                                 std::set<int> attrs_used,
+                                 std::list<SortSupportData> sort_keys,
+                                 bool use_threads,
+                                 bool use_mmap)
+        : cxt(cxt), tupleDesc(tupleDesc), use_threads(use_threads),
+          attrs_used(attrs_used), sort_keys(sort_keys), use_mmap(use_mmap)
+    { }
+
+    ~MultifileMergeExecutionState()
+    {
+        for (auto it: readers)
+            delete it;
+    }
+
+    bool next(TupleTableSlot *slot, bool fake=false)
+    {
+        auto cmp = [this] (FileSlot &a, FileSlot &b) { return compare_slots(a, b); };
+        if (unlikely(!slots_initialized))
+        {
+            /* Initialize binary heap on the first run */
+            int i = 0;
+
+            for (auto reader: readers)
+            {
+                FileSlot    fs;
+
+                /* TODO: use c++ compatiple palloc */
+                PG_TRY();
+                {
+                    MemoryContext oldcxt;
+
+                    oldcxt = MemoryContextSwitchTo(cxt);
+                    fs.slot = MakeTupleTableSlot(tupleDesc, &TTSOpsVirtual);
+                    MemoryContextSwitchTo(oldcxt);
+                }
+                PG_CATCH();
+                {
+                    throw std::runtime_error("failed to create a TupleTableSlot");
+                }
+                PG_END_TRY();
+                if (reader->next(fs.slot))
+                {
+                    ExecStoreVirtualTuple(fs.slot);
+                    fs.reader_id = i;
+                    slots.push_back(fs);
+                }
+                else
+                {
+                    /* TODO: remove from readers */
+                }
+                ++i;
+            }
+            std::make_heap(slots.begin(), slots.end(), cmp);
+            slots_initialized = true;
+        }
+
+        if (unlikely(slots.empty()))
+            return false;
+
+        const FileSlot &fs = slots.front();
+        ExecCopySlot(slot, fs.slot);
+        ExecClearTuple(fs.slot);
+
+        if (readers[slots[0].reader_id]->next(slots[0].slot))
+        {
+            ExecStoreVirtualTuple(slots[0].slot);
+        }
+        else
+        {
+            /* TODO: remove from readers */
+            std::pop_heap(slots.begin(), slots.end(), cmp);
+            slots.pop_back();
+        }
+        std::make_heap(slots.begin(), slots.end(), cmp);
+        return true;
+    }
+
+    void rescan(void)
+    {
+        /* TODO: clean binheap */
+        for (auto reader: readers)
+            reader->rescan();
+        slots.clear();
+        slots_initialized = false;
+    }
+
+    void add_file(const char *filename, List *rowgroups)
+    {
+        ParquetFdwReader *r;
+        ListCell         *lc;
+        std::vector<int>    rg;
+
+        foreach (lc, rowgroups)
+            rg.push_back(lfirst_int(lc));
+
+        r = new ParquetFdwReader();
+        r->open(filename, cxt, tupleDesc, attrs_used, use_threads, use_mmap);
+        r->set_rowgroups_list(rg);
+        readers.push_back(r);
     }
 };
 
@@ -1659,10 +1793,10 @@ destroy_parquet_state(void *arg)
  * C interface functions
  */
 
-static Bitmapset *
+static List *
 parse_attributes_list(char *start, Oid relid)
 {
-    Bitmapset *attrs = NULL;
+    List      *attrs = NIL;
     char      *token;
     const char *delim = std::string(" ").c_str(); /* to satisfy g++ compiler */
     AttrNumber attnum;
@@ -1671,7 +1805,7 @@ parse_attributes_list(char *start, Oid relid)
     {
         if ((attnum = get_attnum(relid, token)) == InvalidAttrNumber)
             elog(ERROR, "paruqet_fdw: invalid attribute name '%s'", token);
-        attrs = bms_add_member(attrs, attnum);
+        attrs = lappend_int(attrs, attnum);
         start = NULL;
     }
 
@@ -1830,8 +1964,8 @@ extract_used_attributes(RelOptInfo *baserel)
 
 extern "C" void
 parquetGetForeignPaths(PlannerInfo *root,
-					RelOptInfo *baserel,
-					Oid foreigntableid)
+                       RelOptInfo *baserel,
+                       Oid foreigntableid)
 {
 	ParquetFdwPlanState *fdw_private;
 	Cost		startup_cost;
@@ -1874,10 +2008,10 @@ parquetGetForeignPaths(PlannerInfo *root,
     extract_used_attributes(baserel);
 
     /* Build pathkeys based on attrs_sorted */
-    int attnum = -1;
-    while ((attnum = bms_next_member(fdw_private->attrs_sorted, attnum)) >= 0)
+    foreach (lc, fdw_private->attrs_sorted)
     {
         Oid         relid = root->simple_rte_array[baserel->relid]->relid;
+        int         attnum = lfirst_int(lc);
         Oid         typid,
                     collid;
         int32       typmod;
@@ -1953,8 +2087,10 @@ parquetGetForeignPlan(PlannerInfo *root,
     ParquetFdwPlanState *fdw_private = (ParquetFdwPlanState *) best_path->fdw_private;
 	Index		scan_relid = baserel->relid;
     List       *attrs_used = NIL;
+    List       *attrs_sorted = NIL;
     AttrNumber  attr;
-    List       *params;
+    List       *params = NIL;
+    ListCell   *lc;
 
 	/*
 	 * We have no native ability to evaluate restriction clauses, so we just
@@ -1975,11 +2111,17 @@ parquetGetForeignPlan(PlannerInfo *root,
     while ((attr = bms_next_member(fdw_private->attrs_used, attr)) >= 0)
         attrs_used = lappend_int(attrs_used, attr);
 
-    params = list_make5(fdw_private->filenames,
-                        attrs_used,
-                        makeInteger(fdw_private->use_mmap),
-                        makeInteger(fdw_private->use_threads),
-                        fdw_private->rowgroups);
+    /* TODO: make sure that attrs_sorted is subset of attrs_used */
+    foreach (lc, fdw_private->attrs_sorted)
+        attrs_sorted = lappend_int(attrs_sorted, lfirst_int(lc));
+
+    /* Packing all the data needed by executor into the list */
+    params = lappend(params, fdw_private->filenames);
+    params = lappend(params, attrs_used);
+    params = lappend(params, attrs_sorted);
+    params = lappend(params, makeInteger(fdw_private->use_mmap));
+    params = lappend(params, makeInteger(fdw_private->use_threads));
+    params = lappend(params, fdw_private->rowgroups);
 
 	/* Create the ForeignScan node */
 	return make_foreignscan(tlist,
@@ -2001,25 +2143,46 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
 	ForeignScan    *plan = (ForeignScan *) node->ss.ps.plan;
 	EState         *estate = node->ss.ps.state;
     List           *fdw_private = plan->fdw_private;
-    List           *attrs_used_list;
+    List           *attrs_list;
     List           *rowgroups_list;
     ListCell       *lc, *lc2;
     List           *filenames;
     std::set<int>   attrs_used;
+    std::list<int>  attrs_sorted;
     bool            use_mmap;
     bool            use_threads;
+    int             i = 0;
 
     /* Unwrap fdw_private */
-    filenames = (List *) linitial(fdw_private);
-
-    attrs_used_list = (List *) lsecond(fdw_private);
-    foreach (lc, attrs_used_list)
-        attrs_used.insert(lfirst_int(lc));
-
-    use_mmap = (bool) intVal((Value *) lthird(fdw_private));
-    use_threads = (bool) intVal((Value *) lfourth(fdw_private));
-
-    rowgroups_list = (List *) llast(fdw_private);
+    foreach (lc, fdw_private)
+    {
+        switch(i)
+        {
+            case 0:
+                filenames = (List *) lfirst(lc);
+                break;
+            case 1:
+                attrs_list = (List *) lfirst(lc);
+                foreach (lc2, attrs_list)
+                    attrs_used.insert(lfirst_int(lc2));
+                break;
+            case 2:
+                attrs_list = (List *) lfirst(lc);
+                foreach (lc2, attrs_list)
+                    attrs_sorted.push_back(lfirst_int(lc2));
+                break;
+            case 3:
+                use_mmap = (bool) intVal((Value *) lfirst(lc));
+                break;
+            case 4:
+                use_threads = (bool) intVal((Value *) lfirst(lc));
+                break;
+            case 5:
+                rowgroups_list = (List *) lfirst(lc);
+                break;
+        }
+        ++i;
+    }
 
     MemoryContext cxt = estate->es_query_cxt;
     TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
@@ -2029,16 +2192,58 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
                                        "parquet_fdw tuple data",
                                        ALLOCSET_DEFAULT_SIZES);
 
-    festate = new MultifileExecutionState(reader_cxt,
-                                          tupleDesc, attrs_used,
-                                          use_threads, use_mmap);
-    forboth (lc, filenames, lc2, rowgroups_list)
+    std::list<SortSupportData> sort_keys;
+    for (auto attr: attrs_sorted)
     {
-        /* TODO: should be Value, not char* */
-        char *filename = strVal((Value *) lfirst(lc));
-        List *rowgroups = (List *) lfirst(lc2);
+        SortSupportData sort_key;
+        Oid     typid;
+        int     typmod;
+        Oid     collid;
+        Oid     relid = RelationGetRelid(node->ss.ss_currentRelation);
+        Oid     sort_op;
 
-        festate->add_file(filename, rowgroups);
+        memset(&sort_key, 0, sizeof(SortSupportData));
+
+        get_atttypetypmodcoll(relid, attr, &typid, &typmod, &collid);
+
+        sort_key.ssup_cxt = reader_cxt;
+        sort_key.ssup_collation = collid;
+        sort_key.ssup_nulls_first = true;
+        sort_key.ssup_attno = attr;
+        sort_key.abbreviate = false;
+
+        get_sort_group_operators(typid,
+                                 true, false, false,
+                                 &sort_op, NULL, NULL,
+                                 NULL);
+
+        PrepareSortSupportFromOrderingOp(sort_op, &sort_key);
+
+        sort_keys.push_back(sort_key);
+    }
+
+    try
+    {
+        /*
+        festate = new MultifileExecutionState(reader_cxt,
+                                              tupleDesc, attrs_used,
+                                              use_threads, use_mmap);
+         */
+        festate = new MultifileMergeExecutionState(reader_cxt, tupleDesc,
+                                                   attrs_used, sort_keys, 
+                                                   use_threads, use_mmap);
+
+        forboth (lc, filenames, lc2, rowgroups_list)
+        {
+            char *filename = strVal((Value *) lfirst(lc));
+            List *rowgroups = (List *) lfirst(lc2);
+
+            festate->add_file(filename, rowgroups);
+        }
+    }
+    catch(std::exception &e)
+    {
+        elog(ERROR, "parquet_fdw: %s", e.what());
     }
 
     /*
@@ -2152,9 +2357,11 @@ parquetIterateForeignScan(ForeignScanState *node)
 
     festate->populate_slot(slot);
     festate->row++;
-#endif
+
     if (festate->next(slot))
         ExecStoreVirtualTuple(slot);
+#endif
+    festate->next(slot);
 
     return slot;
 }
