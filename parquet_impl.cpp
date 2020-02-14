@@ -1166,7 +1166,8 @@ public:
                                  bool use_threads,
                                  bool use_mmap)
         : cxt(cxt), tupleDesc(tupleDesc), use_threads(use_threads),
-          attrs_used(attrs_used), sort_keys(sort_keys), use_mmap(use_mmap)
+          attrs_used(attrs_used), sort_keys(sort_keys), use_mmap(use_mmap),
+          slots_initialized(false)
     { }
 
     ~MultifileMergeExecutionState()
@@ -1187,7 +1188,6 @@ public:
             {
                 FileSlot    fs;
 
-                /* TODO: use c++ compatiple palloc */
                 PG_TRY();
                 {
                     MemoryContext oldcxt;
