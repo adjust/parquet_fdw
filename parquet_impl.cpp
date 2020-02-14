@@ -224,6 +224,11 @@ public:
             elog(DEBUG1, "parquet_fdw: garbage segments recycled");
         }
     }
+
+    MemoryContext context()
+    {
+        return segments_cxt;
+    }
 };
 
 static char *
@@ -730,6 +735,7 @@ public:
     nested_list_get_datum(arrow::Array *array, int type_id,
                           Oid elem_type, FmgrInfo *castfunc)
     {
+        MemoryContext oldcxt;
         ArrayType  *res;
         Datum      *values;
         bool       *nulls = NULL;
@@ -778,8 +784,10 @@ public:
         /* Construct one dimensional array */
         dims[0] = array->length();
         lbs[0] = 1;
+        oldcxt = MemoryContextSwitchTo(allocator->context());
         res = construct_md_array(values, nulls, 1, dims, lbs,
                                  elem_type, elem_len, elem_byval, elem_align);
+        MemoryContextSwitchTo(oldcxt);
 
         return PointerGetDatum(res);
     }
