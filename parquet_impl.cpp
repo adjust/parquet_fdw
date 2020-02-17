@@ -1201,7 +1201,11 @@ public:
                     MemoryContext oldcxt;
 
                     oldcxt = MemoryContextSwitchTo(cxt);
+#if PG_VERSION_NUM < 120000
+                    fs.slot = MakeTupleTableSlot(tupleDesc);
+#else
                     fs.slot = MakeTupleTableSlot(tupleDesc, &TTSOpsVirtual);
+#endif
                     MemoryContextSwitchTo(oldcxt);
                 }
                 PG_CATCH();
