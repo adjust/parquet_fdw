@@ -926,7 +926,6 @@ public:
     virtual void add_file(const char *filename, List *rowgroups) = 0;
 };
 
-#if 0
 class SingleFileExecutionState : public ParquetFdwExecutionState
 {
 private:
@@ -934,21 +933,20 @@ private:
     MemoryContext       cxt;
     TupleDesc           tupleDesc;
     std::set<int>       attrs_used;
+    bool                use_mmap;
     bool                use_threads;
 
 public:
     MemoryContext       estate_cxt;
 
-    SingleFileExecutionState(const char *filename,
-                             MemoryContext cxt,
+    SingleFileExecutionState(MemoryContext cxt,
                              TupleDesc tupleDesc,
+                             std::set<int> attrs_used,
                              bool use_threads,
                              bool use_mmap)
         : cxt(cxt), tupleDesc(tupleDesc), use_threads(use_threads),
-          attrs_used(attrs_used)
-    {
-        reader = new ParquetFdwReader(filename, use_mmap);
-    }
+          use_mmap(use_mmap), attrs_used(attrs_used)
+    { }
 
     ~SingleFileExecutionState()
     {
@@ -956,14 +954,14 @@ public:
             delete reader;
     }
 
-    void init()
+    bool next(TupleTableSlot *slot, bool fake)
     {
-        reader->init(cxt, tupleDesc, attrs_used, use_threads);
-    }
+        bool res;
 
-    bool next(TupleTableSlot *slot)
-    {
-        return reader->next(slot);
+        if ((res = reader->next(slot, fake)) == true)
+            ExecStoreVirtualTuple(slot);
+
+        return res;
     }
 
     void rescan(void)
@@ -971,12 +969,19 @@ public:
         reader->rescan();
     }
 
-    void set_rowgroups_list(List *list)
+    void add_file(const char *filename, List *rowgroups)
     {
-        reader->set_rowgroups_list(list);
+        ListCell           *lc;
+        std::vector<int>    rg;
+
+        foreach (lc, rowgroups)
+            rg.push_back(lfirst_int(lc));
+
+        reader = new ParquetFdwReader();
+        reader->open(filename, cxt, tupleDesc, attrs_used, use_threads, use_mmap);
+        reader->set_rowgroups_list(rg);
     }
 };
-#endif
 
 class MultifileExecutionState : public ParquetFdwExecutionState
 {
@@ -1066,6 +1071,9 @@ public:
                 elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
             }
         }
+
+        if (res)
+            ExecStoreVirtualTuple(slot);
 
         return res;
     }
@@ -2160,7 +2168,7 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
     ListCell       *lc, *lc2;
     List           *filenames;
     std::set<int>   attrs_used;
-    std::list<int>  attrs_sorted;
+    List           *attrs_sorted;
     bool            use_mmap;
     bool            use_threads;
     int             i = 0;
@@ -2179,9 +2187,7 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
                     attrs_used.insert(lfirst_int(lc2));
                 break;
             case 2:
-                attrs_list = (List *) lfirst(lc);
-                foreach (lc2, attrs_list)
-                    attrs_sorted.push_back(lfirst_int(lc2));
+                attrs_sorted = (List *) lfirst(lc);
                 break;
             case 3:
                 use_mmap = (bool) intVal((Value *) lfirst(lc));
@@ -2205,9 +2211,10 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
                                        ALLOCSET_DEFAULT_SIZES);
 
     std::list<SortSupportData> sort_keys;
-    for (auto attr: attrs_sorted)
+    foreach (lc, attrs_sorted)
     {
         SortSupportData sort_key;
+        int     attr = lfirst_int(lc);
         Oid     typid;
         int     typmod;
         Oid     collid;
@@ -2236,14 +2243,27 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
 
     try
     {
-        /*
-        festate = new MultifileExecutionState(reader_cxt,
-                                              tupleDesc, attrs_used,
-                                              use_threads, use_mmap);
-         */
-        festate = new MultifileMergeExecutionState(reader_cxt, tupleDesc,
-                                                   attrs_used, sort_keys, 
-                                                   use_threads, use_mmap);
+        if (list_length(filenames) > 1)
+        {
+            if (list_length(attrs_sorted) > 0)
+            {
+                festate = new MultifileMergeExecutionState(reader_cxt, tupleDesc,
+                                                           attrs_used, sort_keys, 
+                                                           use_threads, use_mmap);
+            }
+            else
+            {
+                festate = new MultifileExecutionState(reader_cxt, tupleDesc,
+                                                      attrs_used, use_threads,
+                                                      use_mmap);
+            }
+        }
+        else
+        {
+            festate = new SingleFileExecutionState(reader_cxt, tupleDesc,
+                                                   attrs_used, use_threads,
+                                                   use_mmap);
+        }
 
         forboth (lc, filenames, lc2, rowgroups_list)
         {
@@ -2656,12 +2676,26 @@ parquetExplainForeignScan(ForeignScanState *node, ExplainState *es)
     StringInfoData str;
     List       *filenames;
     List       *rowgroups_list;
+    List       *attrs_sorted;
 
     initStringInfo(&str);
 
 	fdw_private = ((ForeignScan *) node->ss.ps.plan)->fdw_private;
     filenames = (List *) linitial(fdw_private);
+    attrs_sorted = (List *) lthird(fdw_private);
     rowgroups_list = (List *) llast(fdw_private);
+
+    if (list_length(filenames) == 1)
+    {
+        ExplainPropertyText("Reader", "single file", es);
+    }
+    else
+    {
+        if (list_length(attrs_sorted) > 0)
+            ExplainPropertyText("Reader", "multifile merge", es);
+        else
+            ExplainPropertyText("Reader", "multifile", es);
+    }
 
     forboth(lc, filenames, lc2, rowgroups_list)
     {
@@ -2669,11 +2703,16 @@ parquetExplainForeignScan(ForeignScanState *node, ExplainState *es)
         List   *rowgroups = (List *) lfirst(lc2);
         bool    is_first = true;
 
+        /* Only print filename if there're more than one file */
+        if (list_length(filenames) > 1)
+        {
 #ifdef _GNU_SOURCE
         appendStringInfo(&str, "\n%s: ", basename(filename));
 #else
         appendStringInfo(&str, "\n%s: ", basename(pstrdup(filename)));
 #endif
+        }
+
         foreach(lc3, rowgroups)
         {
             /*

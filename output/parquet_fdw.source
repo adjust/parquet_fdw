@@ -50,8 +50,8 @@ EXPLAIN (COSTS OFF) SELECT * FROM example ORDER BY one;
        QUERY PLAN        
 -------------------------
  Foreign Scan on example
-   Row groups: 
- example.parquet: 1, 2
+   Reader: single file
+   Row groups: 1, 2
 (3 rows)
 
 EXPLAIN (COSTS OFF) SELECT * FROM example ORDER BY three;
@@ -60,8 +60,8 @@ EXPLAIN (COSTS OFF) SELECT * FROM example ORDER BY three;
  Sort
    Sort Key: three
    ->  Foreign Scan on example
-         Row groups: 
- example.parquet: 1, 2
+         Reader: single file
+         Row groups: 1, 2
 (5 rows)
 
 -- filtering
