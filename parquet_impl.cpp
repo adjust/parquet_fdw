@@ -2687,14 +2687,14 @@ parquetExplainForeignScan(ForeignScanState *node, ExplainState *es)
 
     if (list_length(filenames) == 1)
     {
-        ExplainPropertyText("Reader", "single file", es);
+        ExplainPropertyText("Reader", "Single File", es);
     }
     else
     {
         if (list_length(attrs_sorted) > 0)
-            ExplainPropertyText("Reader", "multifile merge", es);
+            ExplainPropertyText("Reader", "Multifile Merge", es);
         else
-            ExplainPropertyText("Reader", "multifile", es);
+            ExplainPropertyText("Reader", "Multifile", es);
     }
 
     forboth(lc, filenames, lc2, rowgroups_list)

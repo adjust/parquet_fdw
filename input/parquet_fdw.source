@@ -10,7 +10,7 @@ CREATE USER MAPPING FOR regress_parquet_fdw SERVER parquet_srv;
 
 SET ROLE regress_parquet_fdw;
 
-CREATE FOREIGN TABLE example (
+CREATE FOREIGN TABLE example1 (
     one     INT8,
     two     INT8[],
     three   TEXT,
@@ -18,48 +18,75 @@ CREATE FOREIGN TABLE example (
     five    DATE,
     six     BOOL)
 SERVER parquet_srv
-OPTIONS (filename '@abs_srcdir@/data/example.parquet', sorted 'one');
+OPTIONS (filename '@abs_srcdir@/data/example1.parquet', sorted 'one');
 
-SELECT * FROM example;
+SELECT * FROM example1;
 
 -- no explicit columns mentions
-SELECT 1 as x FROM example;
-SELECT count(*) as count FROM example;
+SELECT 1 as x FROM example1;
+SELECT count(*) as count FROM example1;
 
 -- sorting
-EXPLAIN (COSTS OFF) SELECT * FROM example ORDER BY one;
-EXPLAIN (COSTS OFF) SELECT * FROM example ORDER BY three;
+EXPLAIN (COSTS OFF) SELECT * FROM example1 ORDER BY one;
+EXPLAIN (COSTS OFF) SELECT * FROM example1 ORDER BY three;
 
 -- filtering
 SET client_min_messages = DEBUG1;
-SELECT * FROM example WHERE one < 1;
-SELECT * FROM example WHERE one <= 1;
-SELECT * FROM example WHERE one > 6;
-SELECT * FROM example WHERE one >= 6;
-SELECT * FROM example WHERE one = 2;
-SELECT * FROM example WHERE one = 7;
-SELECT * FROM example WHERE six = true;
-SELECT * FROM example WHERE six = false;
+SELECT * FROM example1 WHERE one < 1;
+SELECT * FROM example1 WHERE one <= 1;
+SELECT * FROM example1 WHERE one > 6;
+SELECT * FROM example1 WHERE one >= 6;
+SELECT * FROM example1 WHERE one = 2;
+SELECT * FROM example1 WHERE one = 7;
+SELECT * FROM example1 WHERE six = true;
+SELECT * FROM example1 WHERE six = false;
 
 -- prepared statements
-prepare prep(date) as select * from example where five < $1;
+prepare prep(date) as select * from example1 where five < $1;
 execute prep('2018-01-03');
 execute prep('2018-01-01');
 
 -- invalid options
 SET client_min_messages = WARNING;
-CREATE FOREIGN TABLE example2 (one INT8, two INT8[], three TEXT)
+CREATE FOREIGN TABLE example_fail (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv;
-CREATE FOREIGN TABLE example2 (one INT8, two INT8[], three TEXT)
+CREATE FOREIGN TABLE example_fail (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv
 OPTIONS (filename 'nonexistent.parquet', some_option '123');
-CREATE FOREIGN TABLE example2 (one INT8, two INT8[], three TEXT)
+CREATE FOREIGN TABLE example_fail (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv
-OPTIONS (filename '@abs_srcdir@/data/example.parquet', some_option '123');
+OPTIONS (filename '@abs_srcdir@/data/example1.parquet', some_option '123');
 
 -- type mismatch
-CREATE FOREIGN TABLE example2 (one INT8[], two INT8, three TEXT)
+CREATE FOREIGN TABLE example_fail (one INT8[], two INT8, three TEXT)
 SERVER parquet_srv
-OPTIONS (filename '@abs_srcdir@/data/example.parquet', sorted 'one');
-SELECT one FROM example2;
-SELECT two FROM example2;
+OPTIONS (filename '@abs_srcdir@/data/example1.parquet', sorted 'one');
+SELECT one FROM example_fail;
+SELECT two FROM example_fail;
+
+-- sequential multifile reader
+CREATE FOREIGN TABLE example_seq (
+    one     INT8,
+    two     INT8[],
+    three   TEXT,
+    four    TIMESTAMP,
+    five    DATE,
+    six     BOOL)
+SERVER parquet_srv
+OPTIONS (filename '@abs_srcdir@/data/example1.parquet @abs_srcdir@/data/example2.parquet');
+EXPLAIN SELECT * FROM example_seq;
+SELECT * FROM example_seq;
+
+-- multifile merge reader
+CREATE FOREIGN TABLE example_merge (
+    one     INT8,
+    two     INT8[],
+    three   TEXT,
+    four    TIMESTAMP,
+    five    DATE,
+    six     BOOL)
+SERVER parquet_srv
+OPTIONS (filename '@abs_srcdir@/data/example1.parquet @abs_srcdir@/data/example2.parquet', sorted 'one');
+EXPLAIN SELECT * FROM example_merge;
+SELECT * FROM example_merge;
+

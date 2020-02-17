@@ -33,7 +33,26 @@ df2 = pd.DataFrame({'one': [4, 5, 6],
                     'six': [False, False, False]})
 table2 = pa.Table.from_pandas(df2)
 
-with pq.ParquetWriter('example.parquet', table1.schema) as writer:
+with pq.ParquetWriter('example1.parquet', table1.schema) as writer:
     writer.write_table(table1)
     writer.write_table(table2)
 
+# example2.parquet file
+df3 = pd.DataFrame({'one': [1, 3, 5, 7, 9],
+                    'two': [[19, 20], [21, 22], [23, 24], [25, 26], [27, 28]],
+                    'three': ['eins', 'zwei', 'drei', 'vier', 'fünf'],
+                    'four': [datetime(2018, 1, 1),
+                             datetime(2018, 1, 3),
+                             datetime(2018, 1, 5),
+                             datetime(2018, 1, 7),
+                             datetime(2018, 1, 9)],
+                    'five': [date(2018, 1, 1),
+                             date(2018, 1, 3),
+                             date(2018, 1, 5),
+                             date(2018, 1, 7),
+                             date(2018, 1, 9)],
+                    'six': [True, False, True, False, True]})
+table3 = pa.Table.from_pandas(df3)
+
+with pq.ParquetWriter('example2.parquet', table3.schema) as writer:
+    writer.write_table(table3)
