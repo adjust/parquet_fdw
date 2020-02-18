@@ -1188,6 +1188,12 @@ public:
 
     ~MultifileMergeExecutionState()
     {
+#if PG_VERSION_NUM < 110000
+        /* Destroy tuple slots if any */
+        for (auto it: slots)
+            ExecDropSingleTupleTableSlot(it.slot);
+#endif
+
         for (auto it: readers)
             delete it;
     }
@@ -1209,7 +1215,9 @@ public:
                     MemoryContext oldcxt;
 
                     oldcxt = MemoryContextSwitchTo(cxt);
-#if PG_VERSION_NUM < 120000
+#if PG_VERSION_NUM < 110000
+                    fs.slot = MakeSingleTupleTableSlot(tupleDesc);
+#elif PG_VERSION_NUM < 120000
                     fs.slot = MakeTupleTableSlot(tupleDesc);
 #else
                     fs.slot = MakeTupleTableSlot(tupleDesc, &TTSOpsVirtual);
@@ -1244,12 +1252,15 @@ public:
         ExecCopySlot(slot, fs.slot);
         ExecClearTuple(fs.slot);
 
-        if (readers[slots[0].reader_id]->next(slots[0].slot))
+        if (readers[fs.reader_id]->next(fs.slot))
         {
-            ExecStoreVirtualTuple(slots[0].slot);
+            ExecStoreVirtualTuple(fs.slot);
         }
         else
         {
+#if PG_VERSION_NUM < 110000
+            ExecDropSingleTupleTableSlot(fs.slot);
+#endif
             /* TODO: remove from readers */
             std::pop_heap(slots.begin(), slots.end(), cmp);
             slots.pop_back();

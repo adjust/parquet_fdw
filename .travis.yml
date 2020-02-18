@@ -3,11 +3,13 @@ language: c
 
 matrix:
     include:
-      - env: postgres-10
+      - env: postgres=10
         addons:
             postgresql: 10
             apt:
                 packages:
+                  - postgresql-10
+                  - postgresql-client-10
                   - postgresql-server-dev-10
         install:
           - sudo make install
