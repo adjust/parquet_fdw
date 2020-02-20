@@ -101,10 +101,10 @@ parquet_fdw_handler(PG_FUNCTION_ARGS)
     fdwroutine->AnalyzeForeignTable = parquetAnalyzeForeignTable;
     fdwroutine->ExplainForeignScan = parquetExplainForeignScan;
     fdwroutine->IsForeignScanParallelSafe = parquetIsForeignScanParallelSafe;
-    // fdwroutine->EstimateDSMForeignScan = parquetEstimateDSMForeignScan;
-    // fdwroutine->InitializeDSMForeignScan = parquetInitializeDSMForeignScan;
-    // fdwroutine->ReInitializeDSMForeignScan = parquetReInitializeDSMForeignScan;
-    // fdwroutine->InitializeWorkerForeignScan = parquetInitializeWorkerForeignScan;
+    fdwroutine->EstimateDSMForeignScan = parquetEstimateDSMForeignScan;
+    fdwroutine->InitializeDSMForeignScan = parquetInitializeDSMForeignScan;
+    fdwroutine->ReInitializeDSMForeignScan = parquetReInitializeDSMForeignScan;
+    fdwroutine->InitializeWorkerForeignScan = parquetInitializeWorkerForeignScan;
     fdwroutine->ShutdownForeignScan = parquetShutdownForeignScan;
     fdwroutine->ImportForeignSchema = parquetImportForeignSchema;
 

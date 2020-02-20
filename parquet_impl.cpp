@@ -5,6 +5,7 @@
 
 #include <list>
 #include <set>
+#include <mutex>
 
 #include "arrow/api.h"
 #include "arrow/io/api.h"
@@ -133,7 +134,9 @@ struct ChunkInfo
 
 struct ParallelCoordinator
 {
-    pg_atomic_uint32 next_rowgroup; 
+    std::mutex          lock;
+    std::atomic<int32>  next_reader;
+    std::atomic<int32>  next_rowgroup;
 };
 
 
@@ -406,7 +409,7 @@ public:
          * threaded execution.
          */
         if (coord)
-            this->row_group = pg_atomic_fetch_add_u32(&coord->next_rowgroup, 1);
+            this->row_group = coord->next_rowgroup.fetch_add(1);
         else
             this->row_group++;
 
@@ -924,6 +927,7 @@ public:
     virtual bool next(TupleTableSlot *slot, bool fake=false) = 0;
     virtual void rescan(void) = 0;
     virtual void add_file(const char *filename, List *rowgroups) = 0;
+    virtual void set_coordinator(ParallelCoordinator *coord) = 0;
 };
 
 class SingleFileExecutionState : public ParquetFdwExecutionState
@@ -935,6 +939,7 @@ private:
     std::set<int>       attrs_used;
     bool                use_mmap;
     bool                use_threads;
+    ParallelCoordinator *coord;
 
 public:
     MemoryContext       estate_cxt;
@@ -980,6 +985,12 @@ public:
         reader = new ParquetFdwReader();
         reader->open(filename, cxt, tupleDesc, attrs_used, use_threads, use_mmap);
         reader->set_rowgroups_list(rg);
+    }
+
+    void set_coordinator(ParallelCoordinator *coord)
+    {
+        if (reader)
+            reader->coordinator = coord;
     }
 };
 
@@ -1092,6 +1103,11 @@ public:
         foreach (lc, rowgroups)
             fr.rowgroups.push_back(lfirst_int(lc));
         files.push_back(fr);
+    }
+
+    void set_coordinator(ParallelCoordinator *coord)
+    {
+        /* TODO */
     }
 };
 
@@ -1291,6 +1307,11 @@ public:
         r->open(filename, cxt, tupleDesc, attrs_used, use_threads, use_mmap);
         r->set_rowgroups_list(rg);
         readers.push_back(r);
+    }
+
+    void set_coordinator(ParallelCoordinator *coord)
+    {
+        Assert(true);   /* not supported, should never happen */
     }
 };
 
@@ -2367,43 +2388,6 @@ parquetIterateForeignScan(ForeignScanState *node)
 	TupleTableSlot             *slot = node->ss.ss_ScanTupleSlot;
 
 	ExecClearTuple(slot);
-
-#if 0
-    /* recycle old segments if any */
-    if (!festate->garbage_segments.empty())
-    {
-        for (auto it : festate->garbage_segments)
-            pfree(it);
-        festate->garbage_segments.clear();
-        elog(DEBUG1, "parquet_fdw: garbage segments recycled");
-    }
-
-    if (festate->row >= festate->num_rows)
-    {
-        /* Read next row group */
-        try
-        {
-            if (!read_next_rowgroup(festate, slot->tts_tupleDescriptor))
-                return slot;
-        }
-        catch(const std::exception& e)
-        {
-            elog(ERROR,
-                 "parquet_fdw: failed to read row group %d: %s",
-                 festate->row_group, e.what());
-        }
-
-        /* Lookup cast funcs */
-        if (!festate->initialized)
-            festate->initialize_castfuncs(slot->tts_tupleDescriptor);
-    }
-
-    festate->populate_slot(slot);
-    festate->row++;
-
-    if (festate->next(slot))
-        ExecStoreVirtualTuple(slot);
-#endif
     festate->next(slot);
 
     return slot;
@@ -2425,131 +2409,6 @@ parquetReScanForeignScan(ForeignScanState *node)
 
     festate->rescan();
 }
-
-#if 0
-static int
-parquetAcquireSampleRowsFunc(Relation relation, int elevel,
-                             HeapTuple *rows, int targrows,
-                             double *totalrows,
-                             double *totaldeadrows)
-{
-    ParquetFdwExecutionState   *festate;
-    ParquetFdwPlanState         fdw_private;
-    MemoryContext               reader_cxt;
-    TupleDesc       tupleDesc = RelationGetDescr(relation);
-    TupleTableSlot *slot;
-    std::set<int>   attrs_used;
-    int cnt = 0;
-
-    get_table_options(RelationGetRelid(relation), &fdw_private);
-
-    for (int i = 0; i < tupleDesc->natts; ++i)
-        attrs_used.insert(i + 1 - FirstLowInvalidHeapAttributeNumber);
-
-    reader_cxt = AllocSetContextCreate(CurrentMemoryContext,
-                                       "parquet_fdw tuple data",
-                                       ALLOCSET_DEFAULT_SIZES);
-
-
-    /* Open parquet file and build execution state */
-    try
-    {
-        festate = new ParquetFdwExecutionState(fdw_private.filename, false);
-        festate->init(reader_cxt,
-                      tupleDesc,
-                      attrs_used,
-                      fdw_private.use_threads);
-        festate->autodestroy = false;
-    }
-    catch(const std::exception& e)
-    {
-        elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
-    }
-
-    PG_TRY();
-    {
-        auto meta = festate->reader->parquet_reader()->metadata();
-        int ratio = meta->num_rows() / targrows;
-
-        /* Set ratio to at least 1 to avoid devision by zero issue */
-        ratio = ratio < 1 ? 1 : ratio;
-
-        /* We need to scan all rowgroups */
-        for (int i = 0; i < meta->num_row_groups(); ++i)
-            festate->rowgroups.push_back(i);
-
-#if PG_VERSION_NUM < 120000
-        slot = MakeSingleTupleTableSlot(tupleDesc);
-#else
-        slot = MakeSingleTupleTableSlot(tupleDesc, &TTSOpsHeapTuple);
-#endif
-
-        festate->initialize_castfuncs(tupleDesc);
-
-        while (true)
-        {
-            CHECK_FOR_INTERRUPTS();
-
-            if (cnt >= targrows)
-                break;
-
-            /* recycle old segments if any */
-            if (!festate->garbage_segments.empty())
-            {
-                for (auto it : festate->garbage_segments)
-                    pfree(it);
-                festate->garbage_segments.clear();
-                elog(DEBUG1, "parquet_fdw: garbage segments recycled");
-            }
-
-            if (festate->row >= festate->num_rows)
-            {
-                /* Read next row group */
-                try
-                {
-                    if (!read_next_rowgroup(festate, tupleDesc))
-                        break;
-                }
-                catch(const std::exception& e)
-                {
-                    elog(ERROR,
-                         "parquet_fdw: failed to read row group %d: %s",
-                         festate->row_group, e.what());
-                }
-            }
-
-            bool fake = (festate->row % ratio) != 0;
-
-            festate->populate_slot(slot, fake);
-
-            if (!fake)
-            {
-                rows[cnt++] = heap_form_tuple(tupleDesc,
-                                              slot->tts_values,
-                                              slot->tts_isnull);
-            }
-
-            festate->row++;
-        }
-
-        *totalrows = meta->num_rows();
-        *totaldeadrows = 0;
-
-        ExecDropSingleTupleTableSlot(slot);
-    }
-    PG_CATCH();
-    {
-        elog(LOG, "Cancelled");
-        delete festate;
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
-
-    delete festate;
-
-    return cnt - 1;
-}
-#endif
 
 static int
 parquetAcquireSampleRowsFunc(Relation relation, int elevel,
@@ -2635,6 +2494,7 @@ parquetAcquireSampleRowsFunc(Relation relation, int elevel,
                 break;
 
             bool fake = (row % ratio) != 0;
+            ExecClearTuple(slot);
             if (!festate->next(slot, fake))
                 break;
 
@@ -2752,11 +2612,9 @@ parquetIsForeignScanParallelSafe(PlannerInfo *root, RelOptInfo *rel,
                                  RangeTblEntry *rte)
 {
     /* Use parallel execution only when statistics are collected */
-    // return (rel->tuples > 0);
-    return false;
+    return (rel->tuples > 0);
 }
 
-#if 0
 extern "C" Size
 parquetEstimateDSMForeignScan(ForeignScanState *node, ParallelContext *pcxt)
 {
@@ -2770,9 +2628,9 @@ parquetInitializeDSMForeignScan(ForeignScanState *node, ParallelContext *pcxt,
     ParallelCoordinator        *coord = (ParallelCoordinator *) coordinate;
     ParquetFdwExecutionState   *festate;
 
-    pg_atomic_write_u32(&coord->next_rowgroup, 0);
+    coord->next_rowgroup = 0;
     festate = (ParquetFdwExecutionState *) node->fdw_state;
-    festate->coordinator = coord;
+    festate->set_coordinator(coord);
 }
 
 extern "C" void
@@ -2781,7 +2639,7 @@ parquetReInitializeDSMForeignScan(ForeignScanState *node,
 {
     ParallelCoordinator    *coord = (ParallelCoordinator *) coordinate;
 
-    pg_atomic_write_u32(&coord->next_rowgroup, 0);
+    coord->next_rowgroup = 0;
 }
 
 extern "C" void
@@ -2792,10 +2650,10 @@ parquetInitializeWorkerForeignScan(ForeignScanState *node,
     ParallelCoordinator        *coord   = (ParallelCoordinator *) coordinate;
     ParquetFdwExecutionState   *festate;
 
+    coord = new(coordinate) ParallelCoordinator;
     festate = (ParquetFdwExecutionState *) node->fdw_state;
-    festate->coordinator = coord;
+    festate->set_coordinator(coord);
 }
-#endif
 
 extern "C" void
 parquetShutdownForeignScan(ForeignScanState *node)
@@ -2803,7 +2661,6 @@ parquetShutdownForeignScan(ForeignScanState *node)
     ParquetFdwExecutionState   *festate;
 
     festate = (ParquetFdwExecutionState *) node->fdw_state;
-    // festate->coordinator = NULL;
 }
 
 extern "C" List *
