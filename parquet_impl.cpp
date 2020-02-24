@@ -134,9 +134,9 @@ struct ChunkInfo
 
 struct ParallelCoordinator
 {
-    std::mutex          lock;
-    std::atomic<int32>  next_reader;
-    std::atomic<int32>  next_rowgroup;
+    std::mutex  lock;
+    int32       next_reader;
+    int32       next_rowgroup;
 };
 
 
@@ -253,6 +253,9 @@ tolowercase(const char *input, char *output)
 class ParquetFdwReader
 {
 public:
+    /* id needed for parallel execution */
+    int32                           reader_id;
+
     std::unique_ptr<parquet::arrow::FileReader> reader;
 
     std::shared_ptr<arrow::Schema>  schema;
@@ -308,9 +311,9 @@ public:
     /* Wether object is properly initialized */
     bool     initialized;
 
-    ParquetFdwReader()
-        : row_group(-1), row(0), num_rows(0), coordinator(NULL),
-          initialized(false)
+    ParquetFdwReader(int reader_id)
+        : reader_id(reader_id), row_group(-1), row(0), num_rows(0),
+          coordinator(NULL), initialized(false)
     { }
 
     ~ParquetFdwReader()
@@ -409,7 +412,12 @@ public:
          * threaded execution.
          */
         if (coord)
-            this->row_group = coord->next_rowgroup.fetch_add(1);
+        {
+            std::lock_guard<std::mutex> guard(coord->lock);
+            if (this->reader_id != (coord->next_reader - 1))
+                return false;
+            this->row_group = coord->next_rowgroup++;
+        }
         else
             this->row_group++;
 
@@ -950,7 +958,7 @@ public:
                              bool use_threads,
                              bool use_mmap)
         : cxt(cxt), tupleDesc(tupleDesc), use_threads(use_threads),
-          use_mmap(use_mmap), attrs_used(attrs_used)
+          use_mmap(use_mmap), attrs_used(attrs_used), coord(NULL)
     { }
 
     ~SingleFileExecutionState()
@@ -978,11 +986,12 @@ public:
     {
         ListCell           *lc;
         std::vector<int>    rg;
+        int                 reader_id = 0;
 
         foreach (lc, rowgroups)
             rg.push_back(lfirst_int(lc));
 
-        reader = new ParquetFdwReader();
+        reader = new ParquetFdwReader(reader_id);
         reader->open(filename, cxt, tupleDesc, attrs_used, use_threads, use_mmap);
         reader->set_rowgroups_list(rg);
     }
@@ -1004,8 +1013,9 @@ private:
     };
 private:
     ParquetFdwReader       *reader;
-    std::list<FileRowgroups> files;
-    std::list<FileRowgroups>::const_iterator it;
+
+    std::vector<FileRowgroups> files;
+    int                     cur_reader;
 
     MemoryContext           cxt;
     TupleDesc               tupleDesc;
@@ -1013,22 +1023,27 @@ private:
     bool                    use_threads;
     bool                    use_mmap;
 
+    ParallelCoordinator    *coord;
+
 private:
     ParquetFdwReader *get_next_reader()
     {
         ParquetFdwReader *r;
 
-        try
+        if (coord)
         {
-            r = new ParquetFdwReader();
-            r->open((*it).filename.c_str(), cxt, tupleDesc, attrs_used, use_threads, use_mmap);
+            std::lock_guard<std::mutex> guard(coord->lock);
+            cur_reader = coord->next_reader++;
         }
-        catch (const std::exception& e)
-        {
-            elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
-        }
-        r->set_rowgroups_list((*it).rowgroups);
-        it++;
+
+        if (cur_reader >= files.size())
+            return NULL;
+
+        r = new ParquetFdwReader(cur_reader);
+        r->open(files[cur_reader].filename.c_str(), cxt, tupleDesc, attrs_used, use_threads, use_mmap);
+        r->set_rowgroups_list(files[cur_reader].rowgroups);
+
+        cur_reader++;
 
         return r;
     }
@@ -1040,7 +1055,8 @@ public:
                             bool use_threads,
                             bool use_mmap)
         : cxt(cxt), tupleDesc(tupleDesc), use_threads(use_threads),
-          attrs_used(attrs_used), use_mmap(use_mmap), reader(NULL)
+          attrs_used(attrs_used), use_mmap(use_mmap), reader(NULL),
+          cur_reader(0), coord(NULL)
     { }
 
     ~MultifileExecutionState()
@@ -1055,8 +1071,8 @@ public:
 
         if (unlikely(reader == NULL))
         {
-            it = files.begin();
-            reader = this->get_next_reader();
+            if ((reader = this->get_next_reader()) == NULL)
+                return false;
         }
 
         res = reader->next(slot, fake);
@@ -1066,12 +1082,15 @@ public:
         {
             try
             {
-                while (it != files.end())
+                // while (it != files.end())
+                while (true)
                 {
                     if (reader)
                         delete reader;
 
                     reader = this->get_next_reader();
+                    if (!reader)
+                        return false;
                     res = reader->next(slot, fake);
                     if (res)
                         break;
@@ -1107,7 +1126,7 @@ public:
 
     void set_coordinator(ParallelCoordinator *coord)
     {
-        /* TODO */
+        this->coord = coord;
     }
 };
 
@@ -1303,7 +1322,7 @@ public:
         foreach (lc, rowgroups)
             rg.push_back(lfirst_int(lc));
 
-        r = new ParquetFdwReader();
+        r = new ParquetFdwReader(0);
         r->open(filename, cxt, tupleDesc, attrs_used, use_threads, use_mmap);
         r->set_rowgroups_list(rg);
         readers.push_back(r);
@@ -2629,6 +2648,7 @@ parquetInitializeDSMForeignScan(ForeignScanState *node, ParallelContext *pcxt,
     ParquetFdwExecutionState   *festate;
 
     coord->next_rowgroup = 0;
+    coord->next_reader = 0;
     festate = (ParquetFdwExecutionState *) node->fdw_state;
     festate->set_coordinator(coord);
 }
