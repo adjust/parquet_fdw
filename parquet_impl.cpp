@@ -111,6 +111,13 @@ struct RowGroupFilter
     int         strategy;
 };
 
+enum ReaderType
+{
+    RT_SINGLE = 0,
+    RT_MULTI,
+    RT_MULTI_MERGE
+};
+
 /*
  * Plain C struct for fdw_state
  */
@@ -123,6 +130,7 @@ struct ParquetFdwPlanState
     bool        use_threads;
     List       *rowgroups;      /* List of Lists (per filename) */
     uint64      ntuples;
+    ReaderType  type;
 };
 
 struct ChunkInfo
@@ -2039,6 +2047,7 @@ parquetGetForeignPaths(PlannerInfo *root,
                        Oid foreigntableid)
 {
 	ParquetFdwPlanState *fdw_private;
+    Path       *foreign_path;
 	Cost		startup_cost;
 	Cost		total_cost;
     Cost        run_cost;
@@ -2078,32 +2087,44 @@ parquetGetForeignPaths(PlannerInfo *root,
     /* Collect used attributes to reduce number of read columns during scan */
     extract_used_attributes(baserel);
 
-    /* Build pathkeys based on attrs_sorted */
-    foreach (lc, fdw_private->attrs_sorted)
+    if (list_length(fdw_private->filenames) > 1)
+        fdw_private->type = RT_MULTI;
+    else
+        fdw_private->type = RT_SINGLE;
+
+    if (fdw_private->attrs_sorted)
     {
-        Oid         relid = root->simple_rte_array[baserel->relid]->relid;
-        int         attnum = lfirst_int(lc);
-        Oid         typid,
-                    collid;
-        int32       typmod;
-        Oid         sort_op;
-        Var        *var;
-        List       *attr_pathkey;
+        /* TODO: !!! Check that ordering is the same !!! */
+        if (list_length(fdw_private->filenames) > 1)
+            fdw_private->type = RT_MULTI_MERGE;
 
-        /* Build an expression (simple var) */
-        get_atttypetypmodcoll(relid, attnum, &typid, &typmod, &collid);
-        var = makeVar(baserel->relid, attnum, typid, typmod, collid, 0);
+        /* Build pathkeys based on attrs_sorted */
+        foreach (lc, fdw_private->attrs_sorted)
+        {
+            Oid         relid = root->simple_rte_array[baserel->relid]->relid;
+            int         attnum = lfirst_int(lc);
+            Oid         typid,
+                        collid;
+            int32       typmod;
+            Oid         sort_op;
+            Var        *var;
+            List       *attr_pathkey;
 
-        /* Lookup sorting operator for the attribute type */
-        get_sort_group_operators(typid,
-                                 true, false, false,
-                                 &sort_op, NULL, NULL,
-                                 NULL);
+            /* Build an expression (simple var) */
+            get_atttypetypmodcoll(relid, attnum, &typid, &typmod, &collid);
+            var = makeVar(baserel->relid, attnum, typid, typmod, collid, 0);
 
-        attr_pathkey = build_expression_pathkey(root, (Expr *) var, NULL,
-                                                sort_op, baserel->relids,
-                                                true);
-        pathkeys = list_concat(pathkeys, attr_pathkey);
+            /* Lookup sorting operator for the attribute type */
+            get_sort_group_operators(typid,
+                                     true, false, false,
+                                     &sort_op, NULL, NULL,
+                                     NULL);
+
+            attr_pathkey = build_expression_pathkey(root, (Expr *) var, NULL,
+                                                    sort_op, baserel->relids,
+                                                    true);
+            pathkeys = list_concat(pathkeys, attr_pathkey);
+        }
     }
 
 	/*
@@ -2111,38 +2132,76 @@ parquetGetForeignPaths(PlannerInfo *root,
 	 * fdw_private list of the path to carry the convert_selectively option;
 	 * it will be propagated into the fdw_private list of the Plan node.
 	 */
-	add_path(baserel, (Path *)
-			 create_foreignscan_path(root, baserel,
-									 NULL,	/* default pathtarget */
-									 baserel->rows,
-									 startup_cost,
-									 total_cost,
-									 pathkeys,
-									 NULL,	/* no outer rel either */
-									 NULL,	/* no extra plan */
-									 (List *) fdw_private));
+	foreign_path = (Path *) create_foreignscan_path(root, baserel,
+                                                    NULL,	/* default pathtarget */
+                                                    baserel->rows,
+                                                    startup_cost,
+                                                    total_cost,
+                                                    pathkeys,
+                                                    NULL,	/* no outer rel either */
+                                                    NULL,	/* no extra plan */
+                                                    (List *) fdw_private);
+	add_path(baserel, (Path *) foreign_path);
 
     if (baserel->consider_parallel > 0)
     {
-        Path *parallel_path = (Path *)
-                 create_foreignscan_path(root, baserel,
-                                         NULL,	/* default pathtarget */
-                                         baserel->rows,
-                                         startup_cost,
-                                         total_cost,
-									     NULL,
-                                         NULL,	/* no outer rel either */
-                                         NULL,	/* no extra plan */
-                                         (List *) fdw_private);
+        ParquetFdwPlanState *fdw_private_parallel;
+        
+        fdw_private_parallel = (ParquetFdwPlanState *) palloc(sizeof(ParquetFdwPlanState));
+        memcpy(fdw_private_parallel, fdw_private, sizeof(ParquetFdwPlanState));
 
-        int num_workers = max_parallel_workers_per_gather;
+        if (fdw_private->attrs_sorted)
+        {
+            fdw_private_parallel->type = RT_MULTI;
 
-        parallel_path->rows = fdw_private->ntuples / (num_workers + 1);
-        parallel_path->total_cost       = startup_cost + run_cost / num_workers;
-        parallel_path->parallel_workers = num_workers;
-        parallel_path->parallel_aware   = true;
-        parallel_path->parallel_safe    = true;
-        add_partial_path(baserel, parallel_path);
+            Path *parallel_path = (Path *)
+                     create_foreignscan_path(root, baserel,
+                                             NULL,	/* default pathtarget */
+                                             baserel->rows,
+                                             startup_cost,
+                                             total_cost,
+                                             pathkeys,
+                                             NULL,	/* no outer rel either */
+                                             NULL,	/* no extra plan */
+                                             (List *) fdw_private_parallel);
+
+            int num_workers = max_parallel_workers_per_gather;
+
+            parallel_path->rows = fdw_private->ntuples / (num_workers + 1);
+            parallel_path->total_cost       = startup_cost + run_cost / num_workers;
+            parallel_path->parallel_workers = num_workers;
+            parallel_path->parallel_aware   = true;
+            parallel_path->parallel_safe    = true;
+
+            Path *gather_merge = (Path *)
+                create_gather_merge_path(root, baserel, parallel_path, NULL,
+                                         pathkeys, NULL, NULL);
+            add_path(baserel, gather_merge);
+        }
+        else
+        {
+            fdw_private_parallel->type = RT_MULTI;
+
+            Path *parallel_path = (Path *)
+                     create_foreignscan_path(root, baserel,
+                                             NULL,	/* default pathtarget */
+                                             baserel->rows,
+                                             startup_cost,
+                                             total_cost,
+                                             pathkeys,
+                                             NULL,	/* no outer rel either */
+                                             NULL,	/* no extra plan */
+                                             (List *) fdw_private_parallel);
+
+            int num_workers = max_parallel_workers_per_gather;
+
+            parallel_path->rows = fdw_private->ntuples / (num_workers + 1);
+            parallel_path->total_cost       = startup_cost + run_cost / num_workers;
+            parallel_path->parallel_workers = num_workers;
+            parallel_path->parallel_aware   = true;
+            parallel_path->parallel_safe    = true;
+            add_partial_path(baserel, parallel_path);
+        }
     }
 }
 
@@ -2192,6 +2251,7 @@ parquetGetForeignPlan(PlannerInfo *root,
     params = lappend(params, attrs_sorted);
     params = lappend(params, makeInteger(fdw_private->use_mmap));
     params = lappend(params, makeInteger(fdw_private->use_threads));
+    params = lappend(params, makeInteger(fdw_private->type));
     params = lappend(params, fdw_private->rowgroups);
 
 	/* Create the ForeignScan node */
@@ -2223,6 +2283,7 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
     bool            use_mmap;
     bool            use_threads;
     int             i = 0;
+    ReaderType      reader_type;
 
     /* Unwrap fdw_private */
     foreach (lc, fdw_private)
@@ -2247,6 +2308,9 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
                 use_threads = (bool) intVal((Value *) lfirst(lc));
                 break;
             case 5:
+                reader_type = (ReaderType) intVal((Value *) lfirst(lc));
+                break;
+            case 6:
                 rowgroups_list = (List *) lfirst(lc);
                 break;
         }
@@ -2294,26 +2358,25 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
 
     try
     {
-        if (list_length(filenames) > 1)
+        switch (reader_type)
         {
-            if (list_length(attrs_sorted) > 0)
-            {
-                festate = new MultifileMergeExecutionState(reader_cxt, tupleDesc,
-                                                           attrs_used, sort_keys, 
-                                                           use_threads, use_mmap);
-            }
-            else
-            {
+            case RT_SINGLE:
+                festate = new SingleFileExecutionState(reader_cxt, tupleDesc,
+                                                       attrs_used, use_threads,
+                                                       use_mmap);
+                break;
+            case RT_MULTI:
                 festate = new MultifileExecutionState(reader_cxt, tupleDesc,
                                                       attrs_used, use_threads,
                                                       use_mmap);
-            }
-        }
-        else
-        {
-            festate = new SingleFileExecutionState(reader_cxt, tupleDesc,
-                                                   attrs_used, use_threads,
-                                                   use_mmap);
+                break;
+            case RT_MULTI_MERGE:
+                festate = new MultifileMergeExecutionState(reader_cxt, tupleDesc,
+                                                           attrs_used, sort_keys, 
+                                                           use_threads, use_mmap);
+                break;
+            default:
+                throw std::runtime_error("unknown reader type");
         }
 
         forboth (lc, filenames, lc2, rowgroups_list)
@@ -2567,24 +2630,27 @@ parquetExplainForeignScan(ForeignScanState *node, ExplainState *es)
     List       *filenames;
     List       *rowgroups_list;
     List       *attrs_sorted;
+    ReaderType  reader_type;
 
     initStringInfo(&str);
 
 	fdw_private = ((ForeignScan *) node->ss.ps.plan)->fdw_private;
     filenames = (List *) linitial(fdw_private);
     attrs_sorted = (List *) lthird(fdw_private);
+    reader_type = (ReaderType) intVal((Value *) list_nth(fdw_private, 5));
     rowgroups_list = (List *) llast(fdw_private);
 
-    if (list_length(filenames) == 1)
+    switch (reader_type)
     {
-        ExplainPropertyText("Reader", "Single File", es);
-    }
-    else
-    {
-        if (list_length(attrs_sorted) > 0)
-            ExplainPropertyText("Reader", "Multifile Merge", es);
-        else
+        case RT_SINGLE:
+            ExplainPropertyText("Reader", "Single File", es);
+            break;
+        case RT_MULTI:
             ExplainPropertyText("Reader", "Multifile", es);
+            break;
+        case RT_MULTI_MERGE:
+            ExplainPropertyText("Reader", "Multifile Merge", es);
+            break;
     }
 
     forboth(lc, filenames, lc2, rowgroups_list)
