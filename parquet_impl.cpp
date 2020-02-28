@@ -64,6 +64,9 @@ extern "C"
 
 #define SEGMENT_SIZE (1024 * 1024)
 
+/* from costsize.c */
+#define LOG2(x)  (log(x) / 0.693147180559945)
+
 #define to_postgres_timestamp(tstype, i, ts)                    \
     switch ((tstype)->unit()) {                                 \
         case arrow::TimeUnit::SECOND:                           \
@@ -2041,6 +2044,40 @@ extract_used_attributes(RelOptInfo *baserel)
     }
 }
 
+/*
+ * cost_merge
+ *      Calculate the cost of merging nfiles files. The entire logic is stolen
+ *      from cost_gather_merge().
+ */
+static void
+cost_merge(Path *path, uint32 nfiles, Cost input_startup_cost,
+           Cost input_total_cost, double rows)
+{
+	Cost		startup_cost = 0;
+	Cost		run_cost = 0;
+	Cost		comparison_cost;
+	double		N;
+	double		logN;
+
+    N = nfiles;
+    logN = LOG2(N);
+
+	/* Assumed cost per tuple comparison */
+	comparison_cost = 2.0 * cpu_operator_cost;
+
+	/* Heap creation cost */
+	startup_cost += comparison_cost * N * logN;
+
+	/* Per-tuple heap maintenance cost */
+	run_cost += rows * comparison_cost * logN;
+
+	/* small cost for heap management, like cost_merge_append */
+	run_cost += cpu_operator_cost * rows;
+
+	path->startup_cost = startup_cost + input_startup_cost;
+	path->total_cost = (startup_cost + run_cost + input_total_cost);
+}
+
 extern "C" void
 parquetGetForeignPaths(PlannerInfo *root,
                        RelOptInfo *baserel,
@@ -2094,9 +2131,13 @@ parquetGetForeignPaths(PlannerInfo *root,
 
     if (fdw_private->attrs_sorted)
     {
-        /* TODO: !!! Check that ordering is the same !!! */
+        ParquetFdwPlanState    *fdw_private_sorted;
+
+        fdw_private_sorted = (ParquetFdwPlanState *) palloc(sizeof(ParquetFdwPlanState));
+        memcpy(fdw_private_sorted, fdw_private, sizeof(ParquetFdwPlanState));
+
         if (list_length(fdw_private->filenames) > 1)
-            fdw_private->type = RT_MULTI_MERGE;
+            fdw_private_sorted->type = RT_MULTI_MERGE;
 
         /* Build pathkeys based on attrs_sorted */
         foreach (lc, fdw_private->attrs_sorted)
@@ -2125,19 +2166,32 @@ parquetGetForeignPaths(PlannerInfo *root,
                                                     true);
             pathkeys = list_concat(pathkeys, attr_pathkey);
         }
+
+        foreign_path = (Path *) create_foreignscan_path(root, baserel,
+                                                        NULL,	/* default pathtarget */
+                                                        baserel->rows,
+                                                        startup_cost,
+                                                        total_cost,
+                                                        pathkeys,
+                                                        NULL,	/* no outer rel either */
+                                                        NULL,	/* no extra plan */
+                                                        (List *) fdw_private_sorted);
+
+        /* For multifile case calculate costs of merging files */
+        if (fdw_private_sorted->type == RT_MULTI_MERGE)
+        {
+            cost_merge((Path *) foreign_path, list_length(fdw_private->filenames),
+                       startup_cost, total_cost, baserel->rows);
+        }
+        add_path(baserel, (Path *) foreign_path);
     }
 
-	/*
-	 * Create a ForeignPath node and add it as only possible path.  We use the
-	 * fdw_private list of the path to carry the convert_selectively option;
-	 * it will be propagated into the fdw_private list of the Plan node.
-	 */
 	foreign_path = (Path *) create_foreignscan_path(root, baserel,
                                                     NULL,	/* default pathtarget */
                                                     baserel->rows,
                                                     startup_cost,
                                                     total_cost,
-                                                    pathkeys,
+                                                    NULL,
                                                     NULL,	/* no outer rel either */
                                                     NULL,	/* no extra plan */
                                                     (List *) fdw_private);
@@ -2146,14 +2200,13 @@ parquetGetForeignPaths(PlannerInfo *root,
     if (baserel->consider_parallel > 0)
     {
         ParquetFdwPlanState *fdw_private_parallel;
-        
+
         fdw_private_parallel = (ParquetFdwPlanState *) palloc(sizeof(ParquetFdwPlanState));
         memcpy(fdw_private_parallel, fdw_private, sizeof(ParquetFdwPlanState));
+        fdw_private_parallel->type = list_length(fdw_private->filenames) > 1 ? RT_MULTI : RT_SINGLE;
 
         if (fdw_private->attrs_sorted)
         {
-            fdw_private_parallel->type = RT_MULTI;
-
             Path *parallel_path = (Path *)
                      create_foreignscan_path(root, baserel,
                                              NULL,	/* default pathtarget */
@@ -2180,15 +2233,13 @@ parquetGetForeignPaths(PlannerInfo *root,
         }
         else
         {
-            fdw_private_parallel->type = RT_MULTI;
-
             Path *parallel_path = (Path *)
                      create_foreignscan_path(root, baserel,
                                              NULL,	/* default pathtarget */
                                              baserel->rows,
                                              startup_cost,
                                              total_cost,
-                                             pathkeys,
+                                             NULL,
                                              NULL,	/* no outer rel either */
                                              NULL,	/* no extra plan */
                                              (List *) fdw_private_parallel);

@@ -211,17 +211,17 @@ CREATE FOREIGN TABLE example_merge (
     six     BOOL)
 SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/example1.parquet @abs_srcdir@/data/example2.parquet', sorted 'one');
-EXPLAIN SELECT * FROM example_merge;
-                            QUERY PLAN                             
--------------------------------------------------------------------
- Foreign Scan on example_merge  (cost=0.00..0.11 rows=11 width=85)
+EXPLAIN (COSTS OFF) SELECT * FROM example_merge ORDER BY one;
+          QUERY PLAN           
+-------------------------------
+ Foreign Scan on example_merge
    Reader: Multifile Merge
    Row groups: 
  example1.parquet: 1, 2
  example2.parquet: 1
 (5 rows)
 
-SELECT * FROM example_merge;
+SELECT * FROM example_merge ORDER BY one;
  one |    two     | three |        four         |    five    | six 
 -----+------------+-------+---------------------+------------+-----
    1 | {19,20}    | eins  | 2018-01-01 00:00:00 | 2018-01-01 | t
