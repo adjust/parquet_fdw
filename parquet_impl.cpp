@@ -2088,6 +2088,7 @@ parquetGetForeignPaths(PlannerInfo *root,
 	Cost		startup_cost;
 	Cost		total_cost;
     Cost        run_cost;
+    bool        is_sorted, is_multi;
     List       *pathkeys = NIL;
     RangeTblEntry  *rte;
     Relation        rel;
@@ -2096,6 +2097,8 @@ parquetGetForeignPaths(PlannerInfo *root,
     ListCell       *lc;
 
     fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
+    is_sorted = fdw_private->attrs_sorted != NIL;
+    is_multi = list_length(fdw_private->filenames) > 1;
 
     /* Analyze query clauses and extract ones that can be of interest to us*/
     extract_rowgroup_filters(baserel->baserestrictinfo, filters);
@@ -2124,66 +2127,64 @@ parquetGetForeignPaths(PlannerInfo *root,
     /* Collect used attributes to reduce number of read columns during scan */
     extract_used_attributes(baserel);
 
-    if (list_length(fdw_private->filenames) > 1)
-        fdw_private->type = RT_MULTI;
-    else
-        fdw_private->type = RT_SINGLE;
+    fdw_private->type = is_multi ? RT_MULTI : RT_SINGLE;
 
-    if (fdw_private->attrs_sorted)
+    /* Build pathkeys based on attrs_sorted */
+    foreach (lc, fdw_private->attrs_sorted)
     {
-        ParquetFdwPlanState    *fdw_private_sorted;
+        Oid         relid = root->simple_rte_array[baserel->relid]->relid;
+        int         attnum = lfirst_int(lc);
+        Oid         typid,
+                    collid;
+        int32       typmod;
+        Oid         sort_op;
+        Var        *var;
+        List       *attr_pathkey;
 
-        fdw_private_sorted = (ParquetFdwPlanState *) palloc(sizeof(ParquetFdwPlanState));
-        memcpy(fdw_private_sorted, fdw_private, sizeof(ParquetFdwPlanState));
+        /* Build an expression (simple var) */
+        get_atttypetypmodcoll(relid, attnum, &typid, &typmod, &collid);
+        var = makeVar(baserel->relid, attnum, typid, typmod, collid, 0);
 
-        if (list_length(fdw_private->filenames) > 1)
-            fdw_private_sorted->type = RT_MULTI_MERGE;
+        /* Lookup sorting operator for the attribute type */
+        get_sort_group_operators(typid,
+                                 true, false, false,
+                                 &sort_op, NULL, NULL,
+                                 NULL);
 
-        /* Build pathkeys based on attrs_sorted */
-        foreach (lc, fdw_private->attrs_sorted)
+        attr_pathkey = build_expression_pathkey(root, (Expr *) var, NULL,
+                                                sort_op, baserel->relids,
+                                                true);
+        pathkeys = list_concat(pathkeys, attr_pathkey);
+    }
+
+    /* Create a separate path with pathkeys for sorted parquet files. */
+    if (is_sorted)
+    {
+        Path                   *path;
+        ParquetFdwPlanState    *private_sort;
+
+        private_sort = (ParquetFdwPlanState *) palloc(sizeof(ParquetFdwPlanState));
+        memcpy(private_sort, fdw_private, sizeof(ParquetFdwPlanState));
+
+        path = (Path *) create_foreignscan_path(root, baserel,
+                                                NULL,	/* default pathtarget */
+                                                baserel->rows,
+                                                startup_cost,
+                                                total_cost,
+                                                pathkeys,
+                                                NULL,	/* no outer rel either */
+                                                NULL,	/* no extra plan */
+                                                (List *) private_sort);
+
+        /* For multifile case calculate the cost of merging files */
+        if (is_multi)
         {
-            Oid         relid = root->simple_rte_array[baserel->relid]->relid;
-            int         attnum = lfirst_int(lc);
-            Oid         typid,
-                        collid;
-            int32       typmod;
-            Oid         sort_op;
-            Var        *var;
-            List       *attr_pathkey;
+            private_sort->type = RT_MULTI_MERGE;
 
-            /* Build an expression (simple var) */
-            get_atttypetypmodcoll(relid, attnum, &typid, &typmod, &collid);
-            var = makeVar(baserel->relid, attnum, typid, typmod, collid, 0);
-
-            /* Lookup sorting operator for the attribute type */
-            get_sort_group_operators(typid,
-                                     true, false, false,
-                                     &sort_op, NULL, NULL,
-                                     NULL);
-
-            attr_pathkey = build_expression_pathkey(root, (Expr *) var, NULL,
-                                                    sort_op, baserel->relids,
-                                                    true);
-            pathkeys = list_concat(pathkeys, attr_pathkey);
-        }
-
-        foreign_path = (Path *) create_foreignscan_path(root, baserel,
-                                                        NULL,	/* default pathtarget */
-                                                        baserel->rows,
-                                                        startup_cost,
-                                                        total_cost,
-                                                        pathkeys,
-                                                        NULL,	/* no outer rel either */
-                                                        NULL,	/* no extra plan */
-                                                        (List *) fdw_private_sorted);
-
-        /* For multifile case calculate costs of merging files */
-        if (fdw_private_sorted->type == RT_MULTI_MERGE)
-        {
-            cost_merge((Path *) foreign_path, list_length(fdw_private->filenames),
+            cost_merge((Path *) path, list_length(private_sort->filenames),
                        startup_cost, total_cost, baserel->rows);
         }
-        add_path(baserel, (Path *) foreign_path);
+        add_path(baserel, path);
     }
 
 	foreign_path = (Path *) create_foreignscan_path(root, baserel,
@@ -2191,7 +2192,7 @@ parquetGetForeignPaths(PlannerInfo *root,
                                                     baserel->rows,
                                                     startup_cost,
                                                     total_cost,
-                                                    NULL,
+                                                    NULL,   /* no pathkeys */
                                                     NULL,	/* no outer rel either */
                                                     NULL,	/* no extra plan */
                                                     (List *) fdw_private);
@@ -2199,60 +2200,43 @@ parquetGetForeignPaths(PlannerInfo *root,
 
     if (baserel->consider_parallel > 0)
     {
-        ParquetFdwPlanState *fdw_private_parallel;
+        ParquetFdwPlanState *private_parallel;
 
-        fdw_private_parallel = (ParquetFdwPlanState *) palloc(sizeof(ParquetFdwPlanState));
-        memcpy(fdw_private_parallel, fdw_private, sizeof(ParquetFdwPlanState));
-        fdw_private_parallel->type = list_length(fdw_private->filenames) > 1 ? RT_MULTI : RT_SINGLE;
+        private_parallel = (ParquetFdwPlanState *) palloc(sizeof(ParquetFdwPlanState));
+        memcpy(private_parallel, fdw_private, sizeof(ParquetFdwPlanState));
+        private_parallel->type = is_multi ? RT_MULTI : RT_SINGLE;
 
-        if (fdw_private->attrs_sorted)
+        Path *parallel_path = (Path *)
+                 create_foreignscan_path(root, baserel,
+                                         NULL,	/* default pathtarget */
+                                         baserel->rows,
+                                         startup_cost,
+                                         total_cost,
+                                         pathkeys,
+                                         NULL,	/* no outer rel either */
+                                         NULL,	/* no extra plan */
+                                         (List *) private_parallel);
+
+        int num_workers = max_parallel_workers_per_gather;
+
+        parallel_path->rows = fdw_private->ntuples / (num_workers + 1);
+        parallel_path->total_cost       = startup_cost + run_cost / num_workers;
+        parallel_path->parallel_workers = num_workers;
+        parallel_path->parallel_aware   = true;
+        parallel_path->parallel_safe    = true;
+
+        /* Create GatherMerge path for sorted parquet files */
+        if (is_sorted)
         {
-            Path *parallel_path = (Path *)
-                     create_foreignscan_path(root, baserel,
-                                             NULL,	/* default pathtarget */
-                                             baserel->rows,
-                                             startup_cost,
-                                             total_cost,
-                                             pathkeys,
-                                             NULL,	/* no outer rel either */
-                                             NULL,	/* no extra plan */
-                                             (List *) fdw_private_parallel);
-
-            int num_workers = max_parallel_workers_per_gather;
-
-            parallel_path->rows = fdw_private->ntuples / (num_workers + 1);
-            parallel_path->total_cost       = startup_cost + run_cost / num_workers;
-            parallel_path->parallel_workers = num_workers;
-            parallel_path->parallel_aware   = true;
-            parallel_path->parallel_safe    = true;
-
             GatherMergePath *gather_merge =
                 create_gather_merge_path(root, baserel, parallel_path, NULL,
                                          pathkeys, NULL, NULL);
             add_path(baserel, (Path *) gather_merge);
         }
-        else
-        {
-            Path *parallel_path = (Path *)
-                     create_foreignscan_path(root, baserel,
-                                             NULL,	/* default pathtarget */
-                                             baserel->rows,
-                                             startup_cost,
-                                             total_cost,
-                                             NULL,
-                                             NULL,	/* no outer rel either */
-                                             NULL,	/* no extra plan */
-                                             (List *) fdw_private_parallel);
-
-            int num_workers = max_parallel_workers_per_gather;
-
-            parallel_path->rows = fdw_private->ntuples / (num_workers + 1);
-            parallel_path->total_cost       = startup_cost + run_cost / num_workers;
-            parallel_path->parallel_workers = num_workers;
-            parallel_path->parallel_aware   = true;
-            parallel_path->parallel_safe    = true;
+        // else
+        // {
             add_partial_path(baserel, parallel_path);
-        }
+        // }
     }
 }
 

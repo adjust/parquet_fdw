@@ -286,7 +286,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM example_seq ORDER BY two;
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted;
                   QUERY PLAN                   
 -----------------------------------------------
- Gather Merge
+ Gather
    Workers Planned: 2
    ->  Parallel Foreign Scan on example_sorted
          Reader: Multifile
@@ -310,10 +310,10 @@ EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY one;
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY two;
                      QUERY PLAN                      
 -----------------------------------------------------
- Sort
-   Sort Key: two
-   ->  Gather Merge
-         Workers Planned: 2
+ Gather Merge
+   Workers Planned: 2
+   ->  Sort
+         Sort Key: two
          ->  Parallel Foreign Scan on example_sorted
                Reader: Multifile
                Row groups: 
