@@ -2226,10 +2226,10 @@ parquetGetForeignPaths(PlannerInfo *root,
             parallel_path->parallel_aware   = true;
             parallel_path->parallel_safe    = true;
 
-            Path *gather_merge = (Path *)
+            GatherMergePath *gather_merge =
                 create_gather_merge_path(root, baserel, parallel_path, NULL,
                                          pathkeys, NULL, NULL);
-            add_path(baserel, gather_merge);
+            add_path(baserel, (Path *) gather_merge);
         }
         else
         {

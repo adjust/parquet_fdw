@@ -78,7 +78,7 @@ EXPLAIN SELECT * FROM example_seq;
 SELECT * FROM example_seq;
 
 -- multifile merge reader
-CREATE FOREIGN TABLE example_merge (
+CREATE FOREIGN TABLE example_sorted (
     one     INT8,
     two     INT8[],
     three   TEXT,
@@ -87,6 +87,18 @@ CREATE FOREIGN TABLE example_merge (
     six     BOOL)
 SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/example1.parquet @abs_srcdir@/data/example2.parquet', sorted 'one');
-EXPLAIN (COSTS OFF) SELECT * FROM example_merge ORDER BY one;
-SELECT * FROM example_merge ORDER BY one;
+EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY one;
+SELECT * FROM example_sorted ORDER BY one;
 
+-- parallel execution
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0.001;
+SET cpu_operator_cost = 0.000025;
+ANALYZE example_seq;
+ANALYZE example_sorted;
+EXPLAIN (COSTS OFF) SELECT * FROM example_seq;
+EXPLAIN (COSTS OFF) SELECT * FROM example_seq ORDER BY one;
+EXPLAIN (COSTS OFF) SELECT * FROM example_seq ORDER BY two;
+EXPLAIN (COSTS OFF) SELECT * FROM example_sorted;
+EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY one;
+EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY two;
