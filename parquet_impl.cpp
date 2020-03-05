@@ -29,6 +29,7 @@ extern "C"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
+#include "executor/spi.h"
 #include "executor/tuptable.h"
 #include "foreign/foreign.h"
 #include "foreign/fdwapi.h"
@@ -47,6 +48,7 @@ extern "C"
 #include "utils/date.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/memdebug.h"
 #include "utils/rel.h"
 #include "utils/timestamp.h"
 #include "utils/typcache.h"
@@ -89,6 +91,33 @@ static Oid to_postgres_type(int arrow_type);
 static void destroy_parquet_state(void *arg);
 
 bool parquet_fdw_use_threads = true;
+
+/*
+ * exc_palloc
+ *      C++ specific memory allocator that utilizes postgres allocation sets.
+ */
+void *
+exc_palloc(Size size)
+{
+	/* duplicates MemoryContextAllocZero to avoid increased overhead */
+	void	   *ret;
+	MemoryContext context = CurrentMemoryContext;
+
+	AssertArg(MemoryContextIsValid(context));
+
+	if (!AllocSizeIsValid(size))
+		throw std::bad_alloc();
+
+	context->isReset = false;
+
+	ret = context->methods->alloc(context, size);
+	if (unlikely(ret == NULL))
+		throw std::bad_alloc();
+
+	VALGRIND_MEMPOOL_ALLOC(context, ret, size);
+
+	return ret;
+}
 
 struct Error : std::exception
 {
@@ -1717,13 +1746,18 @@ extract_rowgroups_list(const char *filename,
     return rowgroups;
 }
 
+struct FieldInfo
+{
+    char    name[NAMEDATALEN];
+    Oid     oid;
+};
 
 /*
  * extract_parquet_fields
  *      Read parquet file and return a list of its fields
  */
-static std::list<std::pair<std::string, Oid> >
-extract_parquet_fields(ImportForeignSchemaStmt *stmt, const char *path)
+static void
+extract_parquet_fields(const char *path, FieldInfo **fields, int *nfields)
 {
     std::list<std::pair<std::string, Oid> >     res;
     std::unique_ptr<parquet::arrow::FileReader> reader;
@@ -1743,13 +1777,17 @@ extract_parquet_fields(ImportForeignSchemaStmt *stmt, const char *path)
         elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
     }
 
-    PG_TRY();
+    try
     {
-        auto meta = reader->parquet_reader()->metadata();
+        auto    meta = reader->parquet_reader()->metadata();
         parquet::ArrowReaderProperties props;
+        bool    error = false;
 
         if (!parquet::arrow::FromParquetSchema(meta->schema(), props, &schema).ok())
-            elog(ERROR, "parquet_fdw: error reading parquet schema");
+            throw std::runtime_error("parquet_fdw: error reading parquet schema");
+
+        *fields = (FieldInfo *) exc_palloc(sizeof(FieldInfo) * schema->num_fields());
+        *nfields = 0;
 
         for (int k = 0; k < schema->num_fields(); ++k)
         {
@@ -1763,16 +1801,29 @@ extract_parquet_fields(ImportForeignSchemaStmt *stmt, const char *path)
 
             if (type->id() == arrow::Type::LIST)
             {
-                int subtype_id;
-                Oid pg_subtype;
+                int     subtype_id;
+                Oid     pg_subtype;
+                bool    error;
 
                 if (type->children().size() != 1)
-                    elog(ERROR, "parquet_fdw: lists of structs are not supported");
+                    throw std::runtime_error("parquet_fdw: lists of structs are not supported");
 
                 subtype_id = get_arrow_list_elem_type(type.get());
                 pg_subtype = to_postgres_type(subtype_id);
 
-                pg_type = get_array_type(pg_subtype);
+                /* That sucks I know... */
+                PG_TRY();
+                {
+                    pg_type = get_array_type(pg_subtype);
+                }
+                PG_CATCH();
+                {
+                    error = true;
+                }
+                PG_END_TRY();
+
+                if (error)
+                    throw std::runtime_error("parquet_fdw: failed to get the type of array elements");
             }
             else
             {
@@ -1781,25 +1832,99 @@ extract_parquet_fields(ImportForeignSchemaStmt *stmt, const char *path)
 
             if (pg_type != InvalidOid)
             {
-                res.push_back(std::pair<std::string, Oid>(field->name(), pg_type));
+                if (field->name().length() > 63)
+                    throw Error("parquet_fdw: field name '%s' in '%s' is too long",
+                                field->name().c_str(), path);
+                memcpy((*fields)[*nfields].name, field->name().c_str(), field->name().length() + 1);
+                (*fields)[*nfields].oid = pg_type;
+                (*nfields)++;
             }
             else
             {
-                elog(ERROR,
-                     "parquet_fdw: cannot convert field '%s' of type '%s' in %s",
-                     field->name().c_str(), type->name().c_str(), path);
+                throw Error("parquet_fdw: cannot convert field '%s' of type '%s' in %s",
+                            field->name().c_str(), type->name().c_str(), path);
             }
         }
     }
-    PG_CATCH();
+    catch (std::exception &e)
     {
         /* Destroy the reader on error */
         reader.reset();
-        PG_RE_THROW();
+        elog(ERROR, "%s", e.what());
     }
-    PG_END_TRY();
+}
 
-    return res;
+/*
+ * create_foreign_table_query
+ *      Produce a query text for creating a new foreign table.
+ *
+ * XXX I know this is a wierd function signature combining c and c++ but i
+ * leave it like this for now for the sake of not doing additional work of
+ * converting paths list into an std::list.
+ */
+char *
+create_foreign_table_query(const char *tablename,
+                           const char *schemaname,
+                           const char *servername,
+                           char **paths, int npaths,
+                           FieldInfo *fields, int nfields)
+{
+    StringInfoData  str;
+
+    initStringInfo(&str);
+    appendStringInfo(&str, "CREATE FOREIGN TABLE ");
+
+    /* append table name */
+    if (schemaname)
+        appendStringInfo(&str, "%s.%s (",
+                         schemaname, quote_identifier(tablename));
+    else
+        appendStringInfo(&str, "%s (", quote_identifier(tablename));
+
+    /* append columns */
+    bool is_first = true;
+    for (int i = 0; i < nfields; ++i)
+    {
+        char   *name = fields[i].name;
+        Oid     pg_type = fields[i].oid;
+
+        const char *type_name = format_type_be(pg_type);
+
+        if (!is_first)
+            appendStringInfo(&str, ", %s %s", name, type_name);
+        else
+        {
+            appendStringInfo(&str, "%s %s", name, type_name);
+            is_first = false;
+        }
+    }
+    appendStringInfo(&str, ") SERVER %s ", servername);
+    appendStringInfo(&str, "OPTIONS (filename '");
+
+    is_first = true;
+    for (int i = 0; i < npaths; ++i)
+    {
+        if (!is_first)
+            appendStringInfoChar(&str, ' ');
+        else
+            is_first = false;
+
+        appendStringInfoString(&str, paths[i]);
+    }
+    appendStringInfo(&str, "')");
+
+    return str.data;
+
+    /* append options */
+#if 0
+    foreach (lc, stmt->options)
+    {
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+        appendStringInfo(&str, ", %s '%s'", def->defname, defGetString(def));
+    }
+    appendStringInfo(&str, ")");
+#endif
 }
 
 /*
@@ -1811,10 +1936,13 @@ autodiscover_parquet_file(ImportForeignSchemaStmt *stmt, char *filename)
 {
     char           *path = psprintf("%s/%s", stmt->remote_schema, filename);
     StringInfoData  str;
-    auto            fields = extract_parquet_fields(stmt, path);
+    FieldInfo      *fields;
+    int             nfields;
     bool            is_first = true;
     char           *ext;
     ListCell       *lc;
+
+    extract_parquet_fields(path, &fields, &nfields);
 
     initStringInfo(&str);
     appendStringInfo(&str, "CREATE FOREIGN TABLE ");
@@ -1830,18 +1958,18 @@ autodiscover_parquet_file(ImportForeignSchemaStmt *stmt, char *filename)
     *ext = '.';
 
     /* append columns */
-    for (auto field: fields)
+    for (int i = 0; i < nfields; ++i)
     {
-        std::string &name = field.first;
-        Oid pg_type = field.second;
+        char   *name = fields[i].name;
+        Oid     pg_type = fields[i].oid;
 
         const char *type_name = format_type_be(pg_type);
 
         if (!is_first)
-            appendStringInfo(&str, ", %s %s", name.c_str(), type_name);
+            appendStringInfo(&str, ", %s %s", name, type_name);
         else
         {
-            appendStringInfo(&str, "%s %s", name.c_str(), type_name);
+            appendStringInfo(&str, "%s %s", name, type_name);
             is_first = false;
         }
     }
@@ -2233,10 +2361,7 @@ parquetGetForeignPaths(PlannerInfo *root,
                                          pathkeys, NULL, NULL);
             add_path(baserel, (Path *) gather_merge);
         }
-        // else
-        // {
-            add_partial_path(baserel, parallel_path);
-        // }
+        add_partial_path(baserel, parallel_path);
     }
 }
 
@@ -2945,3 +3070,95 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
     PG_RETURN_VOID();
 }
 
+extern "C"
+{
+PG_FUNCTION_INFO_V1(import_parquet);
+extern "C" Datum import_parquet(PG_FUNCTION_ARGS);
+Datum
+import_parquet(PG_FUNCTION_ARGS)
+{
+    char       *tablename = text_to_cstring(PG_GETARG_TEXT_P(0));
+    char       *schemaname = text_to_cstring(PG_GETARG_TEXT_P(1));
+    char       *servername = text_to_cstring(PG_GETARG_TEXT_P(2));
+    Oid         funcid = PG_GETARG_OID(3);
+    Datum       arg = PG_GETARG_DATUM(4);
+    Datum       res;
+    FmgrInfo    finfo;
+    ArrayType  *arr;
+    Oid         ret_type;
+    Oid         elem_type;
+    char       *query;
+
+    fmgr_info(funcid, &finfo);
+
+    ret_type = get_func_rettype(funcid);
+    if (!type_is_array(ret_type))
+        elog(ERROR,
+             "return type of '%s' function must be array",
+             get_func_name(funcid));
+
+    if ((elem_type = get_element_type(ret_type)) == InvalidOid)
+        elog(ERROR,
+             "return type of '%s' function must be array of TEXT elements",
+             get_func_name(funcid));
+
+    /* TODO: other validations: return type is array of TEXT, input arg is JSONB */
+
+    /* Call the user provided function */
+    res = FunctionCall1(&finfo, arg);
+    if (res != NULL)
+    {
+        int16   elem_len;
+        bool    elem_byval;
+        char    elem_align;
+        Datum  *values;
+        bool   *nulls;
+        int     num;
+        int     ret;
+
+        arr = DatumGetArrayTypeP(res);
+        get_typlenbyvalalign(elem_type, &elem_len, &elem_byval, &elem_align);
+
+        deconstruct_array(arr, elem_type, elem_len, elem_byval, elem_align,
+                          &values, &nulls, &num);
+
+        /* TODO: check that there are no nulls */
+
+        if (num == 0)
+        {
+            elog(WARNING,
+                 "'%s' function returned an empty array; foreign table wasn't created",
+                 get_func_name(funcid));
+            PG_RETURN_VOID();
+        }
+
+        /* Convert values to cstring array */
+        char **paths = (char **) palloc(num * sizeof(char *));
+        for (int i = 0; i < num; ++i)
+            paths[i] = text_to_cstring(DatumGetTextP(values[i]));
+
+        /*
+         * Get fields list from the first file. We trust the user to provide
+         * a list of files with the same structure.
+         */
+        FieldInfo  *fields;
+        int         nfields;
+        extract_parquet_fields(paths[0], &fields, &nfields);
+
+        query = create_foreign_table_query(tablename, schemaname, servername,
+                                           paths, num, fields, nfields);
+
+        /* Execute query */
+        if (SPI_connect() < 0)
+            elog(ERROR, "parquet_fdw: SPI_connect failed");
+
+        if ((ret = SPI_exec(query, 0)) != SPI_OK_UTILITY)
+            elog(ERROR, "parquet_fdw: failed to create table '%s': %s",
+                 tablename, SPI_result_code_string(ret));
+
+        SPI_finish();
+    }
+
+    PG_RETURN_VOID();
+}
+}
