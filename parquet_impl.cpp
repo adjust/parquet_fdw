@@ -3112,7 +3112,7 @@ import_parquet(PG_FUNCTION_ARGS)
              "return type of '%s' function must be array of TEXT elements",
              get_func_name(funcid));
 
-    /* TODO: other validations: return type is array of TEXT, input arg is JSONB */
+    /* TODO: other validations: input arg is JSONB */
 
     /* Call the user provided function */
     res = FunctionCall1(&finfo, arg);

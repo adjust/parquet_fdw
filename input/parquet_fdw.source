@@ -102,3 +102,27 @@ EXPLAIN (COSTS OFF) SELECT * FROM example_seq ORDER BY two;
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted;
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY one;
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY two;
+
+-- import foreign schema
+DROP FOREIGN TABLE example1;
+IMPORT FOREIGN SCHEMA "@abs_srcdir@/data"
+FROM SERVER parquet_srv
+INTO public
+OPTIONS (sorted 'one');
+\d
+SELECT * FROM example2;
+
+-- import_parquet
+create function list_parquet_files(args jsonb)
+returns text[] as
+$$
+begin
+    return array_agg(args->>'dir' || '/' || filename)
+    from pg_ls_dir(args->>'dir') as files(filename)
+    where filename ~~ '%.parquet';
+end
+$$
+language plpgsql;
+
+select import_parquet('example_import', 'public', 'parquet_srv', 'list_parquet_files', '{"dir": "@abs_srcdir@/data"}');
+SELECT * FROM example_import;

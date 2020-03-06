@@ -76,7 +76,7 @@ options (
 
 `parquet_fdw` also supports [`IMPORT FOREIGN SCHEMA`](https://www.postgresql.org/docs/current/sql-importforeignschema.html) command to discover parquet files in the specified directory on filesystem and create foreign tables according to those files. It can be used as follows:
 
-```
+```sql
 import foreign schema "/path/to/directory"
 from server parquet_srv
 into public;
