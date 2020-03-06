@@ -5,7 +5,7 @@ PGFILEDESC = "parquet_fdw - foreign data wrapper for parquet"
 SHLIB_LINK = -lm -lstdc++ -lparquet -larrow
 
 EXTENSION = parquet_fdw
-DATA = parquet_fdw--0.1.sql
+DATA = parquet_fdw--0.1.sql parquet_fdw--0.1--0.2.sql
 
 REGRESS = parquet_fdw
 

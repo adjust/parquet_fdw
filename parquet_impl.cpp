@@ -3077,9 +3077,9 @@ extern "C" Datum import_parquet(PG_FUNCTION_ARGS);
 Datum
 import_parquet(PG_FUNCTION_ARGS)
 {
-    char       *tablename = text_to_cstring(PG_GETARG_TEXT_P(0));
-    char       *schemaname = text_to_cstring(PG_GETARG_TEXT_P(1));
-    char       *servername = text_to_cstring(PG_GETARG_TEXT_P(2));
+    char       *tablename;
+    char       *schemaname;
+    char       *servername;
     Oid         funcid = PG_GETARG_OID(3);
     Datum       arg = PG_GETARG_DATUM(4);
     Datum       res;
@@ -3088,6 +3088,16 @@ import_parquet(PG_FUNCTION_ARGS)
     Oid         ret_type;
     Oid         elem_type;
     char       *query;
+
+    if (PG_ARGISNULL(0))
+        elog(ERROR, "foreign table name is mandatory");
+    tablename = text_to_cstring(PG_GETARG_TEXT_P(0));
+
+    schemaname = PG_ARGISNULL(1) ? NULL : text_to_cstring(PG_GETARG_TEXT_P(1));
+
+    if (PG_ARGISNULL(2))
+        elog(ERROR, "foreign server name is mandatory");
+    servername = text_to_cstring(PG_GETARG_TEXT_P(2));
 
     fmgr_info(funcid, &finfo);
 

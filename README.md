@@ -72,14 +72,43 @@ options (
 ### Parallel queries
 `parquet_fdw` also supports [parallel query execution](https://www.postgresql.org/docs/current/parallel-query.html) (not to confuse with multi-threaded decoding feature of `arrow`). It is disabled by default; to enable it run `ANALYZE` command on the table. The reason behind this is that without statistics postgres may end up choosing a terrible parallel plan for certain queries which would be much worse than a serial one (e.g. grouping by a column with large number of distinct values).
 
-### Experimental
+### Import
 
 `parquet_fdw` also supports [`IMPORT FOREIGN SCHEMA`](https://www.postgresql.org/docs/current/sql-importforeignschema.html) command to discover parquet files in the specified directory on filesystem and create foreign tables according to those files. It can be used as follows:
 
 ```
-IMPORT FOREIGN SCHEMA "/path/to/directory"
-FROM SERVER parquet_srv
-INTO public;
+import foreign schema "/path/to/directory"
+from server parquet_srv
+into public;
 ```
 
 It is important that `remote_schema` here is a path to a local filesystem directory and is double quoted.
+
+Another way to import parquet files into foreign tables is to use `import_parquet`:
+
+```sql
+create function import_parquet(
+    tablename   text,
+    schemaname  text,
+    servername  text,
+    userfunc    regproc,
+    args        jsonb)
+```
+
+`userfunc` is a user-defined function. It must take a `jsonb` argument and return a text array (`text[]`) of filesystem paths to parquet files to be imported. `args` is user-specified jsonb object that is passed to `userfunc` as its argument. A simple implementation of such function and its usage may look like this:
+
+```sql
+create function list_parquet_files(args jsonb)
+returns text[] as
+$$
+begin
+    return array_agg(args->>'dir' || '/' || filename)
+    from pg_ls_dir(args->>'dir') as files(filename)
+    where filename ~~ '%.parquet';
+end
+$$
+language plpgsql;
+
+select import_parquet('abc', 'public', 'parquet_srv', 'list_parquet_files', '{"dir": "/path/to/directory"}');
+```
+
