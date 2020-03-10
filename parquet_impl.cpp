@@ -46,6 +46,7 @@ extern "C"
 #include "parser/parse_oper.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
+#include "utils/jsonb.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/memdebug.h"
@@ -1857,19 +1858,17 @@ extract_parquet_fields(const char *path, FieldInfo **fields, int *nfields)
 /*
  * create_foreign_table_query
  *      Produce a query text for creating a new foreign table.
- *
- * XXX I know this is a wierd function signature combining c and c++ but i
- * leave it like this for now for the sake of not doing additional work of
- * converting paths list into an std::list.
  */
 char *
 create_foreign_table_query(const char *tablename,
                            const char *schemaname,
                            const char *servername,
                            char **paths, int npaths,
-                           FieldInfo *fields, int nfields)
+                           FieldInfo *fields, int nfields,
+                           List *options)
 {
     StringInfoData  str;
+    ListCell       *lc;
 
     initStringInfo(&str);
     appendStringInfo(&str, "CREATE FOREIGN TABLE ");
@@ -1901,6 +1900,7 @@ create_foreign_table_query(const char *tablename,
     appendStringInfo(&str, ") SERVER %s ", servername);
     appendStringInfo(&str, "OPTIONS (filename '");
 
+    /* list paths */
     is_first = true;
     for (int i = 0; i < npaths; ++i)
     {
@@ -1911,7 +1911,17 @@ create_foreign_table_query(const char *tablename,
 
         appendStringInfoString(&str, paths[i]);
     }
-    appendStringInfo(&str, "')");
+    appendStringInfoChar(&str, '\'');
+
+    /* list options */
+    foreach(lc, options)
+    {
+        DefElem *def = (DefElem *) lfirst(lc);
+
+        appendStringInfo(&str, ", %s '%s'", def->defname, defGetString(def));
+    }
+
+    appendStringInfo(&str, ")");
 
     return str.data;
 
@@ -2068,8 +2078,8 @@ get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
 
 extern "C" void
 parquetGetForeignRelSize(PlannerInfo *root,
-					  RelOptInfo *baserel,
-					  Oid foreigntableid)
+                         RelOptInfo *baserel,
+                         Oid foreigntableid)
 {
     ParquetFdwPlanState *fdw_private;
 
@@ -3070,34 +3080,84 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
     PG_RETURN_VOID();
 }
 
-extern "C"
+static List *
+jsonb_to_options_list(Jsonb *options)
 {
-PG_FUNCTION_INFO_V1(import_parquet);
-extern "C" Datum import_parquet(PG_FUNCTION_ARGS);
-Datum
-import_parquet(PG_FUNCTION_ARGS)
+    List           *res = NIL;
+	JsonbIterator  *it;
+    JsonbValue      v;
+    JsonbIteratorToken  type = WJB_DONE;
+
+    if (!options)
+        return NIL;
+
+    if (!JsonContainerIsObject(&options->root))
+        elog(ERROR, "options must be a jsonb object");
+
+    it = JsonbIteratorInit(&options->root);
+    while ((type = JsonbIteratorNext(&it, &v, false)) != WJB_DONE)
+    {
+        switch (type)
+        {
+            case WJB_BEGIN_OBJECT:
+            case WJB_END_OBJECT:
+                break;
+            case WJB_KEY:
+                {
+                    DefElem    *elem;
+                    char       *key;
+                    char       *val;
+
+                    if (v.type != jbvString)
+                        elog(ERROR, "expected a string key");
+                    key = pnstrdup(v.val.string.val, v.val.string.len);
+
+                    /* read value directly after key */
+                    type = JsonbIteratorNext(&it, &v, false);
+                    if (type != WJB_VALUE || v.type != jbvString)
+                        elog(ERROR, "expected a string value");
+                    val = pnstrdup(v.val.string.val, v.val.string.len);
+
+                    elem = makeDefElem(key, (Node *) makeString(val), 0);
+                    res = lappend(res, elem);
+
+                    break;
+                }
+            default:
+                elog(ERROR, "unexpected json token");
+        }
+    }
+
+    return res;
+}
+
+static void
+validate_import_args(const char *tablename, const char *servername, Oid funcoid)
 {
-    char       *tablename;
-    char       *schemaname;
-    char       *servername;
-    Oid         funcid = PG_GETARG_OID(3);
-    Datum       arg = PG_GETARG_DATUM(4);
+    if (!tablename)
+        elog(ERROR, "foreign table name is mandatory");
+
+    if (!servername)
+        elog(ERROR, "foreign server name is mandatory");
+
+    if (!OidIsValid(funcoid))
+        elog(ERROR, "function must be specified");
+}
+
+static void
+import_parquet_internal(const char *tablename, const char *schemaname,
+                        const char *servername, Oid funcid, Jsonb *arg,
+                        Jsonb *options)
+{
     Datum       res;
     FmgrInfo    finfo;
     ArrayType  *arr;
     Oid         ret_type;
     Oid         elem_type;
+    List       *optlist;
     char       *query;
 
-    if (PG_ARGISNULL(0))
-        elog(ERROR, "foreign table name is mandatory");
-    tablename = text_to_cstring(PG_GETARG_TEXT_P(0));
-
-    schemaname = PG_ARGISNULL(1) ? NULL : text_to_cstring(PG_GETARG_TEXT_P(1));
-
-    if (PG_ARGISNULL(2))
-        elog(ERROR, "foreign server name is mandatory");
-    servername = text_to_cstring(PG_GETARG_TEXT_P(2));
+    validate_import_args(tablename, servername, funcid);
 
     fmgr_info(funcid, &finfo);
 
@@ -3112,10 +3172,12 @@ import_parquet(PG_FUNCTION_ARGS)
              "return type of '%s' function must be array of TEXT elements",
              get_func_name(funcid));
 
+    optlist = jsonb_to_options_list(options);
+
     /* TODO: other validations: input arg is JSONB */
 
     /* Call the user provided function */
-    res = FunctionCall1(&finfo, arg);
+    res = FunctionCall1(&finfo, (Datum) arg);
     if (res != NULL)
     {
         int16   elem_len;
@@ -3139,7 +3201,7 @@ import_parquet(PG_FUNCTION_ARGS)
             elog(WARNING,
                  "'%s' function returned an empty array; foreign table wasn't created",
                  get_func_name(funcid));
-            PG_RETURN_VOID();
+            return;
         }
 
         /* Convert values to cstring array */
@@ -3156,7 +3218,8 @@ import_parquet(PG_FUNCTION_ARGS)
         extract_parquet_fields(paths[0], &fields, &nfields);
 
         query = create_foreign_table_query(tablename, schemaname, servername,
-                                           paths, num, fields, nfields);
+                                           paths, num, fields, nfields,
+                                           optlist);
 
         /* Execute query */
         if (SPI_connect() < 0)
@@ -3168,6 +3231,29 @@ import_parquet(PG_FUNCTION_ARGS)
 
         SPI_finish();
     }
+}
+
+extern "C"
+{
+PG_FUNCTION_INFO_V1(import_parquet);
+Datum
+import_parquet(PG_FUNCTION_ARGS)
+{
+    char       *tablename;
+    char       *schemaname;
+    char       *servername;
+    Oid         funcid;
+    Jsonb      *arg;
+    Jsonb      *options;
+
+    tablename = PG_ARGISNULL(0) ? NULL : text_to_cstring(PG_GETARG_TEXT_P(0));
+    schemaname = PG_ARGISNULL(1) ? NULL : text_to_cstring(PG_GETARG_TEXT_P(1));
+    servername = PG_ARGISNULL(2) ? NULL : text_to_cstring(PG_GETARG_TEXT_P(2));
+    funcid = PG_ARGISNULL(3) ? InvalidOid : PG_GETARG_OID(3);
+    arg = PG_ARGISNULL(4) ? NULL : PG_GETARG_JSONB_P(4);
+    options = PG_ARGISNULL(5) ? NULL : PG_GETARG_JSONB_P(5);
+
+    import_parquet_internal(tablename, schemaname, servername, funcid, arg, options);
 
     PG_RETURN_VOID();
 }

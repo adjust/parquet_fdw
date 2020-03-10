@@ -92,7 +92,8 @@ create function import_parquet(
     schemaname  text,
     servername  text,
     userfunc    regproc,
-    args        jsonb)
+    args        jsonb,
+    options     jsonb)
 ```
 
 `userfunc` is a user-defined function. It must take a `jsonb` argument and return a text array (`text[]`) of filesystem paths to parquet files to be imported. `args` is user-specified jsonb object that is passed to `userfunc` as its argument. A simple implementation of such function and its usage may look like this:
@@ -103,12 +104,12 @@ returns text[] as
 $$
 begin
     return array_agg(args->>'dir' || '/' || filename)
-    from pg_ls_dir(args->>'dir') as files(filename)
-    where filename ~~ '%.parquet';
+           from pg_ls_dir(args->>'dir') as files(filename)
+           where filename ~~ '%.parquet';
 end
 $$
 language plpgsql;
 
-select import_parquet('abc', 'public', 'parquet_srv', 'list_parquet_files', '{"dir": "/path/to/directory"}');
+select import_parquet('abc', 'public', 'parquet_srv', 'list_parquet_files', '{"dir": "/path/to/directory"}', '{"sorted": "id"}');
 ```
 
