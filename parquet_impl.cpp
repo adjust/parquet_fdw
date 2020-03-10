@@ -85,6 +85,10 @@ extern "C"
                  (tstype)->unit());                             \
     }
 
+#if PG_VERSION_NUM < 110000
+#define PG_GETARG_JSONB_P PG_GETARG_JSONB
+#endif
+
 
 static void find_cmp_func(FmgrInfo *finfo, Oid type1, Oid type2);
 static Datum bytes_to_postgres_type(const char *bytes, arrow::DataType *arrow_type);
@@ -1804,7 +1808,7 @@ extract_parquet_fields(const char *path, FieldInfo **fields, int *nfields)
             {
                 int     subtype_id;
                 Oid     pg_subtype;
-                bool    error;
+                bool    error = false;
 
                 if (type->children().size() != 1)
                     throw std::runtime_error("parquet_fdw: lists of structs are not supported");
@@ -3181,7 +3185,13 @@ import_parquet_internal(const char *tablename, const char *schemaname,
 
     /* Call the user provided function */
     res = FunctionCall1(&finfo, (Datum) arg);
-    if (res != NULL)
+
+    /*
+     * In case function returns NULL the ERROR is thrown. So it's safe to
+     * assume function returned something. Just for the sake of readability
+     * I leave this condition
+     */
+    if (res != (Datum) 0)
     {
         int16   elem_len;
         bool    elem_byval;
