@@ -181,8 +181,8 @@ EXPLAIN SELECT * FROM example_seq;
  Foreign Scan on example_seq  (cost=0.00..0.11 rows=11 width=85)
    Reader: Multifile
    Row groups: 
- example1.parquet: 1, 2
- example2.parquet: 1
+     example1.parquet: 1, 2
+     example2.parquet: 1
 (5 rows)
 
 SELECT * FROM example_seq;
@@ -217,8 +217,8 @@ EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY one;
  Foreign Scan on example_sorted
    Reader: Multifile Merge
    Row groups: 
- example1.parquet: 1, 2
- example2.parquet: 1
+     example1.parquet: 1, 2
+     example2.parquet: 1
 (5 rows)
 
 SELECT * FROM example_sorted ORDER BY one;
@@ -251,8 +251,8 @@ EXPLAIN (COSTS OFF) SELECT * FROM example_seq;
    ->  Parallel Foreign Scan on example_seq
          Reader: Multifile
          Row groups: 
- example1.parquet: 1, 2
- example2.parquet: 1
+           example1.parquet: 1, 2
+           example2.parquet: 1
 (7 rows)
 
 EXPLAIN (COSTS OFF) SELECT * FROM example_seq ORDER BY one;
@@ -265,8 +265,8 @@ EXPLAIN (COSTS OFF) SELECT * FROM example_seq ORDER BY one;
          ->  Parallel Foreign Scan on example_seq
                Reader: Multifile
                Row groups: 
- example1.parquet: 1, 2
- example2.parquet: 1
+                 example1.parquet: 1, 2
+                 example2.parquet: 1
 (9 rows)
 
 EXPLAIN (COSTS OFF) SELECT * FROM example_seq ORDER BY two;
@@ -279,8 +279,8 @@ EXPLAIN (COSTS OFF) SELECT * FROM example_seq ORDER BY two;
          ->  Parallel Foreign Scan on example_seq
                Reader: Multifile
                Row groups: 
- example1.parquet: 1, 2
- example2.parquet: 1
+                 example1.parquet: 1, 2
+                 example2.parquet: 1
 (9 rows)
 
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted;
@@ -291,8 +291,8 @@ EXPLAIN (COSTS OFF) SELECT * FROM example_sorted;
    ->  Parallel Foreign Scan on example_sorted
          Reader: Multifile
          Row groups: 
- example1.parquet: 1, 2
- example2.parquet: 1
+           example1.parquet: 1, 2
+           example2.parquet: 1
 (7 rows)
 
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY one;
@@ -303,8 +303,8 @@ EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY one;
    ->  Parallel Foreign Scan on example_sorted
          Reader: Multifile
          Row groups: 
- example1.parquet: 1, 2
- example2.parquet: 1
+           example1.parquet: 1, 2
+           example2.parquet: 1
 (7 rows)
 
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY two;
@@ -317,13 +317,13 @@ EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY two;
          ->  Parallel Foreign Scan on example_sorted
                Reader: Multifile
                Row groups: 
- example1.parquet: 1, 2
- example2.parquet: 1
+                 example1.parquet: 1, 2
+                 example2.parquet: 1
 (9 rows)
 
 -- import foreign schema
 DROP FOREIGN TABLE example1;
-IMPORT FOREIGN SCHEMA "/home/zilder/projects/parquet_fdw/data"
+IMPORT FOREIGN SCHEMA "@abs_srcdir@/data"
 FROM SERVER parquet_srv
 INTO public
 OPTIONS (sorted 'one');
@@ -359,7 +359,7 @@ begin
 end
 $$
 language plpgsql;
-select import_parquet('example_import', 'public', 'parquet_srv', 'list_parquet_files', '{"dir": "/home/zilder/projects/parquet_fdw/data"}');
+select import_parquet('example_import', 'public', 'parquet_srv', 'list_parquet_files', '{"dir": "@abs_srcdir@/data"}');
  import_parquet 
 ----------------
  

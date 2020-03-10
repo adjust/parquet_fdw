@@ -2832,10 +2832,13 @@ parquetExplainForeignScan(ForeignScanState *node, ExplainState *es)
         /* Only print filename if there're more than one file */
         if (list_length(filenames) > 1)
         {
+            appendStringInfoChar(&str, '\n');
+            appendStringInfoSpaces(&str, (es->indent + 1) * 2);
+
 #ifdef _GNU_SOURCE
-        appendStringInfo(&str, "\n%s: ", basename(filename));
+        appendStringInfo(&str, "%s: ", basename(filename));
 #else
-        appendStringInfo(&str, "\n%s: ", basename(pstrdup(filename)));
+        appendStringInfo(&str, "%s: ", basename(pstrdup(filename)));
 #endif
         }
 
