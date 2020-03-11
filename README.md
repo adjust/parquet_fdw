@@ -84,7 +84,7 @@ into public;
 
 It is important that `remote_schema` here is a path to a local filesystem directory and is double quoted.
 
-Another way to import parquet files into foreign tables is to use `import_parquet`:
+Another way to import parquet files into foreign tables is to use `import_parquet` or `import_parquet_explicit`:
 
 ```sql
 create function import_parquet(
@@ -94,7 +94,18 @@ create function import_parquet(
     userfunc    regproc,
     args        jsonb,
     options     jsonb)
+
+create function import_parquet(
+    tablename   text,
+    schemaname  text,
+    servername  text,
+    attrs       jsonb,
+    userfunc    regproc,
+    args        jsonb,
+    options     jsonb)
 ```
+
+The only difference between `import_parquet` and `import_parquet_explicit` is that the latter allows to specify a set of attributes (columns) to import. `attrs` here is a jsonb object of the form `{"column1": "type1", "column2": "type2"}` (see the example below).
 
 `userfunc` is a user-defined function. It must take a `jsonb` argument and return a text array (`text[]`) of filesystem paths to parquet files to be imported. `args` is user-specified jsonb object that is passed to `userfunc` as its argument. A simple implementation of such function and its usage may look like this:
 
@@ -110,6 +121,6 @@ end
 $$
 language plpgsql;
 
-select import_parquet('abc', 'public', 'parquet_srv', 'list_parquet_files', '{"dir": "/path/to/directory"}', '{"sorted": "id"}');
+select import_parquet_explicit('abc', 'public', 'parquet_srv', 'list_parquet_files', '{"one": "int8", "three": "text", "six": "bool"}', '{"dir": "/path/to/directory"}', '{"sorted": "id"}');
 ```
 
