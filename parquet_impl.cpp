@@ -44,6 +44,7 @@ extern "C"
 #include "optimizer/restrictinfo.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_oper.h"
+#include "parser/parse_type.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/jsonb.h"
@@ -1761,12 +1762,12 @@ struct FieldInfo
  * extract_parquet_fields
  *      Read parquet file and return a list of its fields
  */
-static void
-extract_parquet_fields(const char *path, FieldInfo **fields, int *nfields)
+static List *
+extract_parquet_fields(const char *path)
 {
-    std::list<std::pair<std::string, Oid> >     res;
     std::unique_ptr<parquet::arrow::FileReader> reader;
     std::shared_ptr<arrow::Schema>              schema;
+    List   *res = NIL;
 
     try
     {
@@ -1787,12 +1788,12 @@ extract_parquet_fields(const char *path, FieldInfo **fields, int *nfields)
         auto    meta = reader->parquet_reader()->metadata();
         parquet::ArrowReaderProperties props;
         bool    error = false;
+        FieldInfo  *fields;
 
         if (!parquet::arrow::FromParquetSchema(meta->schema(), props, &schema).ok())
             throw std::runtime_error("parquet_fdw: error reading parquet schema");
 
-        *fields = (FieldInfo *) exc_palloc(sizeof(FieldInfo) * schema->num_fields());
-        *nfields = 0;
+        fields = (FieldInfo *) exc_palloc(sizeof(FieldInfo) * schema->num_fields());
 
         for (int k = 0; k < schema->num_fields(); ++k)
         {
@@ -1840,9 +1841,10 @@ extract_parquet_fields(const char *path, FieldInfo **fields, int *nfields)
                 if (field->name().length() > 63)
                     throw Error("parquet_fdw: field name '%s' in '%s' is too long",
                                 field->name().c_str(), path);
-                memcpy((*fields)[*nfields].name, field->name().c_str(), field->name().length() + 1);
-                (*fields)[*nfields].oid = pg_type;
-                (*nfields)++;
+
+                memcpy(fields->name, field->name().c_str(), field->name().length() + 1);
+                fields->oid = pg_type;
+                res = lappend(res, fields++);
             }
             else
             {
@@ -1857,6 +1859,8 @@ extract_parquet_fields(const char *path, FieldInfo **fields, int *nfields)
         reader.reset();
         elog(ERROR, "%s", e.what());
     }
+
+    return res;
 }
 
 /*
@@ -1868,8 +1872,7 @@ create_foreign_table_query(const char *tablename,
                            const char *schemaname,
                            const char *servername,
                            char **paths, int npaths,
-                           FieldInfo *fields, int nfields,
-                           List *options)
+                           List *fields, List *options)
 {
     StringInfoData  str;
     ListCell       *lc;
@@ -1886,11 +1889,11 @@ create_foreign_table_query(const char *tablename,
 
     /* append columns */
     bool is_first = true;
-    for (int i = 0; i < nfields; ++i)
+    foreach (lc, fields)
     {
-        char   *name = fields[i].name;
-        Oid     pg_type = fields[i].oid;
-
+        FieldInfo  *field = (FieldInfo *) lfirst(lc);
+        char       *name = field->name;
+        Oid         pg_type = field->oid;
         const char *type_name = format_type_be(pg_type);
 
         if (!is_first)
@@ -1928,17 +1931,6 @@ create_foreign_table_query(const char *tablename,
     appendStringInfo(&str, ")");
 
     return str.data;
-
-    /* append options */
-#if 0
-    foreach (lc, stmt->options)
-    {
-		DefElem    *def = (DefElem *) lfirst(lc);
-
-        appendStringInfo(&str, ", %s '%s'", def->defname, defGetString(def));
-    }
-    appendStringInfo(&str, ")");
-#endif
 }
 
 /*
@@ -1950,13 +1942,12 @@ autodiscover_parquet_file(ImportForeignSchemaStmt *stmt, char *filename)
 {
     char           *path = psprintf("%s/%s", stmt->remote_schema, filename);
     StringInfoData  str;
-    FieldInfo      *fields;
-    int             nfields;
     bool            is_first = true;
     char           *ext;
+    List           *fields;
     ListCell       *lc;
 
-    extract_parquet_fields(path, &fields, &nfields);
+    fields = extract_parquet_fields(path);
 
     initStringInfo(&str);
     appendStringInfo(&str, "CREATE FOREIGN TABLE ");
@@ -1972,11 +1963,11 @@ autodiscover_parquet_file(ImportForeignSchemaStmt *stmt, char *filename)
     *ext = '.';
 
     /* append columns */
-    for (int i = 0; i < nfields; ++i)
+    foreach (lc, fields)
     {
-        char   *name = fields[i].name;
-        Oid     pg_type = fields[i].oid;
-
+        FieldInfo  *field = (FieldInfo *) lfirst(lc);
+        char       *name = field->name;
+        Oid         pg_type = field->oid;
         const char *type_name = format_type_be(pg_type);
 
         if (!is_first)
@@ -3099,7 +3090,7 @@ jsonb_to_options_list(Jsonb *options)
         return NIL;
 
     if (!JsonContainerIsObject(&options->root))
-        elog(ERROR, "options must be a jsonb object");
+        elog(ERROR, "options must be represented by a jsonb object");
 
     it = JsonbIteratorInit(&options->root);
     while ((type = JsonbIteratorNext(&it, &v, false)) != WJB_DONE)
@@ -3131,7 +3122,70 @@ jsonb_to_options_list(Jsonb *options)
                     break;
                 }
             default:
-                elog(ERROR, "unexpected json token");
+                elog(ERROR, "wrong options format");
+        }
+    }
+
+    return res;
+}
+
+static List *
+jsonb_to_fields_list(Jsonb *attrs)
+{
+    List           *res = NIL;
+	JsonbIterator  *it;
+    JsonbValue      v;
+    JsonbIteratorToken  type = WJB_DONE;
+
+    if (!attrs)
+        return NIL;
+
+    if (!JsonContainerIsObject(&attrs->root))
+        elog(ERROR, "attrs must be represented by a jsonb object");
+
+    it = JsonbIteratorInit(&attrs->root);
+    while ((type = JsonbIteratorNext(&it, &v, false)) != WJB_DONE)
+    {
+        switch (type)
+        {
+            case WJB_BEGIN_OBJECT:
+            case WJB_END_OBJECT:
+                break;
+            case WJB_KEY:
+                {
+                    FieldInfo  *field;
+                    int32       typmod;
+                    char        typname[NAMEDATALEN];
+
+                    field = (FieldInfo *) palloc(sizeof(FieldInfo));
+
+                    if (v.val.string.len >= NAMEDATALEN)
+                        elog(ERROR, "attribute name cannot be longer than %i",
+                             NAMEDATALEN - 1);
+
+                    if (v.type != jbvString)
+                        elog(ERROR, "expected a string key");
+                    memcpy(field->name, v.val.string.val, v.val.string.len);
+                    field->name[v.val.string.len] = '\0';
+
+                    /* read value directly after key */
+                    type = JsonbIteratorNext(&it, &v, false);
+                    if (type != WJB_VALUE || v.type != jbvString)
+                        elog(ERROR, "expected a string value");
+
+                    if (v.val.string.len >= NAMEDATALEN)
+                        elog(ERROR, "type name cannot be longer than %i",
+                             NAMEDATALEN - 1);
+
+                    memcpy(typname, v.val.string.val, v.val.string.len);
+                    typname[v.val.string.len] = '\n';
+                    parseTypeString(typname, &field->oid, &typmod, false);
+
+                    res = lappend(res, field);
+                    break;
+                }
+            default:
+                elog(ERROR, "wrong attributes format");
         }
     }
 
@@ -3153,7 +3207,7 @@ validate_import_args(const char *tablename, const char *servername, Oid funcoid)
 
 static void
 import_parquet_internal(const char *tablename, const char *schemaname,
-                        const char *servername, Oid funcid, Jsonb *arg,
+                        const char *servername, Jsonb *attrs, Oid funcid, Jsonb *arg,
                         Jsonb *options)
 {
     Datum       res;
@@ -3200,6 +3254,7 @@ import_parquet_internal(const char *tablename, const char *schemaname,
         bool   *nulls;
         int     num;
         int     ret;
+        List   *fields;
 
         arr = DatumGetArrayTypeP(res);
         get_typlenbyvalalign(elem_type, &elem_len, &elem_byval, &elem_align);
@@ -3223,16 +3278,14 @@ import_parquet_internal(const char *tablename, const char *schemaname,
             paths[i] = text_to_cstring(DatumGetTextP(values[i]));
 
         /*
-         * Get fields list from the first file. We trust the user to provide
-         * a list of files with the same structure.
+         * If attributes dict is provided then parse it. Otherwise get the list
+         * from the first file provided by the user function. We trust the user
+         * to provide a list of files with the same structure.
          */
-        FieldInfo  *fields;
-        int         nfields;
-        extract_parquet_fields(paths[0], &fields, &nfields);
+        fields = attrs ? jsonb_to_fields_list(attrs) : extract_parquet_fields(paths[0]);
 
         query = create_foreign_table_query(tablename, schemaname, servername,
-                                           paths, num, fields, nfields,
-                                           optlist);
+                                           paths, num, fields, optlist);
 
         /* Execute query */
         if (SPI_connect() < 0)
@@ -3248,6 +3301,7 @@ import_parquet_internal(const char *tablename, const char *schemaname,
 
 extern "C"
 {
+
 PG_FUNCTION_INFO_V1(import_parquet);
 Datum
 import_parquet(PG_FUNCTION_ARGS)
@@ -3266,8 +3320,34 @@ import_parquet(PG_FUNCTION_ARGS)
     arg = PG_ARGISNULL(4) ? NULL : PG_GETARG_JSONB_P(4);
     options = PG_ARGISNULL(5) ? NULL : PG_GETARG_JSONB_P(5);
 
-    import_parquet_internal(tablename, schemaname, servername, funcid, arg, options);
+    import_parquet_internal(tablename, schemaname, servername, NULL, funcid, arg, options);
 
     PG_RETURN_VOID();
 }
+
+PG_FUNCTION_INFO_V1(import_parquet_with_attrs);
+Datum
+import_parquet_with_attrs(PG_FUNCTION_ARGS)
+{
+    char       *tablename;
+    char       *schemaname;
+    char       *servername;
+    Jsonb      *attrs;
+    Oid         funcid;
+    Jsonb      *arg;
+    Jsonb      *options;
+
+    tablename = PG_ARGISNULL(0) ? NULL : text_to_cstring(PG_GETARG_TEXT_P(0));
+    schemaname = PG_ARGISNULL(1) ? NULL : text_to_cstring(PG_GETARG_TEXT_P(1));
+    servername = PG_ARGISNULL(2) ? NULL : text_to_cstring(PG_GETARG_TEXT_P(2));
+    attrs = PG_ARGISNULL(3) ? NULL : PG_GETARG_JSONB_P(3);
+    funcid = PG_ARGISNULL(4) ? InvalidOid : PG_GETARG_OID(4);
+    arg = PG_ARGISNULL(5) ? NULL : PG_GETARG_JSONB_P(5);
+    options = PG_ARGISNULL(6) ? NULL : PG_GETARG_JSONB_P(6);
+
+    import_parquet_internal(tablename, schemaname, servername, attrs, funcid, arg, options);
+
+    PG_RETURN_VOID();
+}
+
 }
