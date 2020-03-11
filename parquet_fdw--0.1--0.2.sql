@@ -9,7 +9,7 @@ RETURNS VOID
 AS 'MODULE_PATHNAME'
 LANGUAGE C;
 
-CREATE FUNCTION import_parquet(
+CREATE FUNCTION import_parquet_explicit(
     tablename  text,
     schemaname text,
     servername text,

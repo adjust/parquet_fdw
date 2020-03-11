@@ -124,5 +124,5 @@ end
 $$
 language plpgsql;
 
-select import_parquet('example_import', 'public', 'parquet_srv', 'list_parquet_files', '{"dir": "@abs_srcdir@/data"}');
-SELECT * FROM example_import;
+select import_parquet('example_import', 'public', 'parquet_srv', 'list_parquet_files', '{"dir": "@abs_srcdir@/data"}', '{"sorted": "one"}');
+SELECT * FROM example_import ORDER BY one, three;
