@@ -95,7 +95,7 @@ create function import_parquet(
     args        jsonb,
     options     jsonb)
 
-create function import_parquet(
+create function import_parquet_explicit(
     tablename   text,
     schemaname  text,
     servername  text,

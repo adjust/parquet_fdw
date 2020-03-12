@@ -7,7 +7,7 @@ SHLIB_LINK = -lm -lstdc++ -lparquet -larrow
 EXTENSION = parquet_fdw
 DATA = parquet_fdw--0.1.sql parquet_fdw--0.1--0.2.sql
 
-REGRESS = parquet_fdw
+REGRESS = parquet_fdw import
 
 EXTRA_CLEAN = sql/parquet_fdw.sql expected/parquet_fdw.out
 
