@@ -3178,7 +3178,7 @@ jsonb_to_fields_list(Jsonb *attrs)
                              NAMEDATALEN - 1);
 
                     memcpy(typname, v.val.string.val, v.val.string.len);
-                    typname[v.val.string.len] = '\n';
+                    typname[v.val.string.len] = '\0';
                     parseTypeString(typname, &field->oid, &typmod, false);
 
                     res = lappend(res, field);
