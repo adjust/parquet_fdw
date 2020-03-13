@@ -58,26 +58,26 @@ SELECT * FROM example_import ORDER BY one, three;
    9 | {27,28}    | fünf  | 2018-01-09 00:00:00 | 2018-01-09 | t
 (11 rows)
 
-select import_parquet_explicit('example_import2', 'public', 'parquet_srv', '{"one": "int8", "three": "text", "six": "bool"}', 'list_parquet_files', '{"dir": "@abs_srcdir@/data"}', '{"sorted": "one"}');
+select import_parquet_explicit('example_import2', 'public', 'parquet_srv', array[['one', 'int8'], ['three', 'text'], ['six', 'bool']], 'list_parquet_files', '{"dir": "@abs_srcdir@/data"}', '{"sorted": "one"}');
  import_parquet_explicit 
 -------------------------
  
 (1 row)
 
 SELECT * FROM example_import2;
- one | six | three 
------+-----+-------
-   1 | t   | foo
-   2 | f   | bar
-   3 | t   | baz
-   4 | f   | uno
-   5 | f   | dos
-   6 | f   | tres
-   1 | t   | eins
-   3 | f   | zwei
-   5 | t   | drei
-   7 | f   | vier
-   9 | t   | fünf
+ one | three | six 
+-----+-------+-----
+   1 | foo   | t
+   2 | bar   | f
+   3 | baz   | t
+   4 | uno   | f
+   5 | dos   | f
+   6 | tres  | f
+   1 | eins  | t
+   3 | zwei  | f
+   5 | drei  | t
+   7 | vier  | f
+   9 | fünf  | t
 (11 rows)
 
 DROP EXTENSION parquet_fdw CASCADE;

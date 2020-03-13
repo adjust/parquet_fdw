@@ -805,6 +805,7 @@ public:
         values = (Datum *) this->allocator->fast_alloc(sizeof(Datum) * array->length());
         get_typlenbyvalalign(elem_type, &elem_len, &elem_byval, &elem_align);
 
+#if SIZEOF_DATUM == 8
         /* Fill values and nulls arrays */
         if (array->null_count() == 0 && type_id == arrow::Type::INT64)
         {
@@ -814,12 +815,12 @@ public:
              *
              * Warning: the code below is based on the assumption that Datum is
              * 8 bytes long, which is true for most contemporary systems but this
-             * will not work on some exotic or really old systems. In this case
-             * the entire "if" branch should just be removed.
+             * will not work on some exotic or really old systems.
              */
             copy_to_c_array<int64_t>((int64_t *) values, array, elem_len);
             goto construct_array;
         }
+#endif
         for (int64_t i = 0; i < array->length(); ++i)
         {
             if (!array->IsNull(i))
@@ -3130,63 +3131,50 @@ jsonb_to_options_list(Jsonb *options)
 }
 
 static List *
-jsonb_to_fields_list(Jsonb *attrs)
+array_to_fields_list(ArrayType *arr)
 {
-    List           *res = NIL;
-	JsonbIterator  *it;
-    JsonbValue      v;
-    JsonbIteratorToken  type = WJB_DONE;
+    List   *res;
+    int     ndims = ARR_NDIM(arr);
+    int    *dims = ARR_DIMS(arr);
+    Oid     elem_type = ARR_ELEMTYPE(arr);
+    int16   elem_len;
+    bool    elem_byval;
+    char    elem_align;
+    Datum  *values;
+    bool   *nulls;
+    int     num;
 
-    if (!attrs)
-        return NIL;
+    if (ndims != 2)
+        elog(ERROR, "expected 2-dimensional attributes array");
 
-    if (!JsonContainerIsObject(&attrs->root))
-        elog(ERROR, "attrs must be represented by a jsonb object");
+    if (dims[1] != 2)
+        elog(ERROR, "each subarray expected to have 2 elements");
 
-    it = JsonbIteratorInit(&attrs->root);
-    while ((type = JsonbIteratorNext(&it, &v, false)) != WJB_DONE)
+    if (ARR_HASNULL(arr))
+        elog(ERROR, "attributes array must not contain NULLs");
+
+    get_typlenbyvalalign(elem_type, &elem_len, &elem_byval, &elem_align);
+
+    deconstruct_array(arr, elem_type, elem_len, elem_byval, elem_align,
+                      &values, &nulls, &num);
+
+    for (int i = 0, p = 0; i < dims[0]; ++i)
     {
-        switch (type)
-        {
-            case WJB_BEGIN_OBJECT:
-            case WJB_END_OBJECT:
-                break;
-            case WJB_KEY:
-                {
-                    FieldInfo  *field;
-                    int32       typmod;
-                    char        typname[NAMEDATALEN];
+        FieldInfo  *field = (FieldInfo *) palloc(sizeof(FieldInfo));
+        char       *attname;
+        char       *typname;
+        int         typmod;
 
-                    field = (FieldInfo *) palloc(sizeof(FieldInfo));
+        attname = text_to_cstring(DatumGetTextP(values[i * 2]));
+        typname = text_to_cstring(DatumGetTextP(values[i * 2 + 1]));
 
-                    if (v.val.string.len >= NAMEDATALEN)
-                        elog(ERROR, "attribute name cannot be longer than %i",
-                             NAMEDATALEN - 1);
+        if (strlen(attname) >= NAMEDATALEN)
+            elog(ERROR, "attribute name cannot be longer than %i", NAMEDATALEN - 1);
 
-                    if (v.type != jbvString)
-                        elog(ERROR, "expected a string key");
-                    memcpy(field->name, v.val.string.val, v.val.string.len);
-                    field->name[v.val.string.len] = '\0';
+        strcpy(field->name, attname);
+        parseTypeString(typname, &field->oid, &typmod, false);
 
-                    /* read value directly after key */
-                    type = JsonbIteratorNext(&it, &v, false);
-                    if (type != WJB_VALUE || v.type != jbvString)
-                        elog(ERROR, "expected a string value");
-
-                    if (v.val.string.len >= NAMEDATALEN)
-                        elog(ERROR, "type name cannot be longer than %i",
-                             NAMEDATALEN - 1);
-
-                    memcpy(typname, v.val.string.val, v.val.string.len);
-                    typname[v.val.string.len] = '\0';
-                    parseTypeString(typname, &field->oid, &typmod, false);
-
-                    res = lappend(res, field);
-                    break;
-                }
-            default:
-                elog(ERROR, "wrong attributes format");
-        }
+        res = lappend(res, field);
     }
 
     return res;
@@ -3207,8 +3195,8 @@ validate_import_args(const char *tablename, const char *servername, Oid funcoid)
 
 static void
 import_parquet_internal(const char *tablename, const char *schemaname,
-                        const char *servername, Jsonb *attrs, Oid funcid, Jsonb *arg,
-                        Jsonb *options)
+                        const char *servername, ArrayType *attrs, Oid funcid,
+                        Jsonb *arg, Jsonb *options)
 {
     Datum       res;
     FmgrInfo    finfo;
@@ -3282,7 +3270,7 @@ import_parquet_internal(const char *tablename, const char *schemaname,
          * from the first file provided by the user function. We trust the user
          * to provide a list of files with the same structure.
          */
-        fields = attrs ? jsonb_to_fields_list(attrs) : extract_parquet_fields(paths[0]);
+        fields = attrs ? array_to_fields_list(attrs) : extract_parquet_fields(paths[0]);
 
         query = create_foreign_table_query(tablename, schemaname, servername,
                                            paths, num, fields, optlist);
@@ -3332,7 +3320,7 @@ import_parquet_with_attrs(PG_FUNCTION_ARGS)
     char       *tablename;
     char       *schemaname;
     char       *servername;
-    Jsonb      *attrs;
+    ArrayType  *attrs;
     Oid         funcid;
     Jsonb      *arg;
     Jsonb      *options;
@@ -3340,7 +3328,7 @@ import_parquet_with_attrs(PG_FUNCTION_ARGS)
     tablename = PG_ARGISNULL(0) ? NULL : text_to_cstring(PG_GETARG_TEXT_P(0));
     schemaname = PG_ARGISNULL(1) ? NULL : text_to_cstring(PG_GETARG_TEXT_P(1));
     servername = PG_ARGISNULL(2) ? NULL : text_to_cstring(PG_GETARG_TEXT_P(2));
-    attrs = PG_ARGISNULL(3) ? NULL : PG_GETARG_JSONB_P(3);
+    attrs = PG_ARGISNULL(3) ? NULL : PG_GETARG_ARRAYTYPE_P(3);
     funcid = PG_ARGISNULL(4) ? InvalidOid : PG_GETARG_OID(4);
     arg = PG_ARGISNULL(5) ? NULL : PG_GETARG_JSONB_P(5);
     options = PG_ARGISNULL(6) ? NULL : PG_GETARG_JSONB_P(6);

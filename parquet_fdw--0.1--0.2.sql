@@ -13,7 +13,7 @@ CREATE FUNCTION import_parquet_explicit(
     tablename  text,
     schemaname text,
     servername text,
-    attrs      jsonb,
+    attrs      text[],
     func       regproc,
     arg        jsonb,
     options    jsonb default NULL)
