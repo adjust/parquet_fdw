@@ -3133,7 +3133,7 @@ jsonb_to_options_list(Jsonb *options)
 static List *
 array_to_fields_list(ArrayType *arr)
 {
-    List   *res;
+    List   *res = NIL;
     int     ndims = ARR_NDIM(arr);
     int    *dims = ARR_DIMS(arr);
     Oid     elem_type = ARR_ELEMTYPE(arr);
