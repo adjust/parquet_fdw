@@ -68,6 +68,8 @@ extern "C"
 
 #define SEGMENT_SIZE (1024 * 1024)
 
+#define ERROR_STR_LEN 512
+
 /* from costsize.c */
 #define LOG2(x)  (log(x) / 0.693147180559945)
 
@@ -124,6 +126,36 @@ exc_palloc(Size size)
 
 	return ret;
 }
+
+/*
+ * PostgresAllocator
+ *      Custom c++ allocator for STL containers using postgres allocation
+ *      mechanisms.
+ */
+template<class T>
+class PostgresAllocator
+{
+public:
+    using value_type = T;
+    using pointer = T*;
+    using size_type = size_t;
+
+    PostgresAllocator() = default;
+    ~PostgresAllocator() = default;
+
+    pointer allocate(size_type numObjects)
+    {
+        return static_cast<pointer>(exc_palloc(sizeof(T) * numObjects));
+    }
+
+    void deallocate(pointer p, size_type numObjects)
+    {
+        /* Rely only on postgres context purge, do not deallocate explicitly */
+    }
+};
+
+template <class T>
+using pg_vector = std::vector<T, PostgresAllocator<T> >;
 
 struct Error : std::exception
 {
@@ -249,7 +281,7 @@ public:
                     push_back(this->segment_start_ptr);
 
             oldcxt = MemoryContextSwitchTo(this->segments_cxt);
-            this->segment_start_ptr = (char *) palloc(SEGMENT_SIZE);
+            this->segment_start_ptr = (char *) exc_palloc(SEGMENT_SIZE);
             this->segment_cur_ptr = this->segment_start_ptr;
             this->segment_last_ptr =
                 this->segment_start_ptr + SEGMENT_SIZE - 1;
@@ -267,8 +299,21 @@ public:
         /* recycle old segments if any */
         if (!this->garbage_segments.empty())
         {
-            for (auto it : this->garbage_segments)
-                pfree(it);
+            bool    error = false;
+
+            PG_TRY();
+            {
+                for (auto it : this->garbage_segments)
+                    pfree(it);
+            }
+            PG_CATCH();
+            {
+                error = true;
+            }
+            PG_END_TRY();
+            if (error)
+                throw std::runtime_error("garbage segments recycle failed");
+
             this->garbage_segments.clear();
             elog(DEBUG1, "parquet_fdw: garbage segments recycled");
         }
@@ -298,6 +343,17 @@ tolowercase(const char *input, char *output)
 
 class ParquetFdwReader
 {
+private:
+    struct PgTypeInfo
+    {
+        Oid     oid;
+
+        /* For array types. elem_type == InvalidOid means type is not an array */
+        Oid     elem_type;
+        int16   elem_len;
+        bool    elem_byval;
+        char    elem_align;
+    };
 public:
     /* id needed for parallel execution */
     int32                           reader_id;
@@ -330,6 +386,8 @@ public:
      */
     std::vector<arrow::Array *>     chunks;
     std::vector<arrow::DataType *>  types;
+
+    std::vector<PgTypeInfo>         pg_types;
 
     bool           *has_nulls;          /* per-column info on nulls */
 
@@ -428,6 +486,9 @@ public:
                  */
                 if (strcmp(pg_colname, parquet_colname) == 0)
                 {
+                    PgTypeInfo  typinfo;
+                    bool        error = false;
+
                     /* Found mapping! */
                     this->indices.push_back(k);
 
@@ -435,13 +496,38 @@ public:
                     this->map[i] = this->indices.size() - 1;
 
                     this->types.push_back(this->schema->field(k)->type().get());
+
+                    /* Find the element type in case the column type is array */
+                    PG_TRY();
+                    {
+                        typinfo.oid = TupleDescAttr(tupleDesc, i)->atttypid;
+                        typinfo.elem_type = get_element_type(typinfo.oid);
+
+                        if (OidIsValid(typinfo.elem_type))
+                        {
+                            get_typlenbyvalalign(typinfo.elem_type,
+                                                 &typinfo.elem_len,
+                                                 &typinfo.elem_byval,
+                                                 &typinfo.elem_align);
+                        }
+                    }
+                    PG_CATCH();
+                    {
+                        error = true;
+                    }
+                    PG_END_TRY();
+
+                    if (error)
+                        throw Error("failed to get the element type of '%s' column", pg_colname);
+                    this->pg_types.push_back(typinfo);
+
                     break;
                 }
             }
         }
 
         /* TODO: use c++ compatible allocator */
-        this->has_nulls = (bool *) palloc(sizeof(bool) * this->map.size());
+        this->has_nulls = (bool *) exc_palloc(sizeof(bool) * this->map.size());
 
         this->allocator = new FastAllocator(cxt);
     }
@@ -509,7 +595,6 @@ public:
         if (!this->table)
             throw std::runtime_error("got empty table");
 
-        /* Fill this->columns and this->types */
         /* TODO: don't clear each time */
         this->chunk_info.clear();
         this->chunks.clear();
@@ -538,17 +623,8 @@ public:
         if (this->row >= this->num_rows)
         {
             /* Read next row group */
-            try
-            {
-                if (!this->read_next_rowgroup(slot->tts_tupleDescriptor))
-                    return false;
-            }
-            catch(const std::exception& e)
-            {
-                elog(ERROR,
-                     "parquet_fdw: failed to read row group %d: %s",
-                     this->row_group, e.what());
-            }
+            if (!this->read_next_rowgroup(slot->tts_tupleDescriptor))
+                return false;
 
             /* Lookup cast funcs */
             if (!this->initialized)
@@ -585,6 +661,7 @@ public:
                 arrow::Array       *array = this->chunks[arrow_col];
                 arrow::DataType    *arrow_type = this->types[arrow_col];
                 int                 arrow_type_id = arrow_type->id();
+                PgTypeInfo         *pg_type = &this->pg_types[arrow_col];
 
                 chunkInfo.len = array->length();
 
@@ -627,14 +704,12 @@ public:
                 {
                     Oid     pg_type_id;
 
-                    pg_type_id = TupleDescAttr(slot->tts_tupleDescriptor, attr)->atttypid;
-                    if (!type_is_array(pg_type_id))
-                        elog(ERROR,
-                             "parquet_fdw: cannot convert parquet column of type "
-                             "LIST to postgres column of scalar type");
-
-                    /* Figure out the base element types */
-                    pg_type_id = get_element_type(pg_type_id);
+                    /* TODO: do this during initialization stage */
+                    if (!OidIsValid(pg_type->elem_type))
+                    {
+                        throw std::runtime_error("parquet_fdw: cannot convert parquet column of type "
+                                                 "LIST to postgres column of scalar type");
+                    }
                     arrow_type_id = get_arrow_list_elem_type(arrow_type);
 
                     int64 pos = chunkInfo.pos;
@@ -653,7 +728,7 @@ public:
                         slot->tts_values[attr] =
                             this->nested_list_get_datum(slice.get(),
                                                         arrow_type_id,
-                                                        pg_type_id,
+                                                        pg_type,
                                                         this->castfuncs[attr]);
                         slot->tts_isnull[attr] = false;
                     }
@@ -771,14 +846,37 @@ public:
             }
             /* TODO: add other types */
             default:
-                elog(ERROR,
-                     "parquet_fdw: unsupported column type: %d",
-                     type_id);
+                throw Error("parquet_fdw: unsupported column type: %d", type_id);
         }
 
         /* Call cast function if needed */
         if (castfunc != NULL)
-            return FunctionCall1(castfunc, res);
+        {
+            MemoryContext   ccxt = CurrentMemoryContext;
+            bool            error = false;
+            Datum           res;
+            char            errstr[ERROR_STR_LEN];
+
+            PG_TRY();
+            {
+                res = FunctionCall1(castfunc, res);
+            }
+            PG_CATCH();
+            {
+                ErrorData *errdata;
+
+                MemoryContextSwitchTo(ccxt);
+                error = true;
+                errdata = CopyErrorData();
+                FlushErrorState();
+
+                strncpy(errstr, errdata->message, ERROR_STR_LEN);
+                FreeErrorData(errdata);
+            }
+            PG_END_TRY();
+            if (error)
+                throw std::runtime_error(errstr);
+        }
 
         return res;
     }
@@ -789,25 +887,22 @@ public:
      *      dimensional arrays are supported.
      */
     Datum
-    nested_list_get_datum(arrow::Array *array, int type_id,
-                          Oid elem_type, FmgrInfo *castfunc)
+    nested_list_get_datum(arrow::Array *array, int arrow_type,
+                          PgTypeInfo *pg_type, FmgrInfo *castfunc)
     {
         MemoryContext oldcxt;
         ArrayType  *res;
         Datum      *values;
         bool       *nulls = NULL;
-        int16       elem_len;
-        bool        elem_byval;
-        char        elem_align;
         int         dims[1];
         int         lbs[1];
+        bool        error = false;
 
         values = (Datum *) this->allocator->fast_alloc(sizeof(Datum) * array->length());
-        get_typlenbyvalalign(elem_type, &elem_len, &elem_byval, &elem_align);
 
 #if SIZEOF_DATUM == 8
         /* Fill values and nulls arrays */
-        if (array->null_count() == 0 && type_id == arrow::Type::INT64)
+        if (array->null_count() == 0 && arrow_type == arrow::Type::INT64)
         {
             /*
              * Ok, there are no nulls, so probably we could just memcpy the
@@ -817,14 +912,14 @@ public:
              * 8 bytes long, which is true for most contemporary systems but this
              * will not work on some exotic or really old systems.
              */
-            copy_to_c_array<int64_t>((int64_t *) values, array, elem_len);
+            copy_to_c_array<int64_t>((int64_t *) values, array, pg_type->elem_len);
             goto construct_array;
         }
 #endif
         for (int64_t i = 0; i < array->length(); ++i)
         {
             if (!array->IsNull(i))
-                values[i] = this->read_primitive_type(array, type_id, i, castfunc);
+                values[i] = this->read_primitive_type(array, arrow_type, i, castfunc);
             else
             {
                 if (!nulls)
@@ -839,13 +934,28 @@ public:
         }
 
     construct_array:
-        /* Construct one dimensional array */
+        /*
+         * Construct one dimensional array. We have to use PG_TRY / PG_CATCH
+         * to prevent any kind leaks of resources allocated by c++ in case of
+         * errors.
+         */
         dims[0] = array->length();
         lbs[0] = 1;
-        oldcxt = MemoryContextSwitchTo(allocator->context());
-        res = construct_md_array(values, nulls, 1, dims, lbs,
-                                 elem_type, elem_len, elem_byval, elem_align);
-        MemoryContextSwitchTo(oldcxt);
+        PG_TRY();
+        {
+            oldcxt = MemoryContextSwitchTo(allocator->context());
+            res = construct_md_array(values, nulls, 1, dims, lbs,
+                                     pg_type->elem_type, pg_type->elem_len,
+                                     pg_type->elem_byval, pg_type->elem_align);
+            MemoryContextSwitchTo(oldcxt);
+        }
+        PG_CATCH();
+        {
+            error = true;
+        }
+        PG_END_TRY();
+        if (error)
+            throw std::runtime_error("failed to constuct an array");
 
         return PointerGetDatum(res);
     }
@@ -861,7 +971,10 @@ public:
 
         for (uint i = 0; i < this->map.size(); ++i)
         {
-            int arrow_col = this->map[i];
+            MemoryContext ccxt = CurrentMemoryContext;
+            int     arrow_col = this->map[i];
+            bool    error = false;
+            char    errstr[ERROR_STR_LEN];
 
             if (this->map[i] < 0)
             {
@@ -888,8 +1001,7 @@ public:
             dst_type = TupleDescAttr(tupleDesc, i)->atttypid;
 
             if (!OidIsValid(src_type))
-                elog(ERROR, "parquet_fdw: unsupported column type: %s",
-                     type->name().c_str());
+                throw Error("unsupported column type: %s", type->name().c_str());
 
             /* Find underlying type of array */
             dst_is_array = type_is_array(dst_type);
@@ -899,46 +1011,62 @@ public:
             /* Make sure both types are compatible */
             if (src_is_list != dst_is_array)
             {
-                ereport(ERROR,
-                        (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
-                         errmsg("parquet_fdw: incompatible types in column \"%s\"",
-                                this->table->field(arrow_col)->name().c_str()),
-                         errhint(src_is_list ?
-                             "parquet column is of type list while postgres type is scalar" :
-                             "parquet column is of scalar type while postgres type is array")));
+                throw Error("incompatible types in column \"%s\"; %s",
+                            this->table->field(arrow_col)->name().c_str(),
+                            src_is_list ?
+                                "parquet column is of type list while postgres type is scalar" :
+                                "parquet column is of scalar type while postgres type is array");
             }
 
-            if (IsBinaryCoercible(src_type, dst_type))
+            PG_TRY();
             {
-                this->castfuncs[i] = NULL;
-                continue;
-            }
-
-            ct = find_coercion_pathway(dst_type,
-                                       src_type,
-                                       COERCION_EXPLICIT,
-                                       &funcid);
-            switch (ct)
-            {
-                case COERCION_PATH_FUNC:
-                    {
-                        MemoryContext   oldctx;
-
-                        oldctx = MemoryContextSwitchTo(CurTransactionContext);
-                        this->castfuncs[i] = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
-                        fmgr_info(funcid, this->castfuncs[i]);
-                        MemoryContextSwitchTo(oldctx);
-                        break;
-                    }
-                case COERCION_PATH_RELABELTYPE:
-                case COERCION_PATH_COERCEVIAIO:  /* TODO: double check that we
-                                                  * shouldn't do anything here*/
-                    /* Cast is not needed */
+                if (IsBinaryCoercible(src_type, dst_type))
+                {
                     this->castfuncs[i] = NULL;
-                    break;
-                default:
-                    elog(ERROR, "parquet_fdw: cast function is not found");
+                    continue;
+                }
+
+                ct = find_coercion_pathway(dst_type,
+                                           src_type,
+                                           COERCION_EXPLICIT,
+                                           &funcid);
+                switch (ct)
+                {
+                    case COERCION_PATH_FUNC:
+                        {
+                            MemoryContext   oldctx;
+
+                            oldctx = MemoryContextSwitchTo(CurTransactionContext);
+                            this->castfuncs[i] = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
+                            fmgr_info(funcid, this->castfuncs[i]);
+                            MemoryContextSwitchTo(oldctx);
+                            break;
+                        }
+                    case COERCION_PATH_RELABELTYPE:
+                    case COERCION_PATH_COERCEVIAIO:  /* TODO: double check that we
+                                                      * shouldn't do anything here*/
+                        /* Cast is not needed */
+                        this->castfuncs[i] = NULL;
+                        break;
+                    default:
+                        elog(ERROR, "cast function is not found");
+                }
             }
+            PG_CATCH();
+            {
+                ErrorData *errdata;
+
+                MemoryContextSwitchTo(ccxt);
+                error = true;
+                errdata = CopyErrorData();
+                FlushErrorState();
+
+                strncpy(errstr, errdata->message, ERROR_STR_LEN);
+                FreeErrorData(errdata);
+            }
+            PG_END_TRY();
+            if (error)
+                throw std::runtime_error(errstr);
         }
         this->initialized = true;
     }
@@ -1127,30 +1255,28 @@ public:
         /* Finished reading current reader? Proceed to the next one */
         if (unlikely(!res))
         {
-            try
+            while (true)
             {
-                // while (it != files.end())
-                while (true)
-                {
-                    if (reader)
-                        delete reader;
+                if (reader)
+                    delete reader;
 
-                    reader = this->get_next_reader();
-                    if (!reader)
-                        return false;
-                    res = reader->next(slot, fake);
-                    if (res)
-                        break;
-                }
-            }
-            catch (const std::exception& e)
-            {
-                elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
+                reader = this->get_next_reader();
+                if (!reader)
+                    return false;
+                res = reader->next(slot, fake);
+                if (res)
+                    break;
             }
         }
 
         if (res)
+        {
+            /*
+             * ExecStoreVirtualTuple doesn't throw postgres exceptions thus no
+             * need to wrap it into PG_TRY / PG_CATCH
+             */
             ExecStoreVirtualTuple(slot);
+        }
 
         return res;
     }
@@ -1282,7 +1408,9 @@ public:
 
     bool next(TupleTableSlot *slot, bool fake=false)
     {
+        bool error = false;
         auto cmp = [this] (FileSlot &a, FileSlot &b) { return compare_slots(a, b); };
+
         if (unlikely(!slots_initialized))
         {
             /* Initialize binary heap on the first run */
@@ -1291,6 +1419,7 @@ public:
             for (auto reader: readers)
             {
                 FileSlot    fs;
+                bool        error = false;
 
                 PG_TRY();
                 {
@@ -1308,9 +1437,13 @@ public:
                 }
                 PG_CATCH();
                 {
-                    throw std::runtime_error("failed to create a TupleTableSlot");
+                    error = true;
                 }
                 PG_END_TRY();
+
+                if (error)
+                    throw std::runtime_error("failed to create a TupleTableSlot");
+
                 if (reader->next(fs.slot))
                 {
                     ExecStoreVirtualTuple(fs.slot);
@@ -1331,8 +1464,19 @@ public:
             return false;
 
         const FileSlot &fs = slots.front();
-        ExecCopySlot(slot, fs.slot);
-        ExecClearTuple(fs.slot);
+
+        PG_TRY();
+        {
+            ExecCopySlot(slot, fs.slot);
+            ExecClearTuple(fs.slot);
+        }
+        PG_CATCH();
+        {
+            error = true;
+        }
+        PG_END_TRY();
+        if (error)
+            throw std::runtime_error("failed to copy a virtual tuple slot");
 
         if (readers[fs.reader_id]->next(fs.slot))
         {
@@ -1341,7 +1485,17 @@ public:
         else
         {
 #if PG_VERSION_NUM < 110000
-            ExecDropSingleTupleTableSlot(fs.slot);
+            PG_TRY();
+            {
+                ExecDropSingleTupleTableSlot(fs.slot);
+            }
+            PG_CATCH();
+            {
+                error = true;
+            }
+            PG_END_TRY();
+            if (error)
+                throw std::runtime_error("failed to drop a tuple slot");
 #endif
             /* TODO: remove from readers */
             std::pop_heap(slots.begin(), slots.end(), cmp);
@@ -1663,93 +1817,122 @@ List *
 extract_rowgroups_list(const char *filename,
                        TupleDesc tupleDesc,
                        std::list<RowGroupFilter> &filters,
-                       uint64 *ntuples)
+                       uint64 *ntuples) noexcept
 {
     std::unique_ptr<parquet::arrow::FileReader> reader;
-    List       *rowgroups = NIL;
+    arrow::Status   status;
+    List           *rowgroups = NIL;
 
     /* Open parquet file to read meta information */
     try
     {
-        parquet::arrow::FileReader::Make(
+        status = parquet::arrow::FileReader::Make(
                 arrow::default_memory_pool(),
                 parquet::ParquetFileReader::OpenFile(filename, false),
-                &reader
-        );
+                &reader);
 
+        if (!status.ok())
+            throw Error("failed to open Parquet file %s",
+                             status.message().c_str());
+
+
+        auto meta = reader->parquet_reader()->metadata();
+        parquet::ArrowReaderProperties  props;
+        std::shared_ptr<arrow::Schema>  schema;
+
+        status = parquet::arrow::FromParquetSchema(meta->schema(), props, &schema);
+        if (!status.ok())
+            throw Error("failed to convert from parquet schema: %s", status.message().c_str());
+
+        /* Check each row group whether it matches the filters */
+        for (int r = 0; r < reader->num_row_groups(); r++)
+        {
+            bool match = true;
+            auto rowgroup = meta->RowGroup(r);
+
+            for (auto it = filters.begin(); it != filters.end(); it++)
+            {
+                RowGroupFilter &filter = *it;
+                AttrNumber      attnum;
+                const char     *attname;
+
+                attnum = filter.attnum - 1;
+                attname = NameStr(TupleDescAttr(tupleDesc, attnum)->attname);
+
+                /*
+                 * Search for the column with the same name as filtered attribute
+                 */
+                for (int k = 0; k < rowgroup->num_columns(); k++)
+                {
+                    auto    column = rowgroup->ColumnChunk(k);
+                    std::vector<std::string> path = column->path_in_schema()->ToDotVector();
+
+                    if (strcmp(attname, path[0].c_str()) == 0)
+                    {
+                        /* Found it! */
+                        std::shared_ptr<parquet::Statistics>  stats;
+                        std::shared_ptr<arrow::Field>       field;
+                        std::shared_ptr<arrow::DataType>    type;
+                        MemoryContext   ccxt = CurrentMemoryContext;
+                        bool            error = false;
+                        char            errstr[ERROR_STR_LEN];
+
+                        stats = column->statistics();
+
+                        /* Convert to arrow field to get appropriate type */
+                        field = schema->field(k);
+                        type = field->type();
+
+                        PG_TRY();
+                        {
+                            /*
+                             * If at least one filter doesn't match rowgroup exclude
+                             * the current row group and proceed with the next one.
+                             */
+                            if (stats &&
+                                !row_group_matches_filter(stats.get(), type.get(), &filter))
+                            {
+                                match = false;
+                                elog(DEBUG1, "parquet_fdw: skip rowgroup %d", r + 1);
+                            }
+                        }
+                        PG_CATCH();
+                        {
+                            ErrorData *errdata;
+
+                            MemoryContextSwitchTo(ccxt);
+                            error = true;
+                            errdata = CopyErrorData();
+                            FlushErrorState();
+
+                            strncpy(errstr, errdata->message, ERROR_STR_LEN);
+                            FreeErrorData(errdata);
+                        }
+                        PG_END_TRY();
+                        if (error)
+                            throw Error("row group filter match failed: %s", errstr);
+                        break;
+                    }
+                }  /* loop over columns */
+
+                if (!match)
+                    break;
+
+            }  /* loop over filters */
+
+            /* All the filters match this rowgroup */
+            if (match)
+            {
+                /* TODO: PG_TRY */
+                rowgroups = lappend_int(rowgroups, r);
+                *ntuples += rowgroup->num_rows();
+            }
+        }  /* loop over rowgroups */
     }
     catch(const std::exception& e)
     {
-        elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
+        elog(ERROR, "parquet_fdw: failed to exctract row groups from Parquet file: %s", e.what());
     }
-    auto meta = reader->parquet_reader()->metadata();
-    parquet::ArrowReaderProperties  props;
-    std::shared_ptr<arrow::Schema>  schema;
-    parquet::arrow::FromParquetSchema(meta->schema(), props, &schema);
-
-    /* Check each row group whether it matches the filters */
-    for (int r = 0; r < reader->num_row_groups(); r++)
-    {
-        bool match = true;
-        auto rowgroup = meta->RowGroup(r);
-
-        for (auto it = filters.begin(); it != filters.end(); it++)
-        {
-            RowGroupFilter &filter = *it;
-            AttrNumber      attnum;
-            const char     *attname;
-
-            attnum = filter.attnum - 1;
-            attname = NameStr(TupleDescAttr(tupleDesc, attnum)->attname);
-
-            /*
-             * Search for the column with the same name as filtered attribute
-             */
-            for (int k = 0; k < rowgroup->num_columns(); k++)
-            {
-                auto    column = rowgroup->ColumnChunk(k);
-                std::vector<std::string> path = column->path_in_schema()->ToDotVector();
-
-                if (strcmp(attname, path[0].c_str()) == 0)
-                {
-                    /* Found it! */
-                    std::shared_ptr<parquet::Statistics>  stats;
-                    std::shared_ptr<arrow::Field>       field;
-                    std::shared_ptr<arrow::DataType>    type;
-
-                    stats = column->statistics();
-
-                    /* Convert to arrow field to get appropriate type */
-                    field = schema->field(k);
-                    type = field->type();
-
-                    /*
-                     * If at least one filter doesn't match rowgroup exclude
-                     * the current row group and proceed with the next one.
-                     */
-                    if (stats &&
-                        !row_group_matches_filter(stats.get(), type.get(), &filter))
-                    {
-                        match = false;
-                        elog(DEBUG1, "parquet_fdw: skip rowgroup %d", r + 1);
-                    }
-                    break;
-                }
-            }  /* loop over columns */
-
-            if (!match)
-                break;
-
-        }  /* loop over filters */
-
-        /* All the filters match this rowgroup */
-        if (match)
-        {
-            rowgroups = lappend_int(rowgroups, r);
-            *ntuples += rowgroup->num_rows();
-        }
-    }  /* loop over rowgroups */
-
     return rowgroups;
 }
 
@@ -1764,19 +1947,22 @@ struct FieldInfo
  *      Read parquet file and return a list of its fields
  */
 static List *
-extract_parquet_fields(const char *path)
+extract_parquet_fields(const char *path) noexcept
 {
     std::unique_ptr<parquet::arrow::FileReader> reader;
     std::shared_ptr<arrow::Schema>              schema;
-    List   *res = NIL;
+    arrow::Status   status;
+    List           *res = NIL;
 
     try
     {
-        parquet::arrow::FileReader::Make(
-                arrow::default_memory_pool(),
-                parquet::ParquetFileReader::OpenFile(path, false),
-                &reader
-        );
+        status = parquet::arrow::FileReader::Make(
+                    arrow::default_memory_pool(),
+                    parquet::ParquetFileReader::OpenFile(path, false),
+                    &reader);
+        if (!status.ok())
+            throw Error("failed to open Parquet file %s",
+                                 status.message().c_str());
 
     }
     catch(const std::exception& e)
@@ -1786,9 +1972,9 @@ extract_parquet_fields(const char *path)
 
     try
     {
-        auto    meta = reader->parquet_reader()->metadata();
+        auto        meta = reader->parquet_reader()->metadata();
         parquet::ArrowReaderProperties props;
-        bool    error = false;
+        bool        error = false;
         FieldInfo  *fields;
 
         if (!parquet::arrow::FromParquetSchema(meta->schema(), props, &schema).ok())
@@ -2519,7 +2705,11 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
 
         PrepareSortSupportFromOrderingOp(sort_op, &sort_key);
 
-        sort_keys.push_back(sort_key);
+        try {
+            sort_keys.push_back(sort_key);
+        } catch (std::exception &e) {
+            elog(ERROR, "parquet_fdw: scan initialization failed: %s", e.what());
+        }
     }
 
     try
@@ -2636,7 +2826,14 @@ parquetIterateForeignScan(ForeignScanState *node)
 	TupleTableSlot             *slot = node->ss.ss_ScanTupleSlot;
 
 	ExecClearTuple(slot);
-    festate->next(slot);
+    try
+    {
+        festate->next(slot);
+    }
+    catch (std::exception &e)
+    {
+        elog(ERROR, "parquet_fdw: %s", e.what());
+    }
 
     return slot;
 }
@@ -3196,7 +3393,7 @@ validate_import_args(const char *tablename, const char *servername, Oid funcoid)
 static void
 import_parquet_internal(const char *tablename, const char *schemaname,
                         const char *servername, ArrayType *attrs, Oid funcid,
-                        Jsonb *arg, Jsonb *options)
+                        Jsonb *arg, Jsonb *options) noexcept
 {
     Datum       res;
     FmgrInfo    finfo;

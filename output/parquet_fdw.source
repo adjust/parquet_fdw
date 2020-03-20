@@ -160,11 +160,9 @@ CREATE FOREIGN TABLE example_fail (one INT8[], two INT8, three TEXT)
 SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/example1.parquet', sorted 'one');
 SELECT one FROM example_fail;
-ERROR:  parquet_fdw: incompatible types in column "one"
-HINT:  parquet column is of scalar type while postgres type is array
+ERROR:  parquet_fdw: incompatible types in column "one"; parquet column is of scalar type while postgres type is array
 SELECT two FROM example_fail;
-ERROR:  parquet_fdw: incompatible types in column "two"
-HINT:  parquet column is of type list while postgres type is scalar
+ERROR:  parquet_fdw: incompatible types in column "two"; parquet column is of type list while postgres type is scalar
 -- sequential multifile reader
 CREATE FOREIGN TABLE example_seq (
     one     INT8,
