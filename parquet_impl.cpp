@@ -1346,6 +1346,8 @@ private:
      */
     bool compare_slots(FileSlot &a, FileSlot &b)
     {
+        bool    error = false;
+
         PG_TRY();
         {
             TupleTableSlot *s1 = a.slot;
@@ -1373,13 +1375,17 @@ private:
                 if (compare != 0)
                     return (compare > 0);
             }
-            return false;
         }
         PG_CATCH();
         {
-            throw std::runtime_error("slots comparison failed");
+            error = true;
         }
         PG_END_TRY();
+
+        if (error)
+            throw std::runtime_error("slots comparison failed");
+
+        return false;
     }
 
 public:
@@ -1643,6 +1649,7 @@ extract_rowgroup_filters(List *scan_clauses,
             .strategy = strategy,
         };
 
+        /* TODO: potentially this may throw exceptions */
         filters.push_back(f);
     }
 }
@@ -1964,21 +1971,13 @@ extract_parquet_fields(const char *path) noexcept
             throw Error("failed to open Parquet file %s",
                                  status.message().c_str());
 
-    }
-    catch(const std::exception& e)
-    {
-        elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
-    }
-
-    try
-    {
         auto        meta = reader->parquet_reader()->metadata();
         parquet::ArrowReaderProperties props;
         bool        error = false;
         FieldInfo  *fields;
 
         if (!parquet::arrow::FromParquetSchema(meta->schema(), props, &schema).ok())
-            throw std::runtime_error("parquet_fdw: error reading parquet schema");
+            throw std::runtime_error("error reading parquet schema");
 
         fields = (FieldInfo *) exc_palloc(sizeof(FieldInfo) * schema->num_fields());
 
@@ -1999,7 +1998,7 @@ extract_parquet_fields(const char *path) noexcept
                 bool    error = false;
 
                 if (type->children().size() != 1)
-                    throw std::runtime_error("parquet_fdw: lists of structs are not supported");
+                    throw std::runtime_error("lists of structs are not supported");
 
                 subtype_id = get_arrow_list_elem_type(type.get());
                 pg_subtype = to_postgres_type(subtype_id);
@@ -2016,7 +2015,7 @@ extract_parquet_fields(const char *path) noexcept
                 PG_END_TRY();
 
                 if (error)
-                    throw std::runtime_error("parquet_fdw: failed to get the type of array elements");
+                    throw std::runtime_error("failed to get the type of array elements");
             }
             else
             {
@@ -2026,7 +2025,7 @@ extract_parquet_fields(const char *path) noexcept
             if (pg_type != InvalidOid)
             {
                 if (field->name().length() > 63)
-                    throw Error("parquet_fdw: field name '%s' in '%s' is too long",
+                    throw Error("field name '%s' in '%s' is too long",
                                 field->name().c_str(), path);
 
                 memcpy(fields->name, field->name().c_str(), field->name().length() + 1);
@@ -2035,7 +2034,7 @@ extract_parquet_fields(const char *path) noexcept
             }
             else
             {
-                throw Error("parquet_fdw: cannot convert field '%s' of type '%s' in %s",
+                throw Error("cannot convert field '%s' of type '%s' in %s",
                             field->name().c_str(), type->name().c_str(), path);
             }
         }
@@ -2044,7 +2043,7 @@ extract_parquet_fields(const char *path) noexcept
     {
         /* Destroy the reader on error */
         reader.reset();
-        elog(ERROR, "%s", e.what());
+        elog(ERROR, "parquet_fdw: %s", e.what());
     }
 
     return res;
@@ -2116,68 +2115,6 @@ create_foreign_table_query(const char *tablename,
     }
 
     appendStringInfo(&str, ")");
-
-    return str.data;
-}
-
-/*
- * autodiscover_parquet_file
- *      Builds CREATE FOREIGN TABLE query based on specified parquet file
- */
-char *
-autodiscover_parquet_file(ImportForeignSchemaStmt *stmt, char *filename)
-{
-    char           *path = psprintf("%s/%s", stmt->remote_schema, filename);
-    StringInfoData  str;
-    bool            is_first = true;
-    char           *ext;
-    List           *fields;
-    ListCell       *lc;
-
-    fields = extract_parquet_fields(path);
-
-    initStringInfo(&str);
-    appendStringInfo(&str, "CREATE FOREIGN TABLE ");
-
-    /* append table name */
-    ext = strrchr(filename, '.');
-    *ext = '\0';
-    if (stmt->local_schema)
-        appendStringInfo(&str, "%s.%s (",
-                         stmt->local_schema, quote_identifier(filename));
-    else
-        appendStringInfo(&str, "%s (", quote_identifier(filename));
-    *ext = '.';
-
-    /* append columns */
-    foreach (lc, fields)
-    {
-        FieldInfo  *field = (FieldInfo *) lfirst(lc);
-        char       *name = field->name;
-        Oid         pg_type = field->oid;
-        const char *type_name = format_type_be(pg_type);
-
-        if (!is_first)
-            appendStringInfo(&str, ", %s %s", name, type_name);
-        else
-        {
-            appendStringInfo(&str, "%s %s", name, type_name);
-            is_first = false;
-        }
-    }
-    appendStringInfo(&str, ") SERVER %s ", stmt->server_name);
-    appendStringInfo(&str, "OPTIONS (filename '%s'", path);
-
-    /* append options */
-    foreach (lc, stmt->options)
-    {
-		DefElem    *def = (DefElem *) lfirst(lc);
-
-        appendStringInfo(&str, ", %s '%s'", def->defname, defGetString(def));
-    }
-    appendStringInfo(&str, ")");
-
-    elog(DEBUG1, "parquet_fdw: %s", str.data);
 
     return str.data;
 }
@@ -3140,7 +3077,12 @@ parquetImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
         {
             ListCell   *lc;
             bool        skip = false;
-            char       *filename = f->d_name;
+            List       *fields;
+            char       *filename = pstrdup(f->d_name);
+            char       *path;
+            char       *query;
+
+            path = psprintf("%s/%s", stmt->remote_schema, filename);
 
             /* check that file extension is "parquet" */
             char *ext = strrchr(filename, '.');
@@ -3181,9 +3123,11 @@ parquetImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
             if (skip)
                 continue;
 
-            /* Return dot back */
-            *ext = '.';
-            cmds = lappend(cmds, autodiscover_parquet_file(stmt, filename));
+            fields = extract_parquet_fields(path);
+            query = create_foreign_table_query(filename, stmt->local_schema,
+                                               stmt->server_name, &path, 1,
+                                               fields, stmt->options);
+            cmds = lappend(cmds, query);
         }
 
     }
