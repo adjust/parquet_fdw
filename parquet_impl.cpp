@@ -434,7 +434,6 @@ public:
               bool use_mmap)
     {
         parquet::ArrowReaderProperties props;
-        MemoryContext   estate_cxt;
         arrow::Status   status;
         std::unique_ptr<parquet::arrow::FileReader> reader;
 
@@ -702,8 +701,6 @@ public:
                 }
                 else
                 {
-                    Oid     pg_type_id;
-
                     /* TODO: do this during initialization stage */
                     if (!OidIsValid(pg_type->elem_type))
                     {
@@ -1132,8 +1129,8 @@ public:
                              std::set<int> attrs_used,
                              bool use_threads,
                              bool use_mmap)
-        : cxt(cxt), tupleDesc(tupleDesc), use_threads(use_threads),
-          use_mmap(use_mmap), attrs_used(attrs_used), coord(NULL)
+        : cxt(cxt), tupleDesc(tupleDesc), attrs_used(attrs_used),
+          use_mmap(use_mmap), use_threads(use_threads), coord(NULL)
     { }
 
     ~SingleFileExecutionState()
