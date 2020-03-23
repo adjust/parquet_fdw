@@ -32,6 +32,7 @@ ifeq ($(shell test $(VERSION_NUM) -lt 110000; echo $$?), 0)
 	override CXXFLAGS += $(CFLAGS_SL)
 endif
 
+
 # XXX: a hurdle to use common compiler flags when building bytecode from C++
 # files. should be not unnecessary, but src/Makefile.global omits passing those
 # flags for an unnknown reason.
