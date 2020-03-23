@@ -1119,7 +1119,6 @@ private:
     std::set<int>       attrs_used;
     bool                use_mmap;
     bool                use_threads;
-    ParallelCoordinator *coord;
 
 public:
     MemoryContext       estate_cxt;
@@ -1130,7 +1129,7 @@ public:
                              bool use_threads,
                              bool use_mmap)
         : cxt(cxt), tupleDesc(tupleDesc), attrs_used(attrs_used),
-          use_mmap(use_mmap), use_threads(use_threads), coord(NULL)
+          use_mmap(use_mmap), use_threads(use_threads)
     { }
 
     ~SingleFileExecutionState()
@@ -1187,7 +1186,7 @@ private:
     ParquetFdwReader       *reader;
 
     std::vector<FileRowgroups> files;
-    int                     cur_reader;
+    uint64_t                cur_reader;
 
     MemoryContext           cxt;
     TupleDesc               tupleDesc;
@@ -1226,9 +1225,9 @@ public:
                             std::set<int> attrs_used,
                             bool use_threads,
                             bool use_mmap)
-        : cxt(cxt), tupleDesc(tupleDesc), use_threads(use_threads),
-          attrs_used(attrs_used), use_mmap(use_mmap), reader(NULL),
-          cur_reader(0), coord(NULL)
+        : reader(NULL), cur_reader(0), cxt(cxt), tupleDesc(tupleDesc),
+          attrs_used(attrs_used), use_threads(use_threads), use_mmap(use_mmap),
+          coord(NULL)
     { }
 
     ~MultifileExecutionState()
@@ -1349,7 +1348,6 @@ private:
         {
             TupleTableSlot *s1 = a.slot;
             TupleTableSlot *s2 = b.slot;
-            int			nkey;
 
             Assert(!TupIsNull(s1));
             Assert(!TupIsNull(s2));
@@ -1392,8 +1390,8 @@ public:
                                  std::list<SortSupportData> sort_keys,
                                  bool use_threads,
                                  bool use_mmap)
-        : cxt(cxt), tupleDesc(tupleDesc), use_threads(use_threads),
-          attrs_used(attrs_used), sort_keys(sort_keys), use_mmap(use_mmap),
+        : cxt(cxt), tupleDesc(tupleDesc), attrs_used(attrs_used),
+          sort_keys(sort_keys), use_threads(use_threads), use_mmap(use_mmap),
           slots_initialized(false)
     { }
 
@@ -1970,7 +1968,6 @@ extract_parquet_fields(const char *path) noexcept
 
         auto        meta = reader->parquet_reader()->metadata();
         parquet::ArrowReaderProperties props;
-        bool        error = false;
         FieldInfo  *fields;
 
         if (!parquet::arrow::FromParquetSchema(meta->schema(), props, &schema).ok())
@@ -2926,14 +2923,12 @@ parquetExplainForeignScan(ForeignScanState *node, ExplainState *es)
     StringInfoData str;
     List       *filenames;
     List       *rowgroups_list;
-    List       *attrs_sorted;
     ReaderType  reader_type;
 
     initStringInfo(&str);
 
 	fdw_private = ((ForeignScan *) node->ss.ps.plan)->fdw_private;
     filenames = (List *) linitial(fdw_private);
-    attrs_sorted = (List *) lthird(fdw_private);
     reader_type = (ReaderType) intVal((Value *) list_nth(fdw_private, 5));
     rowgroups_list = (List *) llast(fdw_private);
 
@@ -3044,9 +3039,6 @@ parquetInitializeWorkerForeignScan(ForeignScanState *node,
 extern "C" void
 parquetShutdownForeignScan(ForeignScanState *node)
 {
-    ParquetFdwExecutionState   *festate;
-
-    festate = (ParquetFdwExecutionState *) node->fdw_state;
 }
 
 extern "C" List *
@@ -3296,7 +3288,7 @@ array_to_fields_list(ArrayType *arr)
     deconstruct_array(arr, elem_type, elem_len, elem_byval, elem_align,
                       &values, &nulls, &num);
 
-    for (int i = 0, p = 0; i < dims[0]; ++i)
+    for (int i = 0; i < dims[0]; ++i)
     {
         FieldInfo  *field = (FieldInfo *) palloc(sizeof(FieldInfo));
         char       *attname;
