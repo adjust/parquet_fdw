@@ -43,6 +43,7 @@ extern "C"
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
 #include "parser/parse_coerce.h"
+#include "parser/parse_func.h"
 #include "parser/parse_oper.h"
 #include "parser/parse_type.h"
 #include "utils/builtins.h"
@@ -51,6 +52,7 @@ extern "C"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/memdebug.h"
+#include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/timestamp.h"
 #include "utils/typcache.h"
@@ -2115,11 +2117,56 @@ parse_attributes_list(char *start, Oid relid)
     return attrs;
 }
 
+static List *
+get_filenames_from_userfunc(const char *funcname, const char *funcarg)
+{
+    Jsonb      *j;
+    Oid         funcid;
+    List       *f = stringToQualifiedNameList(funcname);
+    Datum       filenames;
+    Oid         jsonboid = JSONBOID;
+    Datum      *values;
+    bool       *nulls;
+    int         num;
+    List       *res = NIL;
+    ArrayType  *arr;
+
+    j = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(funcarg)));
+
+    funcid = LookupFuncName(f, 1, &jsonboid, false);
+    filenames = OidFunctionCall1(funcid, (Datum) j);
+
+    arr = DatumGetArrayTypeP(filenames);
+    if (ARR_ELEMTYPE(arr) != TEXTOID)
+        elog(ERROR, "function returned an array with non-TEXT element type");
+
+    deconstruct_array(arr, TEXTOID, -1, false, 'i', &values, &nulls, &num);
+
+    if (num == 0)
+    {
+        elog(WARNING,
+             "'%s' function returned an empty array; foreign table wasn't created",
+             get_func_name(funcid));
+        return NIL;
+    }
+
+    for (int i = 0; i < num; ++i)
+    {
+        if (nulls[i])
+            elog(ERROR, "user function returned an array containing NULL value(s)");
+        res = lappend(res, makeString(TextDatumGetCString(values[i])));
+    }
+
+    return res;
+}
+
 static void
 get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
 {
 	ForeignTable *table;
     ListCell     *lc;
+    char         *funcname = NULL;
+    char         *funcarg = NULL;
 
     fdw_private->use_mmap = false;
     fdw_private->use_threads = false;
@@ -2132,6 +2179,14 @@ get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
         if (strcmp(def->defname, "filename") == 0)
         {
             fdw_private->filenames = parse_filenames_list(defGetString(def));
+        }
+        else if (strcmp(def->defname, "func") == 0)
+        {
+            funcname = defGetString(def);
+        }
+        else if (strcmp(def->defname, "funcarg") == 0)
+        {
+            funcarg = defGetString(def);
         }
         else if (strcmp(def->defname, "sorted") == 0)
         {
@@ -2156,6 +2211,14 @@ get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
         }
         else
             elog(ERROR, "unknown option '%s'", def->defname);
+    }
+
+    if (funcname)
+    {
+        if (!funcarg)
+            elog(ERROR, "funcarg must be specified");
+
+        fdw_private->filenames = get_filenames_from_userfunc(funcname, funcarg);
     }
 }
 
@@ -2636,6 +2699,9 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
                 throw std::runtime_error("unknown reader type");
         }
 
+        if (!filenames)
+            elog(ERROR, "parquet_fdw: got an empty filenames list");
+
         forboth (lc, filenames, lc2, rowgroups_list)
         {
             char *filename = strVal((Value *) lfirst(lc));
@@ -3102,6 +3168,8 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
     Oid         catalog = PG_GETARG_OID(1);
     ListCell   *lc;
     bool        filename_provided = false;
+    bool        func_provided = false;
+    bool        funcarg_provided = false;
 
     /* Only check table options */
     if (catalog != ForeignTableRelationId)
@@ -3136,6 +3204,16 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
             pfree(filenames);
             pfree(filename);
             filename_provided = true;
+        }
+        else if (strcmp(def->defname, "func") == 0)
+        {
+            /* TODO: check that this is a proper function */
+            func_provided = true;
+        }
+        else if (strcmp(def->defname, "funcarg") == 0)
+        {
+            /* TODO: check that funcarg is a proper json */
+            funcarg_provided = true;
         }
         else if (strcmp(def->defname, "sorted") == 0)
             ;  /* do nothing */
@@ -3173,8 +3251,11 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
         }
     }
 
-    if (!filename_provided)
-        elog(ERROR, "parquet_fdw: filename is required");
+    if (func_provided && !funcarg_provided)
+        elog(ERROR, "parquet_fdw: funcarg is required");
+
+    if (!filename_provided && !func_provided)
+        elog(ERROR, "parquet_fdw: filename or func are required");
 
     PG_RETURN_VOID();
 }
