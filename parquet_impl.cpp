@@ -127,36 +127,6 @@ exc_palloc(Size size)
 	return ret;
 }
 
-/*
- * PostgresAllocator
- *      Custom c++ allocator for STL containers using postgres allocation
- *      mechanisms.
- */
-template<class T>
-class PostgresAllocator
-{
-public:
-    using value_type = T;
-    using pointer = T*;
-    using size_type = size_t;
-
-    PostgresAllocator() = default;
-    ~PostgresAllocator() = default;
-
-    pointer allocate(size_type numObjects)
-    {
-        return static_cast<pointer>(exc_palloc(sizeof(T) * numObjects));
-    }
-
-    void deallocate(pointer p, size_type numObjects)
-    {
-        /* Rely only on postgres context purge, do not deallocate explicitly */
-    }
-};
-
-template <class T>
-using pg_vector = std::vector<T, PostgresAllocator<T> >;
-
 struct Error : std::exception
 {
     char text[1000];
