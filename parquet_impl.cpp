@@ -1018,7 +1018,9 @@ public:
                         this->castfuncs[i] = NULL;
                         break;
                     default:
-                        elog(ERROR, "cast function is not found");
+                        elog(ERROR, "cast function to %s ('%s' column) is not found",
+                             format_type_be(dst_type),
+                             NameStr(TupleDescAttr(tupleDesc, i)->attname));
                 }
             }
             PG_CATCH();
@@ -2117,10 +2119,37 @@ parse_attributes_list(char *start, Oid relid)
     return attrs;
 }
 
+/*
+ * OidFunctionCall1NullableArg
+ *      Practically a copy-paste from FunctionCall1Coll with added capability
+ *      of passing a NULL argument.
+ */
+static Datum
+OidFunctionCall1NullableArg(Oid functionId, Datum arg, bool argisnull)
+{
+    FmgrInfo    flinfo;
+    LOCAL_FCINFO(fcinfo, 1);
+    Datum		result;
+
+    fmgr_info(functionId, &flinfo);
+    InitFunctionCallInfoData(*fcinfo, &flinfo, 1, InvalidOid, NULL, NULL);
+
+    fcinfo->args[0].value = arg;
+    fcinfo->args[0].isnull = argisnull;
+
+    result = FunctionCallInvoke(fcinfo);
+
+    /* Check for null result, since caller is clearly not expecting one */
+    if (fcinfo->isnull)
+        elog(ERROR, "function %u returned NULL", flinfo.fn_oid);
+
+    return result;
+}
+
 static List *
 get_filenames_from_userfunc(const char *funcname, const char *funcarg)
 {
-    Jsonb      *j;
+    Jsonb      *j = NULL;
     Oid         funcid;
     List       *f = stringToQualifiedNameList(funcname);
     Datum       filenames;
@@ -2131,10 +2160,11 @@ get_filenames_from_userfunc(const char *funcname, const char *funcarg)
     List       *res = NIL;
     ArrayType  *arr;
 
-    j = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(funcarg)));
+    if (funcarg)
+        j = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(funcarg)));
 
     funcid = LookupFuncName(f, 1, &jsonboid, false);
-    filenames = OidFunctionCall1(funcid, (Datum) j);
+    filenames = OidFunctionCall1NullableArg(funcid, (Datum) j, funcarg == NULL);
 
     arr = DatumGetArrayTypeP(filenames);
     if (ARR_ELEMTYPE(arr) != TEXTOID)
@@ -2180,11 +2210,11 @@ get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
         {
             fdw_private->filenames = parse_filenames_list(defGetString(def));
         }
-        else if (strcmp(def->defname, "func") == 0)
+        else if (strcmp(def->defname, "files_func") == 0)
         {
             funcname = defGetString(def);
         }
-        else if (strcmp(def->defname, "funcarg") == 0)
+        else if (strcmp(def->defname, "files_func_arg") == 0)
         {
             funcarg = defGetString(def);
         }
@@ -2214,12 +2244,7 @@ get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
     }
 
     if (funcname)
-    {
-        if (!funcarg)
-            elog(ERROR, "funcarg must be specified");
-
         fdw_private->filenames = get_filenames_from_userfunc(funcname, funcarg);
-    }
 }
 
 extern "C" void
@@ -3169,7 +3194,6 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
     ListCell   *lc;
     bool        filename_provided = false;
     bool        func_provided = false;
-    bool        funcarg_provided = false;
 
     /* Only check table options */
     if (catalog != ForeignTableRelationId)
@@ -3205,15 +3229,32 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
             pfree(filename);
             filename_provided = true;
         }
-        else if (strcmp(def->defname, "func") == 0)
+        else if (strcmp(def->defname, "files_func") == 0)
         {
-            /* TODO: check that this is a proper function */
+            Oid     jsonboid = JSONBOID;
+            List   *funcname = stringToQualifiedNameList(defGetString(def)); 
+            Oid     funcoid;
+            Oid     rettype;
+
+            /*
+             * Lookup the function with a single JSONB argument and fail
+             * if there isn't one.
+             */
+            funcoid = LookupFuncName(funcname, 1, &jsonboid, false);
+            if ((rettype = get_func_rettype(funcoid)) != TEXTARRAYOID)
+            {
+                elog(ERROR, "return type of '%s' is %s; expected text[]",
+                     defGetString(def), format_type_be(rettype));
+            }
             func_provided = true;
         }
-        else if (strcmp(def->defname, "funcarg") == 0)
+        else if (strcmp(def->defname, "files_func_arg") == 0)
         {
-            /* TODO: check that funcarg is a proper json */
-            funcarg_provided = true;
+            /* 
+             * Try to convert the string value into JSONB to validate it is
+             * properly formatted.
+             */
+            DirectFunctionCall1(jsonb_in, CStringGetDatum(defGetString(def)));
         }
         else if (strcmp(def->defname, "sorted") == 0)
             ;  /* do nothing */
@@ -3251,11 +3292,8 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
         }
     }
 
-    if (func_provided && !funcarg_provided)
-        elog(ERROR, "parquet_fdw: funcarg is required");
-
     if (!filename_provided && !func_provided)
-        elog(ERROR, "parquet_fdw: filename or func are required");
+        elog(ERROR, "parquet_fdw: filename or function is required");
 
     PG_RETURN_VOID();
 }
@@ -3416,9 +3454,6 @@ import_parquet_internal(const char *tablename, const char *schemaname,
      */
     if (res != (Datum) 0)
     {
-        int16   elem_len;
-        bool    elem_byval;
-        char    elem_align;
         Datum  *values;
         bool   *nulls;
         int     num;
@@ -3426,12 +3461,10 @@ import_parquet_internal(const char *tablename, const char *schemaname,
         List   *fields;
 
         arr = DatumGetArrayTypeP(res);
-        get_typlenbyvalalign(elem_type, &elem_len, &elem_byval, &elem_align);
+        if (ARR_ELEMTYPE(arr) != TEXTOID)
+            elog(ERROR, "function returned an array with non-TEXT element type");
 
-        deconstruct_array(arr, elem_type, elem_len, elem_byval, elem_align,
-                          &values, &nulls, &num);
-
-        /* TODO: check that there are no nulls */
+        deconstruct_array(arr, TEXTOID, -1, false, 'i', &values, &nulls, &num);
 
         if (num == 0)
         {
@@ -3444,7 +3477,11 @@ import_parquet_internal(const char *tablename, const char *schemaname,
         /* Convert values to cstring array */
         char **paths = (char **) palloc(num * sizeof(char *));
         for (int i = 0; i < num; ++i)
+        {
+            if (nulls[i])
+                elog(ERROR, "user function returned an array containing NULL value(s)");
             paths[i] = text_to_cstring(DatumGetTextP(values[i]));
+        }
 
         /*
          * If attributes dict is provided then parse it. Otherwise get the list

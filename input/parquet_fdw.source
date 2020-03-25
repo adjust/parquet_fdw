@@ -64,6 +64,43 @@ OPTIONS (filename '@abs_srcdir@/data/example1.parquet', sorted 'one');
 SELECT one FROM example_fail;
 SELECT two FROM example_fail;
 
+-- files_func
+CREATE FUNCTION list_parquet_files(args JSONB)
+RETURNS TEXT[] AS
+$$
+    SELECT ARRAY[args->>'dir' || '/example1.parquet', args->>'dir' || '/example2.parquet']::TEXT[];
+$$
+LANGUAGE SQL;
+CREATE FOREIGN TABLE example_func (one INT8, two INT8[], three TEXT)
+SERVER parquet_srv
+OPTIONS (
+    files_func 'list_parquet_files',
+    files_func_arg '{"dir": "@abs_srcdir@/data"}',
+    sorted 'one');
+SELECT * FROM example_func;
+
+-- invalid files_func options
+CREATE FUNCTION int_array_func(args JSONB)
+RETURNS INT[] AS
+$$ SELECT ARRAY[1,2,3]::INT[]; $$
+LANGUAGE SQL;
+CREATE FUNCTION no_args_func()
+RETURNS TEXT[] AS
+$$ SELECT ARRAY['@abs_srcdir@/data/example1.parquet']::TEXT[]; $$
+LANGUAGE SQL;
+CREATE FOREIGN TABLE example_inv_func (one INT8, two INT8[], three TEXT)
+SERVER parquet_srv
+OPTIONS (files_func 'int_array_func');
+CREATE FOREIGN TABLE example_inv_func (one INT8, two INT8[], three TEXT)
+SERVER parquet_srv
+OPTIONS (files_func 'no_args_func');
+CREATE FOREIGN TABLE example_inv_func (one INT8, two INT8[], three TEXT)
+SERVER parquet_srv
+OPTIONS (files_func 'list_parquet_files', files_func_arg 'invalid json');
+DROP FUNCTION list_parquet_files(JSONB);
+DROP FUNCTION int_array_func(JSONB);
+DROP FUNCTION no_args_func();
+
 -- sequential multifile reader
 CREATE FOREIGN TABLE example_seq (
     one     INT8,

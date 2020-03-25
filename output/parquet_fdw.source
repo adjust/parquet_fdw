@@ -146,7 +146,7 @@ DEBUG:  parquet_fdw: skip rowgroup 2
 SET client_min_messages = WARNING;
 CREATE FOREIGN TABLE example_fail (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv;
-ERROR:  parquet_fdw: filename is required
+ERROR:  parquet_fdw: filename or function is required
 CREATE FOREIGN TABLE example_fail (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv
 OPTIONS (filename 'nonexistent.parquet', some_option '123');
@@ -163,6 +163,61 @@ SELECT one FROM example_fail;
 ERROR:  parquet_fdw: incompatible types in column "one"; parquet column is of scalar type while postgres type is array
 SELECT two FROM example_fail;
 ERROR:  parquet_fdw: incompatible types in column "two"; parquet column is of type list while postgres type is scalar
+-- files_func
+CREATE FUNCTION list_parquet_files(args JSONB)
+RETURNS TEXT[] AS
+$$
+    SELECT ARRAY[args->>'dir' || '/example1.parquet', args->>'dir' || '/example2.parquet']::TEXT[];
+$$
+LANGUAGE SQL;
+CREATE FOREIGN TABLE example_func (one INT8, two INT8[], three TEXT)
+SERVER parquet_srv
+OPTIONS (
+    files_func 'list_parquet_files',
+    files_func_arg '{"dir": "/home/zilder/projects/parquet_fdw/data"}',
+    sorted 'one');
+SELECT * FROM example_func;
+ one |    two     | three 
+-----+------------+-------
+   1 | {1,2,3}    | foo
+   2 | {NULL,5,6} | bar
+   3 | {7,8,9}    | baz
+   4 | {10,11,12} | uno
+   5 | {13,14,15} | dos
+   6 | {16,17,18} | tres
+   1 | {19,20}    | eins
+   3 | {21,22}    | zwei
+   5 | {23,24}    | drei
+   7 | {25,26}    | vier
+   9 | {27,28}    | fünf
+(11 rows)
+
+-- invalid files_func options
+CREATE FUNCTION int_array_func(args JSONB)
+RETURNS INT[] AS
+$$ SELECT ARRAY[1,2,3]::INT[]; $$
+LANGUAGE SQL;
+CREATE FUNCTION no_args_func()
+RETURNS TEXT[] AS
+$$ SELECT ARRAY['/home/zilder/projects/parquet_fdw/data/example1.parquet']::TEXT[]; $$
+LANGUAGE SQL;
+CREATE FOREIGN TABLE example_inv_func (one INT8, two INT8[], three TEXT)
+SERVER parquet_srv
+OPTIONS (files_func 'int_array_func');
+ERROR:  return type of 'int_array_func' is integer[]; expected text[]
+CREATE FOREIGN TABLE example_inv_func (one INT8, two INT8[], three TEXT)
+SERVER parquet_srv
+OPTIONS (files_func 'no_args_func');
+ERROR:  function no_args_func(jsonb) does not exist
+CREATE FOREIGN TABLE example_inv_func (one INT8, two INT8[], three TEXT)
+SERVER parquet_srv
+OPTIONS (files_func 'list_parquet_files', files_func_arg 'invalid json');
+ERROR:  invalid input syntax for type json
+DETAIL:  Token "invalid" is invalid.
+CONTEXT:  JSON data, line 1: invalid...
+DROP FUNCTION list_parquet_files(JSONB);
+DROP FUNCTION int_array_func(JSONB);
+DROP FUNCTION no_args_func();
 -- sequential multifile reader
 CREATE FOREIGN TABLE example_seq (
     one     INT8,
