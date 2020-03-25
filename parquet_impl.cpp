@@ -3302,30 +3302,22 @@ import_parquet_internal(const char *tablename, const char *schemaname,
     FmgrInfo    finfo;
     ArrayType  *arr;
     Oid         ret_type;
-    Oid         elem_type;
     List       *optlist;
     char       *query;
 
     validate_import_args(tablename, servername, funcid);
 
-    fmgr_info(funcid, &finfo);
-
-    ret_type = get_func_rettype(funcid);
-    if (!type_is_array(ret_type))
+    if ((ret_type = get_func_rettype(funcid)) != TEXTARRAYOID)
+    {
         elog(ERROR,
-             "return type of '%s' function must be array",
-             get_func_name(funcid));
-
-    if ((elem_type = get_element_type(ret_type)) == InvalidOid)
-        elog(ERROR,
-             "return type of '%s' function must be array of TEXT elements",
-             get_func_name(funcid));
+             "return type of '%s' function is %s; expected text[]",
+             get_func_name(funcid), format_type_be(ret_type));
+    }
 
     optlist = jsonb_to_options_list(options);
 
-    /* TODO: other validations: input arg is JSONB */
-
     /* Call the user provided function */
+    fmgr_info(funcid, &finfo);
     res = FunctionCall1(&finfo, (Datum) arg);
 
     /*
@@ -3335,9 +3327,6 @@ import_parquet_internal(const char *tablename, const char *schemaname,
      */
     if (res != (Datum) 0)
     {
-        int16   elem_len;
-        bool    elem_byval;
-        char    elem_align;
         Datum  *values;
         bool   *nulls;
         int     num;
@@ -3345,12 +3334,7 @@ import_parquet_internal(const char *tablename, const char *schemaname,
         List   *fields;
 
         arr = DatumGetArrayTypeP(res);
-        get_typlenbyvalalign(elem_type, &elem_len, &elem_byval, &elem_align);
-
-        deconstruct_array(arr, elem_type, elem_len, elem_byval, elem_align,
-                          &values, &nulls, &num);
-
-        /* TODO: check that there are no nulls */
+        deconstruct_array(arr, TEXTOID, -1, false, 'i', &values, &nulls, &num);
 
         if (num == 0)
         {
@@ -3363,7 +3347,11 @@ import_parquet_internal(const char *tablename, const char *schemaname,
         /* Convert values to cstring array */
         char **paths = (char **) palloc(num * sizeof(char *));
         for (int i = 0; i < num; ++i)
+        {
+            if (nulls[i])
+                elog(ERROR, "user function returned an array containing NULL value(s)");
             paths[i] = text_to_cstring(DatumGetTextP(values[i]));
+        }
 
         /*
          * If attributes dict is provided then parse it. Otherwise get the list
