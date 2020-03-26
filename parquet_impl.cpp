@@ -2127,15 +2127,25 @@ parse_attributes_list(char *start, Oid relid)
 static Datum
 OidFunctionCall1NullableArg(Oid functionId, Datum arg, bool argisnull)
 {
+#if PG_VERSION_NUM < 120000
+    FunctionCallInfoData    _fcinfo;
+    FunctionCallInfoData    *fcinfo = &_fcinfo;
+#else
+	LOCAL_FCINFO(fcinfo, 1);
+#endif
     FmgrInfo    flinfo;
-    LOCAL_FCINFO(fcinfo, 1);
     Datum		result;
 
     fmgr_info(functionId, &flinfo);
     InitFunctionCallInfoData(*fcinfo, &flinfo, 1, InvalidOid, NULL, NULL);
 
+#if PG_VERSION_NUM < 120000
+    fcinfo->arg[0] = arg;
+    fcinfo->argnull[0] = false;
+#else
     fcinfo->args[0].value = arg;
     fcinfo->args[0].isnull = argisnull;
+#endif
 
     result = FunctionCallInvoke(fcinfo);
 
@@ -2161,7 +2171,13 @@ get_filenames_from_userfunc(const char *funcname, const char *funcarg)
     ArrayType  *arr;
 
     if (funcarg)
+    {
+#if PG_VERSION_NUM < 110000
+        j = DatumGetJsonb(DirectFunctionCall1(jsonb_in, CStringGetDatum(funcarg)));
+#else
         j = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(funcarg)));
+#endif
+    }
 
     funcid = LookupFuncName(f, 1, &jsonboid, false);
     filenames = OidFunctionCall1NullableArg(funcid, (Datum) j, funcarg == NULL);

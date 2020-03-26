@@ -174,7 +174,7 @@ CREATE FOREIGN TABLE example_func (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv
 OPTIONS (
     files_func 'list_parquet_files',
-    files_func_arg '{"dir": "/home/zilder/projects/parquet_fdw/data"}',
+    files_func_arg '{"dir": "@abs_srcdir@/data"}',
     sorted 'one');
 SELECT * FROM example_func;
  one |    two     | three 
@@ -199,7 +199,7 @@ $$ SELECT ARRAY[1,2,3]::INT[]; $$
 LANGUAGE SQL;
 CREATE FUNCTION no_args_func()
 RETURNS TEXT[] AS
-$$ SELECT ARRAY['/home/zilder/projects/parquet_fdw/data/example1.parquet']::TEXT[]; $$
+$$ SELECT ARRAY['@abs_srcdir@/data/example1.parquet']::TEXT[]; $$
 LANGUAGE SQL;
 CREATE FOREIGN TABLE example_inv_func (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv
