@@ -3421,30 +3421,22 @@ import_parquet_internal(const char *tablename, const char *schemaname,
     FmgrInfo    finfo;
     ArrayType  *arr;
     Oid         ret_type;
-    Oid         elem_type;
     List       *optlist;
     char       *query;
 
     validate_import_args(tablename, servername, funcid);
 
-    fmgr_info(funcid, &finfo);
-
-    ret_type = get_func_rettype(funcid);
-    if (!type_is_array(ret_type))
+    if ((ret_type = get_func_rettype(funcid)) != TEXTARRAYOID)
+    {
         elog(ERROR,
-             "return type of '%s' function must be array",
-             get_func_name(funcid));
-
-    if ((elem_type = get_element_type(ret_type)) == InvalidOid)
-        elog(ERROR,
-             "return type of '%s' function must be array of TEXT elements",
-             get_func_name(funcid));
+             "return type of '%s' function is %s; expected text[]",
+             get_func_name(funcid), format_type_be(ret_type));
+    }
 
     optlist = jsonb_to_options_list(options);
 
-    /* TODO: other validations: input arg is JSONB */
-
     /* Call the user provided function */
+    fmgr_info(funcid, &finfo);
     res = FunctionCall1(&finfo, (Datum) arg);
 
     /*
@@ -3461,9 +3453,6 @@ import_parquet_internal(const char *tablename, const char *schemaname,
         List   *fields;
 
         arr = DatumGetArrayTypeP(res);
-        if (ARR_ELEMTYPE(arr) != TEXTOID)
-            elog(ERROR, "function returned an array with non-TEXT element type");
-
         deconstruct_array(arr, TEXTOID, -1, false, 'i', &values, &nulls, &num);
 
         if (num == 0)
