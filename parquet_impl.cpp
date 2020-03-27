@@ -495,9 +495,7 @@ public:
             }
         }
 
-        /* TODO: use c++ compatible allocator */
         this->has_nulls = (bool *) exc_palloc(sizeof(bool) * this->map.size());
-
         this->allocator = new FastAllocator(cxt);
     }
 
@@ -671,7 +669,6 @@ public:
                 }
                 else
                 {
-                    /* TODO: do this during initialization stage */
                     if (!OidIsValid(pg_type->elem_type))
                     {
                         throw std::runtime_error("parquet_fdw: cannot convert parquet column of type "
@@ -1299,12 +1296,6 @@ private:
     bool                slots_initialized;
 
 private:
-    bool FileTupleCmp(FileSlot &a, FileSlot &b)
-    {
-        /* TODO */
-        return true;
-    }
-
     /* 
      * Compares two slots according to sort keys. Returns true if a > b,
      * false otherwise. The function is stolen from nodeGatherMerge.c
@@ -1421,10 +1412,6 @@ public:
                     fs.reader_id = i;
                     slots.push_back(fs);
                 }
-                else
-                {
-                    /* TODO: remove from readers */
-                }
                 ++i;
             }
             std::make_heap(slots.begin(), slots.end(), cmp);
@@ -1455,6 +1442,7 @@ public:
         }
         else
         {
+            /* Finished reading from this reader */
 #if PG_VERSION_NUM < 110000
             PG_TRY();
             {
@@ -1468,7 +1456,6 @@ public:
             if (error)
                 throw std::runtime_error("failed to drop a tuple slot");
 #endif
-            /* TODO: remove from readers */
             std::pop_heap(slots.begin(), slots.end(), cmp);
             slots.pop_back();
         }
@@ -1614,8 +1601,12 @@ extract_rowgroup_filters(List *scan_clauses,
             .strategy = strategy,
         };
 
-        /* TODO: potentially this may throw exceptions */
-        filters.push_back(f);
+        /* potentially inserting elements may throw exceptions */
+        try {
+            filters.push_back(f);
+        } catch (std::exception &e) {
+            elog(ERROR, "extracting row filters failed: %s", e.what());
+        }
     }
 }
 
@@ -2494,7 +2485,6 @@ parquetGetForeignPlan(PlannerInfo *root,
     while ((attr = bms_next_member(fdw_private->attrs_used, attr)) >= 0)
         attrs_used = lappend_int(attrs_used, attr);
 
-    /* TODO: make sure that attrs_sorted is subset of attrs_used */
     foreach (lc, fdw_private->attrs_sorted)
         attrs_sorted = lappend_int(attrs_sorted, lfirst_int(lc));
 
