@@ -1,5 +1,6 @@
 SET datestyle = 'ISO';
 SET client_min_messages = WARNING;
+SET log_statement TO 'none';
 CREATE EXTENSION parquet_fdw;
 DROP ROLE IF EXISTS regress_parquet_fdw;
 CREATE ROLE regress_parquet_fdw LOGIN SUPERUSER;
@@ -43,19 +44,19 @@ select import_parquet('example_import', 'public', 'parquet_srv', 'list_parquet_f
 (1 row)
 
 SELECT * FROM example_import ORDER BY one, three;
- one |    two     | three |        four         |    five    | six 
------+------------+-------+---------------------+------------+-----
-   1 | {19,20}    | eins  | 2018-01-01 00:00:00 | 2018-01-01 | t
-   1 | {1,2,3}    | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t
-   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f
-   3 | {7,8,9}    | baz   | 2018-01-03 00:00:00 | 2018-01-03 | t
-   3 | {21,22}    | zwei  | 2018-01-03 00:00:00 | 2018-01-03 | f
-   4 | {10,11,12} | uno   | 2018-01-04 00:00:00 | 2018-01-04 | f
-   5 | {13,14,15} | dos   | 2018-01-05 00:00:00 | 2018-01-05 | f
-   5 | {23,24}    | drei  | 2018-01-05 00:00:00 | 2018-01-05 | t
-   6 | {16,17,18} | tres  | 2018-01-06 00:00:00 | 2018-01-06 | f
-   7 | {25,26}    | vier  | 2018-01-07 00:00:00 | 2018-01-07 | f
-   9 | {27,28}    | fünf  | 2018-01-09 00:00:00 | 2018-01-09 | t
+ one |    two     | three |        four         |    five    | six | seven 
+-----+------------+-------+---------------------+------------+-----+-------
+   1 | {19,20}    | eins  | 2018-01-01 00:00:00 | 2018-01-01 | t   |      
+   1 | {1,2,3}    | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t   |   0.5
+   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f   |      
+   3 | {7,8,9}    | baz   | 2018-01-03 00:00:00 | 2018-01-03 | t   |     1
+   3 | {21,22}    | zwei  | 2018-01-03 00:00:00 | 2018-01-03 | f   |      
+   4 | {10,11,12} | uno   | 2018-01-04 00:00:00 | 2018-01-04 | f   |   0.5
+   5 | {13,14,15} | dos   | 2018-01-05 00:00:00 | 2018-01-05 | f   |      
+   5 | {23,24}    | drei  | 2018-01-05 00:00:00 | 2018-01-05 | t   |      
+   6 | {16,17,18} | tres  | 2018-01-06 00:00:00 | 2018-01-06 | f   |     1
+   7 | {25,26}    | vier  | 2018-01-07 00:00:00 | 2018-01-07 | f   |      
+   9 | {27,28}    | fünf  | 2018-01-09 00:00:00 | 2018-01-09 | t   |      
 (11 rows)
 
 select import_parquet_explicit('example_import2', 'public', 'parquet_srv', array[['one', 'int8'], ['three', 'text'], ['six', 'bool']], 'list_parquet_files', '{"dir": "@abs_srcdir@/data"}', '{"sorted": "one"}');
