@@ -1,7 +1,7 @@
 /*
  * Parquet processing implementation
  */
-// basename comes from libgen.h on Linux,
+// basename comes from string.h on Linux,
 // but from libgen.h on other POSIX systems (see man basename)
 #ifndef GNU_SOURCE
 #include <libgen.h>
