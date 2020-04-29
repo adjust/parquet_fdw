@@ -1,5 +1,6 @@
 SET datestyle = 'ISO';
 SET client_min_messages = WARNING;
+SET log_statement TO 'none';
 CREATE EXTENSION parquet_fdw;
 DROP ROLE IF EXISTS regress_parquet_fdw;
 CREATE ROLE regress_parquet_fdw LOGIN SUPERUSER;
