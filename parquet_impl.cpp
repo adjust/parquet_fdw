@@ -840,7 +840,7 @@ public:
                 errdata = CopyErrorData();
                 FlushErrorState();
 
-                strncpy(errstr, errdata->message, ERROR_STR_LEN);
+                strncpy(errstr, errdata->message, ERROR_STR_LEN - 1);
                 FreeErrorData(errdata);
             }
             PG_END_TRY();
@@ -1031,7 +1031,7 @@ public:
                 errdata = CopyErrorData();
                 FlushErrorState();
 
-                strncpy(errstr, errdata->message, ERROR_STR_LEN);
+                strncpy(errstr, errdata->message, ERROR_STR_LEN - 1);
                 FreeErrorData(errdata);
             }
             PG_END_TRY();
@@ -1874,7 +1874,7 @@ extract_rowgroups_list(const char *filename,
                             errdata = CopyErrorData();
                             FlushErrorState();
 
-                            strncpy(errstr, errdata->message, ERROR_STR_LEN);
+                            strncpy(errstr, errdata->message, ERROR_STR_LEN - 1);
                             FreeErrorData(errdata);
                         }
                         PG_END_TRY();
@@ -2524,15 +2524,15 @@ parquetBeginForeignScan(ForeignScanState *node, int eflags)
 	EState         *estate = node->ss.ps.state;
     List           *fdw_private = plan->fdw_private;
     List           *attrs_list;
-    List           *rowgroups_list;
+    List           *rowgroups_list = NIL;
     ListCell       *lc, *lc2;
-    List           *filenames;
+    List           *filenames = NIL;
     std::set<int>   attrs_used;
-    List           *attrs_sorted;
-    bool            use_mmap;
-    bool            use_threads;
+    List           *attrs_sorted = NIL;
+    bool            use_mmap = false;
+    bool            use_threads = false;
     int             i = 0;
-    ReaderType      reader_type;
+    ReaderType      reader_type = RT_SINGLE;
 
     /* Unwrap fdw_private */
     foreach (lc, fdw_private)
@@ -3227,48 +3227,41 @@ jsonb_to_options_list(Jsonb *options)
 }
 
 static List *
-array_to_fields_list(ArrayType *arr)
+array_to_fields_list(ArrayType *attnames, ArrayType *atttypes)
 {
     List   *res = NIL;
-    int     ndims = ARR_NDIM(arr);
-    int    *dims = ARR_DIMS(arr);
-    Oid     elem_type = ARR_ELEMTYPE(arr);
-    int16   elem_len;
-    bool    elem_byval;
-    char    elem_align;
-    Datum  *values;
+    Datum  *names;
+    Datum  *types;
     bool   *nulls;
-    int     num;
+    int     nnames;
+    int     ntypes;
 
-    if (ndims != 2)
-        elog(ERROR, "expected 2-dimensional attributes array");
+    if (!attnames || !atttypes)
+        elog(ERROR, "attnames and atttypes arrays must not be NULL");
 
-    if (dims[1] != 2)
-        elog(ERROR, "each subarray expected to have 2 elements");
+    if (ARR_HASNULL(attnames))
+        elog(ERROR, "attnames array must not contain NULLs");
 
-    if (ARR_HASNULL(arr))
-        elog(ERROR, "attributes array must not contain NULLs");
+    if (ARR_HASNULL(atttypes))
+        elog(ERROR, "atttypes array must not contain NULLs");
 
-    get_typlenbyvalalign(elem_type, &elem_len, &elem_byval, &elem_align);
+    deconstruct_array(attnames, TEXTOID, -1, false, 'i', &names, &nulls, &nnames);
+    deconstruct_array(atttypes, REGTYPEOID, 4, true, 'i', &types, &nulls, &ntypes);
 
-    deconstruct_array(arr, elem_type, elem_len, elem_byval, elem_align,
-                      &values, &nulls, &num);
+    if (nnames != ntypes)
+        elog(ERROR, "attnames and attypes arrays must have same length");
 
-    for (int i = 0; i < dims[0]; ++i)
+    for (int i = 0; i < nnames; ++i)
     {
         FieldInfo  *field = (FieldInfo *) palloc(sizeof(FieldInfo));
         char       *attname;
-        char       *typname;
-        int         typmod;
-
-        attname = text_to_cstring(DatumGetTextP(values[i * 2]));
-        typname = text_to_cstring(DatumGetTextP(values[i * 2 + 1]));
+        attname = text_to_cstring(DatumGetTextP(names[i]));
 
         if (strlen(attname) >= NAMEDATALEN)
             elog(ERROR, "attribute name cannot be longer than %i", NAMEDATALEN - 1);
 
         strcpy(field->name, attname);
-        parseTypeString(typname, &field->oid, &typmod, false);
+        field->oid = types[i];
 
         res = lappend(res, field);
     }
@@ -3291,7 +3284,7 @@ validate_import_args(const char *tablename, const char *servername, Oid funcoid)
 
 static void
 import_parquet_internal(const char *tablename, const char *schemaname,
-                        const char *servername, ArrayType *attrs, Oid funcid,
+                        const char *servername, List *fields, Oid funcid,
                         Jsonb *arg, Jsonb *options) noexcept
 {
     Datum       res;
@@ -3327,7 +3320,6 @@ import_parquet_internal(const char *tablename, const char *schemaname,
         bool   *nulls;
         int     num;
         int     ret;
-        List   *fields;
 
         arr = DatumGetArrayTypeP(res);
         deconstruct_array(arr, TEXTOID, -1, false, 'i', &values, &nulls, &num);
@@ -3350,11 +3342,11 @@ import_parquet_internal(const char *tablename, const char *schemaname,
         }
 
         /*
-         * If attributes dict is provided then parse it. Otherwise get the list
+         * If attributes list is provided then use it. Otherwise get the list
          * from the first file provided by the user function. We trust the user
          * to provide a list of files with the same structure.
          */
-        fields = attrs ? array_to_fields_list(attrs) : extract_parquet_fields(paths[0]);
+        fields = fields ? fields : extract_parquet_fields(paths[0]);
 
         query = create_foreign_table_query(tablename, schemaname, servername,
                                            paths, num, fields, optlist);
@@ -3404,20 +3396,26 @@ import_parquet_with_attrs(PG_FUNCTION_ARGS)
     char       *tablename;
     char       *schemaname;
     char       *servername;
-    ArrayType  *attrs;
+    ArrayType  *attnames;
+    ArrayType  *atttypes;
     Oid         funcid;
     Jsonb      *arg;
     Jsonb      *options;
+    List       *fields;
 
     tablename = PG_ARGISNULL(0) ? NULL : text_to_cstring(PG_GETARG_TEXT_P(0));
     schemaname = PG_ARGISNULL(1) ? NULL : text_to_cstring(PG_GETARG_TEXT_P(1));
     servername = PG_ARGISNULL(2) ? NULL : text_to_cstring(PG_GETARG_TEXT_P(2));
-    attrs = PG_ARGISNULL(3) ? NULL : PG_GETARG_ARRAYTYPE_P(3);
-    funcid = PG_ARGISNULL(4) ? InvalidOid : PG_GETARG_OID(4);
-    arg = PG_ARGISNULL(5) ? NULL : PG_GETARG_JSONB_P(5);
-    options = PG_ARGISNULL(6) ? NULL : PG_GETARG_JSONB_P(6);
+    attnames = PG_ARGISNULL(3) ? NULL : PG_GETARG_ARRAYTYPE_P(3);
+    atttypes = PG_ARGISNULL(4) ? NULL : PG_GETARG_ARRAYTYPE_P(4);
+    funcid = PG_ARGISNULL(5) ? InvalidOid : PG_GETARG_OID(5);
+    arg = PG_ARGISNULL(6) ? NULL : PG_GETARG_JSONB_P(6);
+    options = PG_ARGISNULL(7) ? NULL : PG_GETARG_JSONB_P(7);
 
-    import_parquet_internal(tablename, schemaname, servername, attrs, funcid, arg, options);
+    fields = array_to_fields_list(attnames, atttypes);
+
+    import_parquet_internal(tablename, schemaname, servername, fields,
+                            funcid, arg, options);
 
     PG_RETURN_VOID();
 }
