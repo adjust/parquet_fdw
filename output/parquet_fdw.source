@@ -163,3 +163,31 @@ HINT:  parquet column is of scalar type while postgres type is array
 SELECT two FROM example2;
 ERROR:  parquet_fdw: incompatible types in column "two"
 HINT:  parquet column is of type list while postgres type is scalar
+-- multiple sorting keys
+CREATE FOREIGN TABLE example_multisort (
+    one     INT8,
+    two     INT8[],
+    three   TEXT,
+    four    TIMESTAMP,
+    five    DATE,
+    six     BOOL)
+SERVER parquet_srv
+OPTIONS (filename '@abs_srcdir@/data/example.parquet', sorted 'one five');
+EXPLAIN (COSTS OFF) SELECT * FROM example_multisort ORDER BY one, five;
+            QUERY PLAN             
+-----------------------------------
+ Foreign Scan on example_multisort
+   Row groups: 1, 2
+(2 rows)
+
+SELECT * FROM example_multisort ORDER BY one, five;
+ one |    two     | three |        four         |    five    | six 
+-----+------------+-------+---------------------+------------+-----
+   1 | {1,2,3}    | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t
+   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f
+   3 | {7,8,9}    | baz   | 2018-01-03 00:00:00 | 2018-01-03 | t
+   4 | {10,11,12} | uno   | 2018-01-04 00:00:00 | 2018-01-04 | f
+   5 | {13,14,15} | dos   | 2018-01-05 00:00:00 | 2018-01-05 | f
+   6 | {16,17,18} | tres  | 2018-01-06 00:00:00 | 2018-01-06 | f
+(6 rows)
+
