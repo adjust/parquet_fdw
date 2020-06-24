@@ -801,6 +801,12 @@ public:
                 res = TimestampGetDatum(ts);
                 break;
             }
+            case arrow::Type::TIME64:
+            {
+                arrow::Time64Array *tarray = (arrow::Time64Array *) array;
+                res = TimeADTGetDatum(tarray->Value(i));
+                break;
+            }
             case arrow::Type::DATE32:
             {
                 arrow::Date32Array *tsarray = (arrow::Date32Array *) array;
@@ -2190,6 +2196,8 @@ to_postgres_type(int arrow_type)
             return BYTEAOID;
         case arrow::Type::TIMESTAMP:
             return TIMESTAMPOID;
+        case arrow::Type::TIME64:
+            return TIMEOID;
         case arrow::Type::DATE32:
             return DATEOID;
         default:

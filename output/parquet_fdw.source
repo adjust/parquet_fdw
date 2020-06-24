@@ -15,18 +15,19 @@ CREATE FOREIGN TABLE example1 (
     four    TIMESTAMP,
     five    DATE,
     six     BOOL,
-    seven   FLOAT8)
+    seven   FLOAT8,
+    eight   TIME)
 SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/example1.parquet', sorted 'one');
 SELECT * FROM example1;
- one |    two     | three |        four         |    five    | six | seven 
------+------------+-------+---------------------+------------+-----+-------
-   1 | {1,2,3}    | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t   |   0.5
-   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f   |      
-   3 | {7,8,9}    | baz   | 2018-01-03 00:00:00 | 2018-01-03 | t   |     1
-   4 | {10,11,12} | uno   | 2018-01-04 00:00:00 | 2018-01-04 | f   |   0.5
-   5 | {13,14,15} | dos   | 2018-01-05 00:00:00 | 2018-01-05 | f   |      
-   6 | {16,17,18} | tres  | 2018-01-06 00:00:00 | 2018-01-06 | f   |     1
+ one |    two     | three |        four         |    five    | six | seven |      eight      
+-----+------------+-------+---------------------+------------+-----+-------+-----------------
+   1 | {1,2,3}    | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t   |   0.5 | 12:00:00
+   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f   |       | 13:14:15
+   3 | {7,8,9}    | baz   | 2018-01-03 00:00:00 | 2018-01-03 | t   |     1 | 16:17:18.005432
+   4 | {10,11,12} | uno   | 2018-01-04 00:00:00 | 2018-01-04 | f   |   0.5 | 12:00:00
+   5 | {13,14,15} | dos   | 2018-01-05 00:00:00 | 2018-01-05 | f   |       | 13:00:00
+   6 | {16,17,18} | tres  | 2018-01-06 00:00:00 | 2018-01-06 | f   |     1 | 14:00:00
 (6 rows)
 
 -- no explicit columns mentions
@@ -71,91 +72,91 @@ SET client_min_messages = DEBUG1;
 SELECT * FROM example1 WHERE one < 1;
 DEBUG:  parquet_fdw: skip rowgroup 1
 DEBUG:  parquet_fdw: skip rowgroup 2
- one | two | three | four | five | six | seven 
------+-----+-------+------+------+-----+-------
+ one | two | three | four | five | six | seven | eight 
+-----+-----+-------+------+------+-----+-------+-------
 (0 rows)
 
 SELECT * FROM example1 WHERE one <= 1;
 DEBUG:  parquet_fdw: skip rowgroup 2
- one |   two   | three |        four         |    five    | six | seven 
------+---------+-------+---------------------+------------+-----+-------
-   1 | {1,2,3} | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t   |   0.5
+ one |   two   | three |        four         |    five    | six | seven |  eight   
+-----+---------+-------+---------------------+------------+-----+-------+----------
+   1 | {1,2,3} | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t   |   0.5 | 12:00:00
 (1 row)
 
 SELECT * FROM example1 WHERE one > 6;
 DEBUG:  parquet_fdw: skip rowgroup 1
 DEBUG:  parquet_fdw: skip rowgroup 2
- one | two | three | four | five | six | seven 
------+-----+-------+------+------+-----+-------
+ one | two | three | four | five | six | seven | eight 
+-----+-----+-------+------+------+-----+-------+-------
 (0 rows)
 
 SELECT * FROM example1 WHERE one >= 6;
 DEBUG:  parquet_fdw: skip rowgroup 1
- one |    two     | three |        four         |    five    | six | seven 
------+------------+-------+---------------------+------------+-----+-------
-   6 | {16,17,18} | tres  | 2018-01-06 00:00:00 | 2018-01-06 | f   |     1
+ one |    two     | three |        four         |    five    | six | seven |  eight   
+-----+------------+-------+---------------------+------------+-----+-------+----------
+   6 | {16,17,18} | tres  | 2018-01-06 00:00:00 | 2018-01-06 | f   |     1 | 14:00:00
 (1 row)
 
 SELECT * FROM example1 WHERE one = 2;
 DEBUG:  parquet_fdw: skip rowgroup 2
- one |    two     | three |        four         |    five    | six | seven 
------+------------+-------+---------------------+------------+-----+-------
-   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f   |      
+ one |    two     | three |        four         |    five    | six | seven |  eight   
+-----+------------+-------+---------------------+------------+-----+-------+----------
+   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f   |       | 13:14:15
 (1 row)
 
 SELECT * FROM example1 WHERE one = 7;
 DEBUG:  parquet_fdw: skip rowgroup 1
 DEBUG:  parquet_fdw: skip rowgroup 2
- one | two | three | four | five | six | seven 
------+-----+-------+------+------+-----+-------
+ one | two | three | four | five | six | seven | eight 
+-----+-----+-------+------+------+-----+-------+-------
 (0 rows)
 
 SELECT * FROM example1 WHERE six = true;
 DEBUG:  parquet_fdw: skip rowgroup 2
- one |   two   | three |        four         |    five    | six | seven 
------+---------+-------+---------------------+------------+-----+-------
-   1 | {1,2,3} | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t   |   0.5
-   3 | {7,8,9} | baz   | 2018-01-03 00:00:00 | 2018-01-03 | t   |     1
+ one |   two   | three |        four         |    five    | six | seven |      eight      
+-----+---------+-------+---------------------+------------+-----+-------+-----------------
+   1 | {1,2,3} | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t   |   0.5 | 12:00:00
+   3 | {7,8,9} | baz   | 2018-01-03 00:00:00 | 2018-01-03 | t   |     1 | 16:17:18.005432
 (2 rows)
 
 SELECT * FROM example1 WHERE six = false;
- one |    two     | three |        four         |    five    | six | seven 
------+------------+-------+---------------------+------------+-----+-------
-   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f   |      
-   4 | {10,11,12} | uno   | 2018-01-04 00:00:00 | 2018-01-04 | f   |   0.5
-   5 | {13,14,15} | dos   | 2018-01-05 00:00:00 | 2018-01-05 | f   |      
-   6 | {16,17,18} | tres  | 2018-01-06 00:00:00 | 2018-01-06 | f   |     1
+ one |    two     | three |        four         |    five    | six | seven |  eight   
+-----+------------+-------+---------------------+------------+-----+-------+----------
+   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f   |       | 13:14:15
+   4 | {10,11,12} | uno   | 2018-01-04 00:00:00 | 2018-01-04 | f   |   0.5 | 12:00:00
+   5 | {13,14,15} | dos   | 2018-01-05 00:00:00 | 2018-01-05 | f   |       | 13:00:00
+   6 | {16,17,18} | tres  | 2018-01-06 00:00:00 | 2018-01-06 | f   |     1 | 14:00:00
 (4 rows)
 
 SELECT * FROM example1 WHERE seven < 0.9;
- one |    two     | three |        four         |    five    | six | seven 
------+------------+-------+---------------------+------------+-----+-------
-   1 | {1,2,3}    | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t   |   0.5
-   4 | {10,11,12} | uno   | 2018-01-04 00:00:00 | 2018-01-04 | f   |   0.5
+ one |    two     | three |        four         |    five    | six | seven |  eight   
+-----+------------+-------+---------------------+------------+-----+-------+----------
+   1 | {1,2,3}    | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t   |   0.5 | 12:00:00
+   4 | {10,11,12} | uno   | 2018-01-04 00:00:00 | 2018-01-04 | f   |   0.5 | 12:00:00
 (2 rows)
 
 SELECT * FROM example1 WHERE seven IS NULL;
- one |    two     | three |        four         |    five    | six | seven 
------+------------+-------+---------------------+------------+-----+-------
-   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f   |      
-   5 | {13,14,15} | dos   | 2018-01-05 00:00:00 | 2018-01-05 | f   |      
+ one |    two     | three |        four         |    five    | six | seven |  eight   
+-----+------------+-------+---------------------+------------+-----+-------+----------
+   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f   |       | 13:14:15
+   5 | {13,14,15} | dos   | 2018-01-05 00:00:00 | 2018-01-05 | f   |       | 13:00:00
 (2 rows)
 
 -- prepared statements
 prepare prep(date) as select * from example1 where five < $1;
 execute prep('2018-01-03');
 DEBUG:  parquet_fdw: skip rowgroup 2
- one |    two     | three |        four         |    five    | six | seven 
------+------------+-------+---------------------+------------+-----+-------
-   1 | {1,2,3}    | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t   |   0.5
-   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f   |      
+ one |    two     | three |        four         |    five    | six | seven |  eight   
+-----+------------+-------+---------------------+------------+-----+-------+----------
+   1 | {1,2,3}    | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t   |   0.5 | 12:00:00
+   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f   |       | 13:14:15
 (2 rows)
 
 execute prep('2018-01-01');
 DEBUG:  parquet_fdw: skip rowgroup 1
 DEBUG:  parquet_fdw: skip rowgroup 2
- one | two | three | four | five | six | seven 
------+-----+-------+------+------+-----+-------
+ one | two | three | four | five | six | seven | eight 
+-----+-----+-------+------+------+-----+-------+-------
 (0 rows)
 
 -- invalid options
