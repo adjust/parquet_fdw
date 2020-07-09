@@ -1,6 +1,4 @@
-[![Build Status](https://travis-ci.org/adjust/parquet_fdw.svg?branch=master)](https://travis-ci.org/adjust/parquet_fdw)
-
-[WIP]
+[![Build Status](https://travis-ci.org/adjust/parquet_fdw.svg?branch=master)](https://travis-ci.org/adjust/parquet_fdw) ![experimental](https://img.shields.io/badge/status-experimental-orange)
 
 # parquet_fdw
 
