@@ -2098,7 +2098,7 @@ parse_attributes_list(char *start, Oid relid)
 {
     List      *attrs = NIL;
     char      *token;
-    const char *delim = std::string(" ").c_str(); /* to satisfy g++ compiler */
+    const char *delim = " ";
     AttrNumber attnum;
 
     while ((token = strtok(start, delim)) != NULL)
