@@ -48,8 +48,8 @@ Now you should be able to create foreign table from Parquet files. Currently `pa
 Currently `parquet_fdw` doesn't support structs and nested lists.
 
 Following options are supported:
-* **filename** - path to Parquet file to read;
-* **sorted** - space separated list of columns that Parquet file is already sorted by; that would help postgres to avoid redundant sorting when running query with `ORDER BY` clause;
+* **filename** - space separated list of paths to Parquet files to read;
+* **sorted** - space separated list of columns that Parquet files are presorted by; that would help postgres to avoid redundant sorting when running query with `ORDER BY` clause or in other cases when having a presorted set is beneficial (Group Aggregate, Merge Join);
 * **use_mmap** - whether memory map operations will be used instead of file read operations (default `false`);
 * **use_threads** - enables `arrow`'s parallel columns decoding/decompression (default `false`).
 
@@ -73,14 +73,55 @@ options (
 ### Parallel queries
 `parquet_fdw` also supports [parallel query execution](https://www.postgresql.org/docs/current/parallel-query.html) (not to confuse with multi-threaded decoding feature of `arrow`). It is disabled by default; to enable it run `ANALYZE` command on the table. The reason behind this is that without statistics postgres may end up choosing a terrible parallel plan for certain queries which would be much worse than a serial one (e.g. grouping by a column with large number of distinct values).
 
-### Experimental
+### Import
 
 `parquet_fdw` also supports [`IMPORT FOREIGN SCHEMA`](https://www.postgresql.org/docs/current/sql-importforeignschema.html) command to discover parquet files in the specified directory on filesystem and create foreign tables according to those files. It can be used as follows:
 
-```
-IMPORT FOREIGN SCHEMA "/path/to/directory"
-FROM SERVER parquet_srv
-INTO public;
+```sql
+import foreign schema "/path/to/directory"
+from server parquet_srv
+into public;
 ```
 
 It is important that `remote_schema` here is a path to a local filesystem directory and is double quoted.
+
+Another way to import parquet files into foreign tables is to use `import_parquet` or `import_parquet_explicit`:
+
+```sql
+create function import_parquet(
+    tablename   text,
+    schemaname  text,
+    servername  text,
+    userfunc    regproc,
+    args        jsonb,
+    options     jsonb)
+
+create function import_parquet_explicit(
+    tablename   text,
+    schemaname  text,
+    servername  text,
+    attrs       text[],
+    userfunc    regproc,
+    args        jsonb,
+    options     jsonb)
+```
+
+The only difference between `import_parquet` and `import_parquet_explicit` is that the latter allows to specify a set of attributes (columns) to import. `attrs` here is a 2-dimensional text array of the form `[['column1', 'type1'], ['column2', 'type2']]` (see the example below).
+
+`userfunc` is a user-defined function. It must take a `jsonb` argument and return a text array of filesystem paths to parquet files to be imported. `args` is user-specified jsonb object that is passed to `userfunc` as its argument. A simple implementation of such function and its usage may look like this:
+
+```sql
+create function list_parquet_files(args jsonb)
+returns text[] as
+$$
+begin
+    return array_agg(args->>'dir' || '/' || filename)
+           from pg_ls_dir(args->>'dir') as files(filename)
+           where filename ~~ '%.parquet';
+end
+$$
+language plpgsql;
+
+select import_parquet_explicit('abc', 'public', 'parquet_srv', 'list_parquet_files', array[['one', 'int8'], ['three', 'text'], ['six', 'bool']], '{"dir": "/path/to/directory"}', '{"sorted": "id"}');
+```
+

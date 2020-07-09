@@ -45,4 +45,4 @@ script:
     - make installcheck
       
 after_failure:
-  - cat regression.diffs
+    - cat regression.diffs

@@ -1,9 +1,17 @@
 /*
  * Parquet processing implementation
  */
+// basename comes from string.h on Linux,
+// but from libgen.h on other POSIX systems (see man basename)
+#ifndef GNU_SOURCE
+#include <libgen.h>
+#endif
+
+#include <sys/stat.h>
 
 #include <list>
 #include <set>
+#include <mutex>
 
 #include "arrow/api.h"
 #include "arrow/io/api.h"
@@ -22,9 +30,12 @@ extern "C"
 #include "access/parallel.h"
 #include "access/sysattr.h"
 #include "access/nbtree.h"
+#include "access/reloptions.h"
+#include "catalog/pg_foreign_table.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
+#include "executor/spi.h"
 #include "executor/tuptable.h"
 #include "foreign/foreign.h"
 #include "foreign/fdwapi.h"
@@ -39,10 +50,13 @@ extern "C"
 #include "optimizer/restrictinfo.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_oper.h"
+#include "parser/parse_type.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
+#include "utils/jsonb.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/memdebug.h"
 #include "utils/rel.h"
 #include "utils/timestamp.h"
 #include "utils/typcache.h"
@@ -57,7 +71,13 @@ extern "C"
 #endif
 }
 
+
 #define SEGMENT_SIZE (1024 * 1024)
+
+#define ERROR_STR_LEN 512
+
+/* from costsize.c */
+#define LOG2(x)  (log(x) / 0.693147180559945)
 
 #define to_postgres_timestamp(tstype, i, ts)                    \
     switch ((tstype)->unit()) {                                 \
@@ -74,10 +94,58 @@ extern "C"
                  (tstype)->unit());                             \
     }
 
+#if PG_VERSION_NUM < 110000
+#define PG_GETARG_JSONB_P PG_GETARG_JSONB
+#endif
+
+
 static void find_cmp_func(FmgrInfo *finfo, Oid type1, Oid type2);
 static Datum bytes_to_postgres_type(const char *bytes, arrow::DataType *arrow_type);
+static Oid to_postgres_type(int arrow_type);
+static void destroy_parquet_state(void *arg);
 
 bool parquet_fdw_use_threads = true;
+
+/*
+ * exc_palloc
+ *      C++ specific memory allocator that utilizes postgres allocation sets.
+ */
+void *
+exc_palloc(Size size)
+{
+	/* duplicates MemoryContextAllocZero to avoid increased overhead */
+	void	   *ret;
+	MemoryContext context = CurrentMemoryContext;
+
+	AssertArg(MemoryContextIsValid(context));
+
+	if (!AllocSizeIsValid(size))
+		throw std::bad_alloc();
+
+	context->isReset = false;
+
+	ret = context->methods->alloc(context, size);
+	if (unlikely(ret == NULL))
+		throw std::bad_alloc();
+
+	VALGRIND_MEMPOOL_ALLOC(context, ret, size);
+
+	return ret;
+}
+
+struct Error : std::exception
+{
+    char text[1000];
+
+    Error(char const* fmt, ...) __attribute__((format(printf,2,3))) {
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(text, sizeof text, fmt, ap);
+        va_end(ap);
+    }
+
+    char const* what() const throw() { return text; }
+};
 
 /*
  * Restriction
@@ -89,18 +157,26 @@ struct RowGroupFilter
     int         strategy;
 };
 
+enum ReaderType
+{
+    RT_SINGLE = 0,
+    RT_MULTI,
+    RT_MULTI_MERGE
+};
+
 /*
  * Plain C struct for fdw_state
  */
 struct ParquetFdwPlanState
 {
-    char       *filename;
-    Bitmapset  *attrs_sorted;
-    Bitmapset  *attrs_used;    /* attributes actually used in query */
+    List       *filenames;
+    List       *attrs_sorted;
+    Bitmapset  *attrs_used;     /* attributes actually used in query */
     bool        use_mmap;
     bool        use_threads;
-    List       *rowgroups;
+    List       *rowgroups;      /* List of Lists (per filename) */
     uint64      ntuples;
+    ReaderType  type;
 };
 
 struct ChunkInfo
@@ -112,12 +188,152 @@ struct ChunkInfo
 
 struct ParallelCoordinator
 {
-    pg_atomic_uint32 next_rowgroup; 
+    std::mutex  lock;
+    int32       next_reader;
+    int32       next_rowgroup;
 };
 
-class ParquetFdwExecutionState
+
+static int
+get_arrow_list_elem_type(arrow::DataType *type)
 {
+    auto children = type->children();
+
+    Assert(children.size() == 1);
+    return children[0]->type()->id();
+}
+
+class FastAllocator
+{
+private:
+    /*
+     * Special memory segment to speed up bytea/Text allocations.
+     */
+    MemoryContext       segments_cxt;
+    char               *segment_start_ptr;
+    char               *segment_cur_ptr;
+    char               *segment_last_ptr;
+    std::list<char *>   garbage_segments;
 public:
+    FastAllocator(MemoryContext cxt)
+        : garbage_segments()
+    {
+        this->segments_cxt = cxt;
+        this->segment_start_ptr = NULL;
+        this->segment_cur_ptr = NULL;
+        this->segment_last_ptr = NULL;
+    }
+
+    /*
+     * fast_alloc
+     *      Preallocate a big memory segment and distribute blocks from it. When
+     *      segment is exhausted it is added to garbage_segments list and freed
+     *      on the next executor's iteration. If requested size is bigger that
+     *      SEGMENT_SIZE then just palloc is used.
+     */
+    inline void *fast_alloc(long size)
+    {
+        void   *ret;
+
+        Assert(size >= 0);
+
+        /* If allocation is bigger than segment then just palloc */
+        if (size > SEGMENT_SIZE)
+            return palloc(size);
+
+        size = MAXALIGN(size);
+
+        /* If there is not enough space in current segment create a new one */
+        if (this->segment_last_ptr - this->segment_cur_ptr < size)
+        {
+            MemoryContext oldcxt;
+
+            /*
+             * Recycle the last segment at the next iteration (if there
+             * was one)
+             */
+            if (this->segment_start_ptr)
+                this->garbage_segments.
+                    push_back(this->segment_start_ptr);
+
+            oldcxt = MemoryContextSwitchTo(this->segments_cxt);
+            this->segment_start_ptr = (char *) exc_palloc(SEGMENT_SIZE);
+            this->segment_cur_ptr = this->segment_start_ptr;
+            this->segment_last_ptr =
+                this->segment_start_ptr + SEGMENT_SIZE - 1;
+            MemoryContextSwitchTo(oldcxt);
+        }
+
+        ret = (void *) this->segment_cur_ptr;
+        this->segment_cur_ptr += size;
+
+        return ret;
+    }
+
+    void recycle(void)
+    {
+        /* recycle old segments if any */
+        if (!this->garbage_segments.empty())
+        {
+            bool    error = false;
+
+            PG_TRY();
+            {
+                for (auto it : this->garbage_segments)
+                    pfree(it);
+            }
+            PG_CATCH();
+            {
+                error = true;
+            }
+            PG_END_TRY();
+            if (error)
+                throw std::runtime_error("garbage segments recycle failed");
+
+            this->garbage_segments.clear();
+            elog(DEBUG1, "parquet_fdw: garbage segments recycled");
+        }
+    }
+
+    MemoryContext context()
+    {
+        return segments_cxt;
+    }
+};
+
+static char *
+tolowercase(const char *input, char *output)
+{
+    int i = 0;
+
+    Assert(strlen(input) < 254);
+
+    do
+    {
+        output[i] = tolower(input[i]);
+    }
+    while (input[i++]);
+
+    return output;
+}
+
+class ParquetFdwReader
+{
+private:
+    struct PgTypeInfo
+    {
+        Oid     oid;
+
+        /* For array types. elem_type == InvalidOid means type is not an array */
+        Oid     elem_type;
+        int16   elem_len;
+        bool    elem_byval;
+        char    elem_align;
+    };
+public:
+    /* id needed for parallel execution */
+    int32                           reader_id;
+
     std::unique_ptr<parquet::arrow::FileReader> reader;
 
     std::shared_ptr<arrow::Schema>  schema;
@@ -147,6 +363,8 @@ public:
     std::vector<arrow::Array *>     chunks;
     std::vector<arrow::DataType *>  types;
 
+    std::vector<PgTypeInfo>         pg_types;
+
     bool           *has_nulls;          /* per-column info on nulls */
 
     int             row_group;          /* current row group index */
@@ -165,18 +383,7 @@ public:
      */
     std::vector<int>                rowgroups;
 
-    /*
-     * Special memory segment to speed up bytea/Text allocations.
-     */
-    MemoryContext                   segments_cxt;
-    char                           *segment_start_ptr;
-    char                           *segment_cur_ptr;
-    char                           *segment_last_ptr;
-    std::list<char *>               garbage_segments;
-
-    /* Callback to delete this state object in case of ERROR */
-    MemoryContextCallback           callback;
-    bool                            autodestroy;
+    FastAllocator                  *allocator;
 
     /* Coordinator for parallel query execution */
     ParallelCoordinator            *coordinator;
@@ -184,184 +391,1113 @@ public:
     /* Wether object is properly initialized */
     bool     initialized;
 
-    ParquetFdwExecutionState(const char *filename, bool use_mmap)
-        : row_group(-1), row(0), num_rows(0), coordinator(NULL),
-          initialized(false)
+    ParquetFdwReader(int reader_id)
+        : reader_id(reader_id), row_group(-1), row(0), num_rows(0),
+          coordinator(NULL), initialized(false)
+    { }
+
+    ~ParquetFdwReader()
     {
-        parquet::arrow::FileReader::Make(
-                arrow::default_memory_pool(),
-                parquet::ParquetFileReader::OpenFile(filename, use_mmap),
-                &reader
-        );
+        if (allocator)
+            delete allocator;
     }
-};
 
-static void
-destroy_parquet_state(void *arg)
-{
-    ParquetFdwExecutionState *festate = (ParquetFdwExecutionState *) arg;
-
-    if (festate->autodestroy)
-        delete festate;
-}
-
-static ParquetFdwExecutionState *
-create_parquet_state(const char *filename,
-                     TupleDesc tupleDesc,
-                     MemoryContext parent_cxt,
-                     std::set<int> &attrs_used,
-                     bool use_mmap,
-                     bool use_threads)
-{
-    ParquetFdwExecutionState *festate;
-
-    festate = new ParquetFdwExecutionState(filename, use_mmap);
-    auto schema = festate->reader->parquet_reader()->metadata()->schema();
-    parquet::ArrowReaderProperties props;
-
-    if (!parquet::arrow::FromParquetSchema(schema, props, &festate->schema).ok())
-        elog(ERROR, "parquet_fdw: error reading parquet schema");
-
-    /* Enable parallel columns decoding/decompression if needed */
-    festate->reader->set_use_threads(use_threads && parquet_fdw_use_threads);
- 
-    /* Create mapping between tuple descriptor and parquet columns. */
-    festate->map.resize(tupleDesc->natts);
-    for (int i = 0; i < tupleDesc->natts; i++)
+    void open(const char *filename,
+              MemoryContext cxt,
+              TupleDesc tupleDesc,
+              std::set<int> &attrs_used,
+              bool use_threads,
+              bool use_mmap)
     {
-        AttrNumber attnum = i + 1 - FirstLowInvalidHeapAttributeNumber;
+        parquet::ArrowReaderProperties props;
+        arrow::Status   status;
+        std::unique_ptr<parquet::arrow::FileReader> reader;
 
-        festate->map[i] = -1;
+        status = parquet::arrow::FileReader::Make(
+                        arrow::default_memory_pool(),
+                        parquet::ParquetFileReader::OpenFile(filename, use_mmap),
+                        &reader);
+        if (!status.ok())
+            throw Error("failed to open Parquet file %s",
+                                 status.message().c_str());
+        this->reader = std::move(reader);
 
-        /* Skip columns we don't intend to use in query */
-        if (attrs_used.find(attnum) == attrs_used.end())
-            continue;
+        auto    schema = this->reader->parquet_reader()->metadata()->schema();
+        if (!parquet::arrow::FromParquetSchema(schema, props, &this->schema).ok())
+            throw Error("error reading parquet schema");
 
-        for (int k = 0; k < schema->num_columns(); k++)
+        /* Enable parallel columns decoding/decompression if needed */
+        this->reader->set_use_threads(use_threads && parquet_fdw_use_threads);
+
+        /* Create mapping between tuple descriptor and parquet columns. */
+        this->map.resize(tupleDesc->natts);
+        for (int i = 0; i < tupleDesc->natts; i++)
         {
-            parquet::schema::NodePtr node = schema->Column(k)->schema_node();
-            std::vector<std::string> path = node->path()->ToDotVector();
+            AttrNumber  attnum = i + 1 - FirstLowInvalidHeapAttributeNumber;
+            char        pg_colname[255];
 
-            /*
-             * Compare postgres attribute name to the top level column name in
-             * parquet.
-             *
-             * XXX If we will ever want to support structs then this should be
-             * changed.
-             */
-            if (strcmp(NameStr(TupleDescAttr(tupleDesc, i)->attname),
-                       path[0].c_str()) == 0)
+            this->map[i] = -1;
+
+            /* Skip columns we don't intend to use in query */
+            if (attrs_used.find(attnum) == attrs_used.end())
+                continue;
+
+            tolowercase(NameStr(TupleDescAttr(tupleDesc, i)->attname), pg_colname);
+
+            for (int k = 0; k < schema->num_columns(); k++)
             {
-                /* Found mapping! */
-                festate->indices.push_back(k);
+                parquet::schema::NodePtr node = schema->Column(k)->schema_node();
+                std::vector<std::string> path = node->path()->ToDotVector();
+                char    parquet_colname[255];
 
-                /* index of last element */
-                festate->map[i] = festate->indices.size() - 1; 
+                tolowercase(path[0].c_str(), parquet_colname);
 
-                festate->types.push_back(festate->schema->field(k)->type().get());
-                break;
+                /*
+                 * Compare postgres attribute name to the top level column name in
+                 * parquet.
+                 *
+                 * XXX If we will ever want to support structs then this should be
+                 * changed.
+                 */
+                if (strcmp(pg_colname, parquet_colname) == 0)
+                {
+                    PgTypeInfo  typinfo;
+                    bool        error = false;
+
+                    /* Found mapping! */
+                    this->indices.push_back(k);
+
+                    /* index of last element */
+                    this->map[i] = this->indices.size() - 1;
+
+                    this->types.push_back(this->schema->field(k)->type().get());
+
+                    /* Find the element type in case the column type is array */
+                    PG_TRY();
+                    {
+                        typinfo.oid = TupleDescAttr(tupleDesc, i)->atttypid;
+                        typinfo.elem_type = get_element_type(typinfo.oid);
+
+                        if (OidIsValid(typinfo.elem_type))
+                        {
+                            get_typlenbyvalalign(typinfo.elem_type,
+                                                 &typinfo.elem_len,
+                                                 &typinfo.elem_byval,
+                                                 &typinfo.elem_align);
+                        }
+                    }
+                    PG_CATCH();
+                    {
+                        error = true;
+                    }
+                    PG_END_TRY();
+
+                    if (error)
+                        throw Error("failed to get the element type of '%s' column", pg_colname);
+                    this->pg_types.push_back(typinfo);
+
+                    break;
+                }
+            }
+        }
+
+        this->has_nulls = (bool *) exc_palloc(sizeof(bool) * this->map.size());
+        this->allocator = new FastAllocator(cxt);
+    }
+
+    bool read_next_rowgroup(TupleDesc tupleDesc)
+    {
+        ParallelCoordinator        *coord;
+        arrow::Status               status;
+
+        coord = this->coordinator;
+
+        /*
+         * Use atomic increment for parallel query or just regular one for single
+         * threaded execution.
+         */
+        if (coord)
+        {
+            std::lock_guard<std::mutex> guard(coord->lock);
+            if (this->reader_id != (coord->next_reader - 1))
+                return false;
+            this->row_group = coord->next_rowgroup++;
+        }
+        else
+            this->row_group++;
+
+        /*
+         * row_group cannot be less than zero at this point so it is safe to cast
+         * it to unsigned int
+         */
+        if ((uint) this->row_group >= this->rowgroups.size())
+            return false;
+
+        int  rowgroup = this->rowgroups[this->row_group];
+        auto rowgroup_meta = this->reader
+                                ->parquet_reader()
+                                ->metadata()
+                                ->RowGroup(rowgroup);
+
+        /* Determine which columns has null values */
+        for (uint i = 0; i < this->map.size(); i++)
+        {
+            std::shared_ptr<parquet::Statistics>  stats;
+            int arrow_col = this->map[i];
+
+            if (arrow_col < 0)
+                continue;
+
+            stats = rowgroup_meta
+                ->ColumnChunk(this->indices[arrow_col])
+                ->statistics();
+
+            if (stats)
+                this->has_nulls[arrow_col] = (stats->null_count() > 0);
+            else
+                this->has_nulls[arrow_col] = true;
+        }
+
+        status = this->reader
+            ->RowGroup(rowgroup)
+            ->ReadTable(this->indices, &this->table);
+
+        if (!status.ok())
+            throw std::runtime_error(status.message().c_str());
+
+        if (!this->table)
+            throw std::runtime_error("got empty table");
+
+        /* TODO: don't clear each time */
+        this->chunk_info.clear();
+        this->chunks.clear();
+        for (int i = 0; i < tupleDesc->natts; i++)
+        {
+            if (this->map[i] >= 0)
+            {
+                ChunkInfo chunkInfo = { .chunk = 0, .pos = 0, .len = 0 };
+                auto column = this->table->column(this->map[i]);
+
+                this->chunk_info.push_back(chunkInfo);
+                this->chunks.push_back(column->chunk(0).get());
+            }
+        }
+
+        this->row = 0;
+        this->num_rows = this->table->num_rows();
+
+        return true;
+    }
+
+    bool next(TupleTableSlot *slot, bool fake=false)
+    {
+        allocator->recycle();
+
+        if (this->row >= this->num_rows)
+        {
+            /* Read next row group */
+            if (!this->read_next_rowgroup(slot->tts_tupleDescriptor))
+                return false;
+
+            /* Lookup cast funcs */
+            if (!this->initialized)
+                this->initialize_castfuncs(slot->tts_tupleDescriptor);
+        }
+
+        this->populate_slot(slot, fake);
+        this->row++;
+
+        return true;
+    }
+
+    /*
+     * populate_slot
+     *      Fill slot with the values from parquet row.
+     *
+     * If `fake` set to true the actual reading and populating the slot is skipped.
+     * The purpose of this feature is to correctly skip rows to collect sparse
+     * samples.
+     */
+    void populate_slot(TupleTableSlot *slot, bool fake=false)
+    {
+        /* Fill slot values */
+        for (int attr = 0; attr < slot->tts_tupleDescriptor->natts; attr++)
+        {
+            int arrow_col = this->map[attr];
+            /*
+             * We only fill slot attributes if column was referred in targetlist
+             * or clauses. In other cases mark attribute as NULL.
+             * */
+            if (arrow_col >= 0)
+            {
+                ChunkInfo &chunkInfo = this->chunk_info[arrow_col];
+                arrow::Array       *array = this->chunks[arrow_col];
+                arrow::DataType    *arrow_type = this->types[arrow_col];
+                int                 arrow_type_id = arrow_type->id();
+                PgTypeInfo         *pg_type = &this->pg_types[arrow_col];
+
+                chunkInfo.len = array->length();
+
+                if (chunkInfo.pos >= chunkInfo.len)
+                {
+                    auto column = this->table->column(arrow_col);
+
+                    /* There are no more chunks */
+                    if (++chunkInfo.chunk >= column->num_chunks())
+                        break;
+
+                    array = column->chunk(chunkInfo.chunk).get();
+                    this->chunks[arrow_col] = array;
+                    chunkInfo.pos = 0;
+                    chunkInfo.len = array->length();
+                }
+
+                /* Don't do actual reading data into slot in fake mode */
+                if (fake)
+                    continue;
+
+                /* Currently only primitive types and lists are supported */
+                if (arrow_type_id != arrow::Type::LIST)
+                {
+                    if (this->has_nulls[arrow_col] && array->IsNull(chunkInfo.pos))
+                    {
+                        slot->tts_isnull[attr] = true;
+                    }
+                    else
+                    {
+                        slot->tts_values[attr] = 
+                            this->read_primitive_type(array,
+                                                      arrow_type_id,
+                                                      chunkInfo.pos,
+                                                      this->castfuncs[attr]);
+                        slot->tts_isnull[attr] = false;
+                    }
+                }
+                else
+                {
+                    if (!OidIsValid(pg_type->elem_type))
+                    {
+                        throw std::runtime_error("parquet_fdw: cannot convert parquet column of type "
+                                                 "LIST to postgres column of scalar type");
+                    }
+                    arrow_type_id = get_arrow_list_elem_type(arrow_type);
+
+                    int64 pos = chunkInfo.pos;
+                    arrow::ListArray   *larray = (arrow::ListArray *) array;
+
+                    if (this->has_nulls[arrow_col] && array->IsNull(pos))
+                    {
+                        slot->tts_isnull[attr] = true;
+                    }
+                    else
+                    {
+                        std::shared_ptr<arrow::Array> slice =
+                            larray->values()->Slice(larray->value_offset(pos),
+                                                    larray->value_length(pos));
+
+                        slot->tts_values[attr] =
+                            this->nested_list_get_datum(slice.get(),
+                                                        arrow_type_id,
+                                                        pg_type,
+                                                        this->castfuncs[attr]);
+                        slot->tts_isnull[attr] = false;
+                    }
+                }
+
+                chunkInfo.pos++;
+            }
+            else
+            {
+                slot->tts_isnull[attr] = true;
             }
         }
     }
 
-    festate->has_nulls = (bool *) palloc(sizeof(bool) * festate->map.size());
-
-    festate->segments_cxt = AllocSetContextCreate(parent_cxt,
-                                                  "parquet_fdw tuple data",
-                                                  ALLOCSET_DEFAULT_SIZES);
-    festate->segment_start_ptr = NULL;
-    festate->segment_cur_ptr = NULL;
-    festate->segment_last_ptr = NULL;
+    void rescan(void)
+    {
+        this->row_group = 0;
+        this->row = 0;
+        this->num_rows = 0;
+    }
 
     /*
-     * Enable automatic execution state destruction by using memory context
-     * callback
+     * read_primitive_type
+     *      Returns primitive type value from arrow array
      */
-    festate->callback.func = destroy_parquet_state;
-    festate->callback.arg = (void *) festate;
-    MemoryContextRegisterResetCallback(festate->segments_cxt,
-                                       &festate->callback);
-    festate->autodestroy = true;
-
-    return festate;
-}
-
-/*
- * C interface functions
- */
-
-static Bitmapset *
-parse_attributes_list(char *start, Oid relid)
-{
-    Bitmapset *attrs = NULL;
-    char      *token;
-    const char *delim = " ";
-    AttrNumber attnum;
-
-    while ((token = strtok(start, delim)) != NULL)
+    Datum
+    read_primitive_type(arrow::Array *array,
+                        int type_id, int64_t i,
+                        FmgrInfo *castfunc)
     {
-        if ((attnum = get_attnum(relid, token)) == InvalidAttrNumber)
-            elog(ERROR, "paruqet_fdw: invalid attribute name '%s'", token);
-        attrs = bms_add_member(attrs, attnum);
-        start = NULL;
+        Datum   res;
+
+        /* Get datum depending on the column type */
+        switch (type_id)
+        {
+            case arrow::Type::BOOL:
+            {
+                arrow::BooleanArray *boolarray = (arrow::BooleanArray *) array;
+
+                res = BoolGetDatum(boolarray->Value(i));
+                break;
+            }
+            case arrow::Type::INT32:
+            {
+                arrow::Int32Array *intarray = (arrow::Int32Array *) array;
+                int value = intarray->Value(i);
+
+                res = Int32GetDatum(value);
+                break;
+            }
+            case arrow::Type::INT64:
+            {
+                arrow::Int64Array *intarray = (arrow::Int64Array *) array;
+                int64 value = intarray->Value(i);
+
+                res = Int64GetDatum(value);
+                break;
+            }
+            case arrow::Type::FLOAT:
+            {
+                arrow::FloatArray *farray = (arrow::FloatArray *) array;
+                float value = farray->Value(i);
+
+                res = Float4GetDatum(value);
+                break;
+            }
+            case arrow::Type::DOUBLE:
+            {
+                arrow::DoubleArray *darray = (arrow::DoubleArray *) array;
+                double value = darray->Value(i);
+
+                res = Float8GetDatum(value);
+                break;
+            }
+            case arrow::Type::STRING:
+            case arrow::Type::BINARY:
+            {
+                arrow::BinaryArray *binarray = (arrow::BinaryArray *) array;
+
+                int32_t vallen = 0;
+                const char *value = reinterpret_cast<const char*>(binarray->GetValue(i, &vallen));
+
+                /* Build bytea */
+                int64 bytea_len = vallen + VARHDRSZ;
+                bytea *b = (bytea *) this->allocator->fast_alloc(bytea_len);
+                SET_VARSIZE(b, bytea_len);
+                memcpy(VARDATA(b), value, vallen);
+
+                res = PointerGetDatum(b);
+                break;
+            }
+            case arrow::Type::TIMESTAMP:
+            {
+                /* TODO: deal with timezones */
+                TimestampTz ts;
+                arrow::TimestampArray *tsarray = (arrow::TimestampArray *) array;
+                auto tstype = (arrow::TimestampType *) array->type().get();
+
+                to_postgres_timestamp(tstype, tsarray->Value(i), ts);
+                res = TimestampGetDatum(ts);
+                break;
+            }
+            case arrow::Type::DATE32:
+            {
+                arrow::Date32Array *tsarray = (arrow::Date32Array *) array;
+                int32 d = tsarray->Value(i);
+
+                /*
+                 * Postgres date starts with 2000-01-01 while unix date (which
+                 * Parquet is using) starts with 1970-01-01. So we need to do
+                 * simple calculations here.
+                 */
+                res = DateADTGetDatum(d + (UNIX_EPOCH_JDATE - POSTGRES_EPOCH_JDATE));
+                break;
+            }
+            /* TODO: add other types */
+            default:
+                throw Error("parquet_fdw: unsupported column type: %d", type_id);
+        }
+
+        /* Call cast function if needed */
+        if (castfunc != NULL)
+        {
+            MemoryContext   ccxt = CurrentMemoryContext;
+            bool            error = false;
+            Datum           res;
+            char            errstr[ERROR_STR_LEN];
+
+            PG_TRY();
+            {
+                res = FunctionCall1(castfunc, res);
+            }
+            PG_CATCH();
+            {
+                ErrorData *errdata;
+
+                MemoryContextSwitchTo(ccxt);
+                error = true;
+                errdata = CopyErrorData();
+                FlushErrorState();
+
+                strncpy(errstr, errdata->message, ERROR_STR_LEN - 1);
+                FreeErrorData(errdata);
+            }
+            PG_END_TRY();
+            if (error)
+                throw std::runtime_error(errstr);
+        }
+
+        return res;
     }
 
-    return attrs;
-}
-
-static void
-get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
-{
-	ForeignTable *table;
-    ListCell     *lc;
-
-    fdw_private->use_mmap = false;
-    fdw_private->use_threads = false;
-    table = GetForeignTable(relid);
-    
-    foreach(lc, table->options)
+    /*
+     * nested_list_get_datum
+     *      Returns postgres array build from elements of array. Only one
+     *      dimensional arrays are supported.
+     */
+    Datum
+    nested_list_get_datum(arrow::Array *array, int arrow_type,
+                          PgTypeInfo *pg_type, FmgrInfo *castfunc)
     {
-		DefElem    *def = (DefElem *) lfirst(lc);
+        MemoryContext oldcxt;
+        ArrayType  *res;
+        Datum      *values;
+        bool       *nulls = NULL;
+        int         dims[1];
+        int         lbs[1];
+        bool        error = false;
 
-        if (strcmp(def->defname, "filename") == 0)
-            fdw_private->filename = defGetString(def);
-        else if (strcmp(def->defname, "sorted") == 0)
+        values = (Datum *) this->allocator->fast_alloc(sizeof(Datum) * array->length());
+
+#if SIZEOF_DATUM == 8
+        /* Fill values and nulls arrays */
+        if (array->null_count() == 0 && arrow_type == arrow::Type::INT64)
         {
-            fdw_private->attrs_sorted =
-                parse_attributes_list(defGetString(def), relid);
+            /*
+             * Ok, there are no nulls, so probably we could just memcpy the
+             * entire array.
+             *
+             * Warning: the code below is based on the assumption that Datum is
+             * 8 bytes long, which is true for most contemporary systems but this
+             * will not work on some exotic or really old systems.
+             */
+            copy_to_c_array<int64_t>((int64_t *) values, array, pg_type->elem_len);
+            goto construct_array;
         }
-        else if (strcmp(def->defname, "use_mmap") == 0)
-        { 
-            if (!parse_bool(defGetString(def), &fdw_private->use_mmap))
-                ereport(ERROR,
-                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                         errmsg("invalid value for boolean option \"%s\": %s",
-                                def->defname, defGetString(def))));
-        }
-        else if (strcmp(def->defname, "use_threads") == 0)
+#endif
+        for (int64_t i = 0; i < array->length(); ++i)
         {
-            if (!parse_bool(defGetString(def), &fdw_private->use_threads))
-                ereport(ERROR,
-                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                         errmsg("invalid value for boolean option \"%s\": %s",
-                                def->defname, defGetString(def))));
+            if (!array->IsNull(i))
+                values[i] = this->read_primitive_type(array, arrow_type, i, castfunc);
+            else
+            {
+                if (!nulls)
+                {
+                    Size size = sizeof(bool) * array->length();
+
+                    nulls = (bool *) this->allocator->fast_alloc(size);
+                    memset(nulls, 0, size);
+                }
+                nulls[i] = true;
+            }
+        }
+
+    construct_array:
+        /*
+         * Construct one dimensional array. We have to use PG_TRY / PG_CATCH
+         * to prevent any kind leaks of resources allocated by c++ in case of
+         * errors.
+         */
+        dims[0] = array->length();
+        lbs[0] = 1;
+        PG_TRY();
+        {
+            oldcxt = MemoryContextSwitchTo(allocator->context());
+            res = construct_md_array(values, nulls, 1, dims, lbs,
+                                     pg_type->elem_type, pg_type->elem_len,
+                                     pg_type->elem_byval, pg_type->elem_align);
+            MemoryContextSwitchTo(oldcxt);
+        }
+        PG_CATCH();
+        {
+            error = true;
+        }
+        PG_END_TRY();
+        if (error)
+            throw std::runtime_error("failed to constuct an array");
+
+        return PointerGetDatum(res);
+    }
+
+    /*
+     * initialize_castfuncs
+     *      Check wether implicit cast will be required and prepare cast function
+     *      call. For arrays find cast functions for its elements.
+     */
+    void initialize_castfuncs(TupleDesc tupleDesc)
+    {
+        this->castfuncs.resize(this->map.size());
+
+        for (uint i = 0; i < this->map.size(); ++i)
+        {
+            MemoryContext ccxt = CurrentMemoryContext;
+            int     arrow_col = this->map[i];
+            bool    error = false;
+            char    errstr[ERROR_STR_LEN];
+
+            if (this->map[i] < 0)
+            {
+                /* Null column */
+                this->castfuncs[i] = NULL;
+                continue;
+            }
+
+            arrow::DataType *type = this->types[arrow_col];
+            int     type_id = type->id();
+            int     src_type,
+                    dst_type;
+            bool    src_is_list,
+                    dst_is_array;
+            Oid     funcid;
+            CoercionPathType ct;
+
+            /* Find underlying type of list */
+            src_is_list = (type_id == arrow::Type::LIST);
+            if (src_is_list)
+                type_id = get_arrow_list_elem_type(type);
+
+            src_type = to_postgres_type(type_id);
+            dst_type = TupleDescAttr(tupleDesc, i)->atttypid;
+
+            if (!OidIsValid(src_type))
+                throw Error("unsupported column type: %s", type->name().c_str());
+
+            /* Find underlying type of array */
+            dst_is_array = type_is_array(dst_type);
+            if (dst_is_array)
+                dst_type = get_element_type(dst_type);
+
+            /* Make sure both types are compatible */
+            if (src_is_list != dst_is_array)
+            {
+                throw Error("incompatible types in column \"%s\"; %s",
+                            this->table->field(arrow_col)->name().c_str(),
+                            src_is_list ?
+                                "parquet column is of type list while postgres type is scalar" :
+                                "parquet column is of scalar type while postgres type is array");
+            }
+
+            PG_TRY();
+            {
+                if (IsBinaryCoercible(src_type, dst_type))
+                {
+                    this->castfuncs[i] = NULL;
+                    continue;
+                }
+
+                ct = find_coercion_pathway(dst_type,
+                                           src_type,
+                                           COERCION_EXPLICIT,
+                                           &funcid);
+                switch (ct)
+                {
+                    case COERCION_PATH_FUNC:
+                        {
+                            MemoryContext   oldctx;
+
+                            oldctx = MemoryContextSwitchTo(CurTransactionContext);
+                            this->castfuncs[i] = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
+                            fmgr_info(funcid, this->castfuncs[i]);
+                            MemoryContextSwitchTo(oldctx);
+                            break;
+                        }
+                    case COERCION_PATH_RELABELTYPE:
+                    case COERCION_PATH_COERCEVIAIO:  /* TODO: double check that we
+                                                      * shouldn't do anything here*/
+                        /* Cast is not needed */
+                        this->castfuncs[i] = NULL;
+                        break;
+                    default:
+                        elog(ERROR, "cast function is not found");
+                }
+            }
+            PG_CATCH();
+            {
+                ErrorData *errdata;
+
+                MemoryContextSwitchTo(ccxt);
+                error = true;
+                errdata = CopyErrorData();
+                FlushErrorState();
+
+                strncpy(errstr, errdata->message, ERROR_STR_LEN - 1);
+                FreeErrorData(errdata);
+            }
+            PG_END_TRY();
+            if (error)
+                throw std::runtime_error(errstr);
+        }
+        this->initialized = true;
+    }
+
+    /* 
+     * copy_to_c_array
+     *      memcpy plain values from Arrow array to a C array.
+     */
+    template<typename T> static inline void
+    copy_to_c_array(T *values, const arrow::Array *array, int elem_size)
+    {
+        const T *in = GetPrimitiveValues<T>(*array);
+
+        memcpy(values, in, elem_size * array->length());
+    }
+
+    /*
+     * GetPrimitiveValues
+     *      Get plain C value array. Copy-pasted from Arrow.
+     */
+    template <typename T>
+    static inline const T* GetPrimitiveValues(const arrow::Array& arr) {
+        if (arr.length() == 0) {
+            return nullptr;
+        }
+        const auto& prim_arr = arrow::internal::checked_cast<const arrow::PrimitiveArray&>(arr);
+        const T* raw_values = reinterpret_cast<const T*>(prim_arr.values()->data());
+        return raw_values + arr.offset();
+    }
+
+    void set_rowgroups_list(const std::vector<int> &rowgroups)
+    {
+        this->rowgroups = rowgroups;
+    }
+};
+
+class ParquetFdwExecutionState
+{
+public:
+    virtual ~ParquetFdwExecutionState() {};
+    virtual bool next(TupleTableSlot *slot, bool fake=false) = 0;
+    virtual void rescan(void) = 0;
+    virtual void add_file(const char *filename, List *rowgroups) = 0;
+    virtual void set_coordinator(ParallelCoordinator *coord) = 0;
+};
+
+class SingleFileExecutionState : public ParquetFdwExecutionState
+{
+private:
+    ParquetFdwReader   *reader;
+    MemoryContext       cxt;
+    TupleDesc           tupleDesc;
+    std::set<int>       attrs_used;
+    bool                use_mmap;
+    bool                use_threads;
+
+public:
+    MemoryContext       estate_cxt;
+
+    SingleFileExecutionState(MemoryContext cxt,
+                             TupleDesc tupleDesc,
+                             std::set<int> attrs_used,
+                             bool use_threads,
+                             bool use_mmap)
+        : cxt(cxt), tupleDesc(tupleDesc), attrs_used(attrs_used),
+          use_mmap(use_mmap), use_threads(use_threads)
+    { }
+
+    ~SingleFileExecutionState()
+    {
+        if (reader)
+            delete reader;
+    }
+
+    bool next(TupleTableSlot *slot, bool fake)
+    {
+        bool res;
+
+        if ((res = reader->next(slot, fake)) == true)
+            ExecStoreVirtualTuple(slot);
+
+        return res;
+    }
+
+    void rescan(void)
+    {
+        reader->rescan();
+    }
+
+    void add_file(const char *filename, List *rowgroups)
+    {
+        ListCell           *lc;
+        std::vector<int>    rg;
+        int                 reader_id = 0;
+
+        foreach (lc, rowgroups)
+            rg.push_back(lfirst_int(lc));
+
+        reader = new ParquetFdwReader(reader_id);
+        reader->open(filename, cxt, tupleDesc, attrs_used, use_threads, use_mmap);
+        reader->set_rowgroups_list(rg);
+    }
+
+    void set_coordinator(ParallelCoordinator *coord)
+    {
+        if (reader)
+            reader->coordinator = coord;
+    }
+};
+
+class MultifileExecutionState : public ParquetFdwExecutionState
+{
+private:
+    struct FileRowgroups
+    {
+        std::string         filename;
+        std::vector<int>    rowgroups;
+    };
+private:
+    ParquetFdwReader       *reader;
+
+    std::vector<FileRowgroups> files;
+    uint64_t                cur_reader;
+
+    MemoryContext           cxt;
+    TupleDesc               tupleDesc;
+    std::set<int>           attrs_used;
+    bool                    use_threads;
+    bool                    use_mmap;
+
+    ParallelCoordinator    *coord;
+
+private:
+    ParquetFdwReader *get_next_reader()
+    {
+        ParquetFdwReader *r;
+
+        if (coord)
+        {
+            std::lock_guard<std::mutex> guard(coord->lock);
+            cur_reader = coord->next_reader++;
+        }
+
+        if (cur_reader >= files.size())
+            return NULL;
+
+        r = new ParquetFdwReader(cur_reader);
+        r->open(files[cur_reader].filename.c_str(), cxt, tupleDesc, attrs_used, use_threads, use_mmap);
+        r->set_rowgroups_list(files[cur_reader].rowgroups);
+
+        cur_reader++;
+
+        return r;
+    }
+
+public:
+    MultifileExecutionState(MemoryContext cxt,
+                            TupleDesc tupleDesc,
+                            std::set<int> attrs_used,
+                            bool use_threads,
+                            bool use_mmap)
+        : reader(NULL), cur_reader(0), cxt(cxt), tupleDesc(tupleDesc),
+          attrs_used(attrs_used), use_threads(use_threads), use_mmap(use_mmap),
+          coord(NULL)
+    { }
+
+    ~MultifileExecutionState()
+    {
+        if (reader)
+            delete reader;
+    }
+
+    bool next(TupleTableSlot *slot, bool fake=false)
+    {
+        bool    res;
+
+        if (unlikely(reader == NULL))
+        {
+            if ((reader = this->get_next_reader()) == NULL)
+                return false;
+        }
+
+        res = reader->next(slot, fake);
+
+        /* Finished reading current reader? Proceed to the next one */
+        if (unlikely(!res))
+        {
+            while (true)
+            {
+                if (reader)
+                    delete reader;
+
+                reader = this->get_next_reader();
+                if (!reader)
+                    return false;
+                res = reader->next(slot, fake);
+                if (res)
+                    break;
+            }
+        }
+
+        if (res)
+        {
+            /*
+             * ExecStoreVirtualTuple doesn't throw postgres exceptions thus no
+             * need to wrap it into PG_TRY / PG_CATCH
+             */
+            ExecStoreVirtualTuple(slot);
+        }
+
+        return res;
+    }
+
+    void rescan(void)
+    {
+        reader->rescan();
+    }
+
+    void add_file(const char *filename, List *rowgroups)
+    {
+        FileRowgroups   fr;
+        ListCell       *lc;
+
+        fr.filename = filename;
+        foreach (lc, rowgroups)
+            fr.rowgroups.push_back(lfirst_int(lc));
+        files.push_back(fr);
+    }
+
+    void set_coordinator(ParallelCoordinator *coord)
+    {
+        this->coord = coord;
+    }
+};
+
+class MultifileMergeExecutionState : public ParquetFdwExecutionState
+{
+    struct FileSlot
+    {
+        int             reader_id;
+        TupleTableSlot *slot;
+    };
+    typedef std::vector<FileSlot> BinHeap;
+private:
+    std::vector<ParquetFdwReader *>   readers;
+
+    MemoryContext       cxt;
+    TupleDesc           tupleDesc;
+    std::set<int>       attrs_used;
+    std::list<SortSupportData> sort_keys;
+    bool                use_threads;
+    bool                use_mmap;
+
+    /*
+     * Heap is used to store tuples in prioritized manner along with file
+     * number. Priority is given to the tuples with minimal key. Once next
+     * tuple is requested it is being taken from the top of the heap and a new
+     * tuple from the same file is read and inserted back into the heap. Then
+     * heap is rebuilt to sustain its properties. The idea is taken from
+     * nodeGatherMerge.c in PostgreSQL but reimplemented using STL.
+     */
+    BinHeap             slots;
+    bool                slots_initialized;
+
+private:
+    /* 
+     * Compares two slots according to sort keys. Returns true if a > b,
+     * false otherwise. The function is stolen from nodeGatherMerge.c
+     * (postgres) and adapted.
+     */
+    bool compare_slots(FileSlot &a, FileSlot &b)
+    {
+        bool    error = false;
+
+        PG_TRY();
+        {
+            TupleTableSlot *s1 = a.slot;
+            TupleTableSlot *s2 = b.slot;
+
+            Assert(!TupIsNull(s1));
+            Assert(!TupIsNull(s2));
+
+            for (auto sort_key: sort_keys)
+            {
+                AttrNumber  attno = sort_key.ssup_attno;
+                Datum       datum1,
+                            datum2;
+                bool        isNull1,
+                            isNull2;
+                int         compare;
+
+                datum1 = slot_getattr(s1, attno, &isNull1);
+                datum2 = slot_getattr(s2, attno, &isNull2);
+
+                compare = ApplySortComparator(datum1, isNull1,
+                                              datum2, isNull2,
+                                              &sort_key);
+                if (compare != 0)
+                    return (compare > 0);
+            }
+        }
+        PG_CATCH();
+        {
+            error = true;
+        }
+        PG_END_TRY();
+
+        if (error)
+            throw std::runtime_error("slots comparison failed");
+
+        return false;
+    }
+
+public:
+    MultifileMergeExecutionState(MemoryContext cxt,
+                                 TupleDesc tupleDesc,
+                                 std::set<int> attrs_used,
+                                 std::list<SortSupportData> sort_keys,
+                                 bool use_threads,
+                                 bool use_mmap)
+        : cxt(cxt), tupleDesc(tupleDesc), attrs_used(attrs_used),
+          sort_keys(sort_keys), use_threads(use_threads), use_mmap(use_mmap),
+          slots_initialized(false)
+    { }
+
+    ~MultifileMergeExecutionState()
+    {
+#if PG_VERSION_NUM < 110000
+        /* Destroy tuple slots if any */
+        for (auto it: slots)
+            ExecDropSingleTupleTableSlot(it.slot);
+#endif
+
+        for (auto it: readers)
+            delete it;
+    }
+
+    bool next(TupleTableSlot *slot, bool fake=false)
+    {
+        bool error = false;
+        auto cmp = [this] (FileSlot &a, FileSlot &b) { return compare_slots(a, b); };
+
+        if (unlikely(!slots_initialized))
+        {
+            /* Initialize binary heap on the first run */
+            int i = 0;
+
+            for (auto reader: readers)
+            {
+                FileSlot    fs;
+                bool        error = false;
+
+                PG_TRY();
+                {
+                    MemoryContext oldcxt;
+
+                    oldcxt = MemoryContextSwitchTo(cxt);
+#if PG_VERSION_NUM < 110000
+                    fs.slot = MakeSingleTupleTableSlot(tupleDesc);
+#elif PG_VERSION_NUM < 120000
+                    fs.slot = MakeTupleTableSlot(tupleDesc);
+#else
+                    fs.slot = MakeTupleTableSlot(tupleDesc, &TTSOpsVirtual);
+#endif
+                    MemoryContextSwitchTo(oldcxt);
+                }
+                PG_CATCH();
+                {
+                    error = true;
+                }
+                PG_END_TRY();
+
+                if (error)
+                    throw std::runtime_error("failed to create a TupleTableSlot");
+
+                if (reader->next(fs.slot))
+                {
+                    ExecStoreVirtualTuple(fs.slot);
+                    fs.reader_id = i;
+                    slots.push_back(fs);
+                }
+                ++i;
+            }
+            std::make_heap(slots.begin(), slots.end(), cmp);
+            slots_initialized = true;
+        }
+
+        if (unlikely(slots.empty()))
+            return false;
+
+        const FileSlot &fs = slots.front();
+
+        PG_TRY();
+        {
+            ExecCopySlot(slot, fs.slot);
+            ExecClearTuple(fs.slot);
+        }
+        PG_CATCH();
+        {
+            error = true;
+        }
+        PG_END_TRY();
+        if (error)
+            throw std::runtime_error("failed to copy a virtual tuple slot");
+
+        if (readers[fs.reader_id]->next(fs.slot))
+        {
+            ExecStoreVirtualTuple(fs.slot);
         }
         else
-            elog(ERROR, "unknown option '%s'", def->defname);
+        {
+            /* Finished reading from this reader */
+#if PG_VERSION_NUM < 110000
+            PG_TRY();
+            {
+                ExecDropSingleTupleTableSlot(fs.slot);
+            }
+            PG_CATCH();
+            {
+                error = true;
+            }
+            PG_END_TRY();
+            if (error)
+                throw std::runtime_error("failed to drop a tuple slot");
+#endif
+            std::pop_heap(slots.begin(), slots.end(), cmp);
+            slots.pop_back();
+        }
+        std::make_heap(slots.begin(), slots.end(), cmp);
+        return true;
     }
-}
 
-extern "C" void
-parquetGetForeignRelSize(PlannerInfo *root,
-					  RelOptInfo *baserel,
-					  Oid foreigntableid)
-{
-    ParquetFdwPlanState *fdw_private;
+    void rescan(void)
+    {
+        /* TODO: clean binheap */
+        for (auto reader: readers)
+            reader->rescan();
+        slots.clear();
+        slots_initialized = false;
+    }
 
-    fdw_private = (ParquetFdwPlanState *) palloc0(sizeof(ParquetFdwPlanState));
-    get_table_options(foreigntableid, fdw_private);
-    baserel->fdw_private = fdw_private;
-}
+    void add_file(const char *filename, List *rowgroups)
+    {
+        ParquetFdwReader *r;
+        ListCell         *lc;
+        std::vector<int>    rg;
+
+        foreach (lc, rowgroups)
+            rg.push_back(lfirst_int(lc));
+
+        r = new ParquetFdwReader(0);
+        r->open(filename, cxt, tupleDesc, attrs_used, use_threads, use_mmap);
+        r->set_rowgroups_list(rg);
+        readers.push_back(r);
+    }
+
+    void set_coordinator(ParallelCoordinator *coord)
+    {
+        Assert(true);   /* not supported, should never happen */
+    }
+};
 
 /*
  * extract_rowgroup_filters
@@ -471,35 +1607,12 @@ extract_rowgroup_filters(List *scan_clauses,
             .strategy = strategy,
         };
 
-        filters.push_back(f);
-    }
-}
-
-static Oid
-to_postgres_type(int arrow_type)
-{
-    switch (arrow_type)
-    {
-        case arrow::Type::BOOL:
-            return BOOLOID;
-        case arrow::Type::INT32:
-            return INT4OID;
-        case arrow::Type::INT64:
-            return INT8OID;
-        case arrow::Type::FLOAT:
-            return FLOAT4OID;
-        case arrow::Type::DOUBLE:
-            return FLOAT8OID;
-        case arrow::Type::STRING:
-            return TEXTOID;
-        case arrow::Type::BINARY:
-            return BYTEAOID;
-        case arrow::Type::TIMESTAMP:
-            return TIMESTAMPOID;
-        case arrow::Type::DATE32:
-            return DATEOID;
-        default:
-            return InvalidOid;
+        /* potentially inserting elements may throw exceptions */
+        try {
+            filters.push_back(f);
+        } catch (std::exception &e) {
+            elog(ERROR, "extracting row filters failed: %s", e.what());
+        }
     }
 }
 
@@ -588,115 +1701,500 @@ row_group_matches_filter(parquet::Statistics *stats,
     return true;
 }
 
+typedef enum
+{
+    PS_START = 0,
+    PS_IDENT,
+    PS_QUOTE
+} ParserState;
+
+/*
+ * parse_filenames_list
+ *      Parse space separated list of filenames. This function modifies 
+ *      the original string.
+ */
+static List *
+parse_filenames_list(const char *str)
+{
+    char       *cur = pstrdup(str);
+    char       *f = cur;
+    ParserState state = PS_START;
+    List       *filenames = NIL;
+
+    while (*cur)
+    {
+        switch (state)
+        {
+            case PS_START:
+                switch (*cur)
+                {
+                    case ' ':
+                        /* just skip */
+                        break;
+                    case '"':
+                        f = cur + 1;
+                        state = PS_QUOTE;
+                        break;
+                    default:
+                        /* XXX we should check that *cur is a valid path symbol
+                         * but let's skip it for now */
+                        state = PS_IDENT;
+                        f = cur;
+                        break;
+                }
+                break;
+            case PS_IDENT:
+                switch (*cur)
+                {
+                    case ' ':
+                        *cur = '\0';
+                        filenames = lappend(filenames, makeString(f));
+                        state = PS_START;
+                        break;
+                    default:
+                        break;
+                }
+                break;
+            case PS_QUOTE:
+                switch (*cur)
+                {
+                    case '"':
+                        *cur = '\0';
+                        filenames = lappend(filenames, makeString(f));
+                        state = PS_START;
+                        break;
+                    default:
+                        break;
+                }
+            default:
+                elog(ERROR, "parquet_fdw: unknown parse state");
+        }
+        cur++;
+    }
+    filenames = lappend(filenames, makeString(f));
+
+    return filenames;
+}
+
 /*
  * extract_rowgroups_list
  *      Analyze query predicates and using min/max statistics determine which
  *      row groups satisfy clauses. Store resulting row group list to
  *      fdw_private.
  */
-static void
-extract_rowgroups_list(PlannerInfo *root, RelOptInfo *baserel)
+List *
+extract_rowgroups_list(const char *filename,
+                       TupleDesc tupleDesc,
+                       std::list<RowGroupFilter> &filters,
+                       uint64 *ntuples) noexcept
 {
     std::unique_ptr<parquet::arrow::FileReader> reader;
-    std::list<RowGroupFilter>       filters;
-    RangeTblEntry  *rte;
-    Relation        rel;
-    TupleDesc       tupleDesc;
-    auto            fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
-
-    /*
-     * Open relation to be able to access tuple descriptor
-     */
-    rte = root->simple_rte_array[baserel->relid];
-    rel = heap_open(rte->relid, AccessShareLock);
-    tupleDesc = RelationGetDescr(rel);
-
-    /* Analyze query clauses and extract ones that can be of interest to us*/
-    extract_rowgroup_filters(baserel->baserestrictinfo, filters);
+    arrow::Status   status;
+    List           *rowgroups = NIL;
 
     /* Open parquet file to read meta information */
     try
     {
-        parquet::arrow::FileReader::Make(
+        status = parquet::arrow::FileReader::Make(
                 arrow::default_memory_pool(),
-                parquet::ParquetFileReader::OpenFile(fdw_private->filename, false),
-                &reader
-        );
+                parquet::ParquetFileReader::OpenFile(filename, false),
+                &reader);
 
+        if (!status.ok())
+            throw Error("failed to open Parquet file %s",
+                             status.message().c_str());
+
+
+        auto meta = reader->parquet_reader()->metadata();
+        parquet::ArrowReaderProperties  props;
+        std::shared_ptr<arrow::Schema>  schema;
+
+        status = parquet::arrow::FromParquetSchema(meta->schema(), props, &schema);
+        if (!status.ok())
+            throw Error("failed to convert from parquet schema: %s", status.message().c_str());
+
+        /* Check each row group whether it matches the filters */
+        for (int r = 0; r < reader->num_row_groups(); r++)
+        {
+            bool match = true;
+            auto rowgroup = meta->RowGroup(r);
+
+            for (auto it = filters.begin(); it != filters.end(); it++)
+            {
+                RowGroupFilter &filter = *it;
+                AttrNumber      attnum;
+                const char     *attname;
+
+                attnum = filter.attnum - 1;
+                attname = NameStr(TupleDescAttr(tupleDesc, attnum)->attname);
+
+                /*
+                 * Search for the column with the same name as filtered attribute
+                 */
+                for (int k = 0; k < rowgroup->num_columns(); k++)
+                {
+                    auto    column = rowgroup->ColumnChunk(k);
+                    std::vector<std::string> path = column->path_in_schema()->ToDotVector();
+
+                    if (strcmp(attname, path[0].c_str()) == 0)
+                    {
+                        /* Found it! */
+                        std::shared_ptr<parquet::Statistics>  stats;
+                        std::shared_ptr<arrow::Field>       field;
+                        std::shared_ptr<arrow::DataType>    type;
+                        MemoryContext   ccxt = CurrentMemoryContext;
+                        bool            error = false;
+                        char            errstr[ERROR_STR_LEN];
+
+                        stats = column->statistics();
+
+                        /* Convert to arrow field to get appropriate type */
+                        field = schema->field(k);
+                        type = field->type();
+
+                        PG_TRY();
+                        {
+                            /*
+                             * If at least one filter doesn't match rowgroup exclude
+                             * the current row group and proceed with the next one.
+                             */
+                            if (stats &&
+                                !row_group_matches_filter(stats.get(), type.get(), &filter))
+                            {
+                                match = false;
+                                elog(DEBUG1, "parquet_fdw: skip rowgroup %d", r + 1);
+                            }
+                        }
+                        PG_CATCH();
+                        {
+                            ErrorData *errdata;
+
+                            MemoryContextSwitchTo(ccxt);
+                            error = true;
+                            errdata = CopyErrorData();
+                            FlushErrorState();
+
+                            strncpy(errstr, errdata->message, ERROR_STR_LEN - 1);
+                            FreeErrorData(errdata);
+                        }
+                        PG_END_TRY();
+                        if (error)
+                            throw Error("row group filter match failed: %s", errstr);
+                        break;
+                    }
+                }  /* loop over columns */
+
+                if (!match)
+                    break;
+
+            }  /* loop over filters */
+
+            /* All the filters match this rowgroup */
+            if (match)
+            {
+                /* TODO: PG_TRY */
+                rowgroups = lappend_int(rowgroups, r);
+                *ntuples += rowgroup->num_rows();
+            }
+        }  /* loop over rowgroups */
     }
     catch(const std::exception& e)
     {
-        elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
+        elog(ERROR, "parquet_fdw: failed to exctract row groups from Parquet file: %s", e.what());
     }
-    auto meta = reader->parquet_reader()->metadata();
-    parquet::ArrowReaderProperties  props;
-    std::shared_ptr<arrow::Schema>  schema;
-    parquet::arrow::FromParquetSchema(meta->schema(), props, &schema);
+    return rowgroups;
+}
 
-    /* Check each row group whether it matches the filters */
-    for (int r = 0; r < reader->num_row_groups(); r++)
+struct FieldInfo
+{
+    char    name[NAMEDATALEN];
+    Oid     oid;
+};
+
+/*
+ * extract_parquet_fields
+ *      Read parquet file and return a list of its fields
+ */
+static List *
+extract_parquet_fields(const char *path) noexcept
+{
+    std::unique_ptr<parquet::arrow::FileReader> reader;
+    std::shared_ptr<arrow::Schema>              schema;
+    arrow::Status   status;
+    List           *res = NIL;
+
+    try
     {
-        bool match = true;
-        auto rowgroup = meta->RowGroup(r);
+        status = parquet::arrow::FileReader::Make(
+                    arrow::default_memory_pool(),
+                    parquet::ParquetFileReader::OpenFile(path, false),
+                    &reader);
+        if (!status.ok())
+            throw Error("failed to open Parquet file %s",
+                                 status.message().c_str());
 
-        for (auto it = filters.begin(); it != filters.end(); it++)
+        auto        meta = reader->parquet_reader()->metadata();
+        parquet::ArrowReaderProperties props;
+        FieldInfo  *fields;
+
+        if (!parquet::arrow::FromParquetSchema(meta->schema(), props, &schema).ok())
+            throw std::runtime_error("error reading parquet schema");
+
+        fields = (FieldInfo *) exc_palloc(sizeof(FieldInfo) * schema->num_fields());
+
+        for (int k = 0; k < schema->num_fields(); ++k)
         {
-            RowGroupFilter &filter = *it;
-            AttrNumber      attnum;
-            const char     *attname;
+            std::shared_ptr<arrow::Field>       field;
+            std::shared_ptr<arrow::DataType>    type;
+            Oid     pg_type;
 
-            attnum = filter.attnum - 1;
-            attname = NameStr(TupleDescAttr(tupleDesc, attnum)->attname);
+            /* Convert to arrow field to get appropriate type */
+            field = schema->field(k);
+            type = field->type();
 
-            /*
-             * Search for the column with the same name as filtered attribute
-             */
-            for (int k = 0; k < rowgroup->num_columns(); k++)
+            if (type->id() == arrow::Type::LIST)
             {
-                auto    column = rowgroup->ColumnChunk(k);
-                std::vector<std::string> path = column->path_in_schema()->ToDotVector();
+                int     subtype_id;
+                Oid     pg_subtype;
+                bool    error = false;
 
-                if (strcmp(attname, path[0].c_str()) == 0)
+                if (type->children().size() != 1)
+                    throw std::runtime_error("lists of structs are not supported");
+
+                subtype_id = get_arrow_list_elem_type(type.get());
+                pg_subtype = to_postgres_type(subtype_id);
+
+                /* That sucks I know... */
+                PG_TRY();
                 {
-                    /* Found it! */
-                    std::shared_ptr<parquet::Statistics>  stats;
-                    std::shared_ptr<arrow::Field>       field;
-                    std::shared_ptr<arrow::DataType>    type;
-
-                    stats = column->statistics();
-
-                    /* Convert to arrow field to get appropriate type */
-                    field = schema->field(k);
-                    type = field->type();
-
-                    /*
-                     * If at least one filter doesn't match rowgroup exclude
-                     * the current row group and proceed with the next one.
-                     */
-                    if (stats &&
-                        !row_group_matches_filter(stats.get(), type.get(), &filter))
-                    {
-                        match = false;
-                        elog(DEBUG1, "parquet_fdw: skip rowgroup %d", r + 1);
-                    }
-                    break;
+                    pg_type = get_array_type(pg_subtype);
                 }
-            }  /* loop over columns */
+                PG_CATCH();
+                {
+                    error = true;
+                }
+                PG_END_TRY();
 
-            if (!match)
-                break;
+                if (error)
+                    throw std::runtime_error("failed to get the type of array elements");
+            }
+            else
+            {
+                pg_type = to_postgres_type(type->id());
+            }
 
-        }  /* loop over filters */
-        
-        /* All the filters match this rowgroup */
-        if (match)
+            if (pg_type != InvalidOid)
+            {
+                if (field->name().length() > 63)
+                    throw Error("field name '%s' in '%s' is too long",
+                                field->name().c_str(), path);
+
+                memcpy(fields->name, field->name().c_str(), field->name().length() + 1);
+                fields->oid = pg_type;
+                res = lappend(res, fields++);
+            }
+            else
+            {
+                throw Error("cannot convert field '%s' of type '%s' in %s",
+                            field->name().c_str(), type->name().c_str(), path);
+            }
+        }
+    }
+    catch (std::exception &e)
+    {
+        /* Destroy the reader on error */
+        reader.reset();
+        elog(ERROR, "parquet_fdw: %s", e.what());
+    }
+
+    return res;
+}
+
+/*
+ * create_foreign_table_query
+ *      Produce a query text for creating a new foreign table.
+ */
+char *
+create_foreign_table_query(const char *tablename,
+                           const char *schemaname,
+                           const char *servername,
+                           char **paths, int npaths,
+                           List *fields, List *options)
+{
+    StringInfoData  str;
+    ListCell       *lc;
+
+    initStringInfo(&str);
+    appendStringInfo(&str, "CREATE FOREIGN TABLE ");
+
+    /* append table name */
+    if (schemaname)
+        appendStringInfo(&str, "%s.%s (",
+                         schemaname, quote_identifier(tablename));
+    else
+        appendStringInfo(&str, "%s (", quote_identifier(tablename));
+
+    /* append columns */
+    bool is_first = true;
+    foreach (lc, fields)
+    {
+        FieldInfo  *field = (FieldInfo *) lfirst(lc);
+        char       *name = field->name;
+        Oid         pg_type = field->oid;
+        const char *type_name = format_type_be(pg_type);
+
+        if (!is_first)
+            appendStringInfo(&str, ", %s %s", name, type_name);
+        else
         {
-            fdw_private->rowgroups = lappend_int(fdw_private->rowgroups, r);
-            fdw_private->ntuples += rowgroup->num_rows();
-        } 
-    }  /* loop over rowgroups */
+            appendStringInfo(&str, "%s %s", name, type_name);
+            is_first = false;
+        }
+    }
+    appendStringInfo(&str, ") SERVER %s ", servername);
+    appendStringInfo(&str, "OPTIONS (filename '");
 
-    heap_close(rel, AccessShareLock);
+    /* list paths */
+    is_first = true;
+    for (int i = 0; i < npaths; ++i)
+    {
+        if (!is_first)
+            appendStringInfoChar(&str, ' ');
+        else
+            is_first = false;
+
+        appendStringInfoString(&str, paths[i]);
+    }
+    appendStringInfoChar(&str, '\'');
+
+    /* list options */
+    foreach(lc, options)
+    {
+        DefElem *def = (DefElem *) lfirst(lc);
+
+        appendStringInfo(&str, ", %s '%s'", def->defname, defGetString(def));
+    }
+
+    appendStringInfo(&str, ")");
+
+    return str.data;
+}
+
+static void
+destroy_parquet_state(void *arg)
+{
+    ParquetFdwExecutionState *festate = (ParquetFdwExecutionState *) arg;
+
+    if (festate)
+        delete festate;
+}
+
+/*
+ * C interface functions
+ */
+
+static List *
+parse_attributes_list(char *start, Oid relid)
+{
+    List      *attrs = NIL;
+    char      *token;
+    const char *delim = " ";
+    AttrNumber attnum;
+
+    while ((token = strtok(start, delim)) != NULL)
+    {
+        if ((attnum = get_attnum(relid, token)) == InvalidAttrNumber)
+            elog(ERROR, "paruqet_fdw: invalid attribute name '%s'", token);
+        attrs = lappend_int(attrs, attnum);
+        start = NULL;
+    }
+
+    return attrs;
+}
+
+static void
+get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
+{
+	ForeignTable *table;
+    ListCell     *lc;
+
+    fdw_private->use_mmap = false;
+    fdw_private->use_threads = false;
+    table = GetForeignTable(relid);
+
+    foreach(lc, table->options)
+    {
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+        if (strcmp(def->defname, "filename") == 0)
+        {
+            fdw_private->filenames = parse_filenames_list(defGetString(def));
+        }
+        else if (strcmp(def->defname, "sorted") == 0)
+        {
+            fdw_private->attrs_sorted =
+                parse_attributes_list(defGetString(def), relid);
+        }
+        else if (strcmp(def->defname, "use_mmap") == 0)
+        {
+            if (!parse_bool(defGetString(def), &fdw_private->use_mmap))
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("invalid value for boolean option \"%s\": %s",
+                                def->defname, defGetString(def))));
+        }
+        else if (strcmp(def->defname, "use_threads") == 0)
+        {
+            if (!parse_bool(defGetString(def), &fdw_private->use_threads))
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("invalid value for boolean option \"%s\": %s",
+                                def->defname, defGetString(def))));
+        }
+        else
+            elog(ERROR, "unknown option '%s'", def->defname);
+    }
+}
+
+extern "C" void
+parquetGetForeignRelSize(PlannerInfo *root,
+                         RelOptInfo *baserel,
+                         Oid foreigntableid)
+{
+    ParquetFdwPlanState *fdw_private;
+
+    fdw_private = (ParquetFdwPlanState *) palloc0(sizeof(ParquetFdwPlanState));
+    get_table_options(foreigntableid, fdw_private);
+    
+    baserel->fdw_private = fdw_private;
+}
+
+static Oid
+to_postgres_type(int arrow_type)
+{
+    switch (arrow_type)
+    {
+        case arrow::Type::BOOL:
+            return BOOLOID;
+        case arrow::Type::INT32:
+            return INT4OID;
+        case arrow::Type::INT64:
+            return INT8OID;
+        case arrow::Type::FLOAT:
+            return FLOAT4OID;
+        case arrow::Type::DOUBLE:
+            return FLOAT8OID;
+        case arrow::Type::STRING:
+            return TEXTOID;
+        case arrow::Type::BINARY:
+            return BYTEAOID;
+        case arrow::Type::TIMESTAMP:
+            return TIMESTAMPOID;
+        case arrow::Type::DATE32:
+            return DATEOID;
+        default:
+            return InvalidOid;
+    }
 }
 
 static void
@@ -764,35 +2262,96 @@ extract_used_attributes(RelOptInfo *baserel)
     }
 }
 
+/*
+ * cost_merge
+ *      Calculate the cost of merging nfiles files. The entire logic is stolen
+ *      from cost_gather_merge().
+ */
+static void
+cost_merge(Path *path, uint32 nfiles, Cost input_startup_cost,
+           Cost input_total_cost, double rows)
+{
+	Cost		startup_cost = 0;
+	Cost		run_cost = 0;
+	Cost		comparison_cost;
+	double		N;
+	double		logN;
+
+    N = nfiles;
+    logN = LOG2(N);
+
+	/* Assumed cost per tuple comparison */
+	comparison_cost = 2.0 * cpu_operator_cost;
+
+	/* Heap creation cost */
+	startup_cost += comparison_cost * N * logN;
+
+	/* Per-tuple heap maintenance cost */
+	run_cost += rows * comparison_cost * logN;
+
+	/* small cost for heap management, like cost_merge_append */
+	run_cost += cpu_operator_cost * rows;
+
+	path->startup_cost = startup_cost + input_startup_cost;
+	path->total_cost = (startup_cost + run_cost + input_total_cost);
+}
+
 extern "C" void
 parquetGetForeignPaths(PlannerInfo *root,
-					RelOptInfo *baserel,
-					Oid foreigntableid)
+                       RelOptInfo *baserel,
+                       Oid foreigntableid)
 {
 	ParquetFdwPlanState *fdw_private;
+    Path       *foreign_path;
 	Cost		startup_cost;
 	Cost		total_cost;
     Cost        run_cost;
+    bool        is_sorted, is_multi;
     List       *pathkeys = NIL;
+    RangeTblEntry  *rte;
+    Relation        rel;
+    TupleDesc       tupleDesc;
+    std::list<RowGroupFilter> filters;
+    ListCell       *lc;
 
     fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
+    is_sorted = fdw_private->attrs_sorted != NIL;
+    is_multi = list_length(fdw_private->filenames) > 1;
+
+    /* Analyze query clauses and extract ones that can be of interest to us*/
+    extract_rowgroup_filters(baserel->baserestrictinfo, filters);
+
+    rte = root->simple_rte_array[baserel->relid];
+    rel = heap_open(rte->relid, AccessShareLock);
+    tupleDesc = RelationGetDescr(rel);
 
     /*
      * Extract list of row groups that match query clauses. Also calculate
      * approximate number of rows in result set based on total number of tuples
      * in those row groups. It isn't very precise but it is best we got.
      */
-    extract_rowgroups_list(root, baserel);
+    foreach (lc, fdw_private->filenames)
+    {
+        char *filename = strVal((Value *) lfirst(lc));
+        List *rowgroups = extract_rowgroups_list(filename, tupleDesc,
+                                                 filters, &fdw_private->ntuples);
+
+        fdw_private->rowgroups = lappend(fdw_private->rowgroups, rowgroups);
+    }
+    heap_close(rel, AccessShareLock);
+
     estimate_costs(root, baserel, &startup_cost, &run_cost, &total_cost);
 
     /* Collect used attributes to reduce number of read columns during scan */
     extract_used_attributes(baserel);
 
+    fdw_private->type = is_multi ? RT_MULTI : RT_SINGLE;
+
     /* Build pathkeys based on attrs_sorted */
-    int attnum = -1;
-    while ((attnum = bms_next_member(fdw_private->attrs_sorted, attnum)) >= 0)
+    foreach (lc, fdw_private->attrs_sorted)
     {
         Oid         relid = root->simple_rte_array[baserel->relid]->relid;
+        int         attnum = lfirst_int(lc);
         Oid         typid,
                     collid;
         int32       typmod;
@@ -816,34 +2375,65 @@ parquetGetForeignPaths(PlannerInfo *root,
         pathkeys = list_concat(pathkeys, attr_pathkey);
     }
 
-	/*
-	 * Create a ForeignPath node and add it as only possible path.  We use the
-	 * fdw_private list of the path to carry the convert_selectively option;
-	 * it will be propagated into the fdw_private list of the Plan node.
-	 */
-	add_path(baserel, (Path *)
-			 create_foreignscan_path(root, baserel,
-									 NULL,	/* default pathtarget */
-									 baserel->rows,
-									 startup_cost,
-									 total_cost,
-									 pathkeys,
-									 NULL,	/* no outer rel either */
-									 NULL,	/* no extra plan */
-									 (List *) fdw_private));
+    /* Create a separate path with pathkeys for sorted parquet files. */
+    if (is_sorted)
+    {
+        Path                   *path;
+        ParquetFdwPlanState    *private_sort;
+
+        private_sort = (ParquetFdwPlanState *) palloc(sizeof(ParquetFdwPlanState));
+        memcpy(private_sort, fdw_private, sizeof(ParquetFdwPlanState));
+
+        path = (Path *) create_foreignscan_path(root, baserel,
+                                                NULL,	/* default pathtarget */
+                                                baserel->rows,
+                                                startup_cost,
+                                                total_cost,
+                                                pathkeys,
+                                                NULL,	/* no outer rel either */
+                                                NULL,	/* no extra plan */
+                                                (List *) private_sort);
+
+        /* For multifile case calculate the cost of merging files */
+        if (is_multi)
+        {
+            private_sort->type = RT_MULTI_MERGE;
+
+            cost_merge((Path *) path, list_length(private_sort->filenames),
+                       startup_cost, total_cost, baserel->rows);
+        }
+        add_path(baserel, path);
+    }
+
+	foreign_path = (Path *) create_foreignscan_path(root, baserel,
+                                                    NULL,	/* default pathtarget */
+                                                    baserel->rows,
+                                                    startup_cost,
+                                                    total_cost,
+                                                    NULL,   /* no pathkeys */
+                                                    NULL,	/* no outer rel either */
+                                                    NULL,	/* no extra plan */
+                                                    (List *) fdw_private);
+	add_path(baserel, (Path *) foreign_path);
 
     if (baserel->consider_parallel > 0)
     {
+        ParquetFdwPlanState *private_parallel;
+
+        private_parallel = (ParquetFdwPlanState *) palloc(sizeof(ParquetFdwPlanState));
+        memcpy(private_parallel, fdw_private, sizeof(ParquetFdwPlanState));
+        private_parallel->type = is_multi ? RT_MULTI : RT_SINGLE;
+
         Path *parallel_path = (Path *)
                  create_foreignscan_path(root, baserel,
                                          NULL,	/* default pathtarget */
                                          baserel->rows,
                                          startup_cost,
                                          total_cost,
-									     NULL,
+                                         pathkeys,
                                          NULL,	/* no outer rel either */
                                          NULL,	/* no extra plan */
-                                         (List *) fdw_private);
+                                         (List *) private_parallel);
 
         int num_workers = max_parallel_workers_per_gather;
 
@@ -852,6 +2442,15 @@ parquetGetForeignPaths(PlannerInfo *root,
         parallel_path->parallel_workers = num_workers;
         parallel_path->parallel_aware   = true;
         parallel_path->parallel_safe    = true;
+
+        /* Create GatherMerge path for sorted parquet files */
+        if (is_sorted)
+        {
+            GatherMergePath *gather_merge =
+                create_gather_merge_path(root, baserel, parallel_path, NULL,
+                                         pathkeys, NULL, NULL);
+            add_path(baserel, (Path *) gather_merge);
+        }
         add_partial_path(baserel, parallel_path);
     }
 }
@@ -868,8 +2467,10 @@ parquetGetForeignPlan(PlannerInfo *root,
     ParquetFdwPlanState *fdw_private = (ParquetFdwPlanState *) best_path->fdw_private;
 	Index		scan_relid = baserel->relid;
     List       *attrs_used = NIL;
+    List       *attrs_sorted = NIL;
     AttrNumber  attr;
-    List       *params;
+    List       *params = NIL;
+    ListCell   *lc;
 
 	/*
 	 * We have no native ability to evaluate restriction clauses, so we just
@@ -890,11 +2491,17 @@ parquetGetForeignPlan(PlannerInfo *root,
     while ((attr = bms_next_member(fdw_private->attrs_used, attr)) >= 0)
         attrs_used = lappend_int(attrs_used, attr);
 
-    params = list_make5(makeString(fdw_private->filename),
-                        attrs_used,
-                        makeInteger(fdw_private->use_mmap),
-                        makeInteger(fdw_private->use_threads),
-                        fdw_private->rowgroups);
+    foreach (lc, fdw_private->attrs_sorted)
+        attrs_sorted = lappend_int(attrs_sorted, lfirst_int(lc));
+
+    /* Packing all the data needed by executor into the list */
+    params = lappend(params, fdw_private->filenames);
+    params = lappend(params, attrs_used);
+    params = lappend(params, attrs_sorted);
+    params = lappend(params, makeInteger(fdw_private->use_mmap));
+    params = lappend(params, makeInteger(fdw_private->use_threads));
+    params = lappend(params, makeInteger(fdw_private->type));
+    params = lappend(params, fdw_private->rowgroups);
 
 	/* Create the ForeignScan node */
 	return make_foreignscan(tlist,
@@ -910,512 +2517,144 @@ parquetGetForeignPlan(PlannerInfo *root,
 extern "C" void
 parquetBeginForeignScan(ForeignScanState *node, int eflags)
 {
-    ParquetFdwExecutionState *festate; 
+    ParquetFdwExecutionState   *festate;
+    MemoryContextCallback      *callback;
+    MemoryContext   reader_cxt;
 	ForeignScan    *plan = (ForeignScan *) node->ss.ps.plan;
 	EState         *estate = node->ss.ps.state;
     List           *fdw_private = plan->fdw_private;
-    List           *attrs_used_list;
-    List           *rowgroups_list;
-    ListCell       *lc;
-    char           *filename;
+    List           *attrs_list;
+    List           *rowgroups_list = NIL;
+    ListCell       *lc, *lc2;
+    List           *filenames = NIL;
     std::set<int>   attrs_used;
-    bool            use_mmap; 
-    bool            use_threads;
+    List           *attrs_sorted = NIL;
+    bool            use_mmap = false;
+    bool            use_threads = false;
+    int             i = 0;
+    ReaderType      reader_type = RT_SINGLE;
 
     /* Unwrap fdw_private */
-    filename = strVal((Value *) linitial(fdw_private));
-
-    attrs_used_list = (List *) lsecond(fdw_private);
-    foreach (lc, attrs_used_list)
-        attrs_used.insert(lfirst_int(lc));
-
-    use_mmap = (bool) intVal((Value *) lthird(fdw_private));
-    use_threads = (bool) intVal((Value *) lfourth(fdw_private));
+    foreach (lc, fdw_private)
+    {
+        switch(i)
+        {
+            case 0:
+                filenames = (List *) lfirst(lc);
+                break;
+            case 1:
+                attrs_list = (List *) lfirst(lc);
+                foreach (lc2, attrs_list)
+                    attrs_used.insert(lfirst_int(lc2));
+                break;
+            case 2:
+                attrs_sorted = (List *) lfirst(lc);
+                break;
+            case 3:
+                use_mmap = (bool) intVal((Value *) lfirst(lc));
+                break;
+            case 4:
+                use_threads = (bool) intVal((Value *) lfirst(lc));
+                break;
+            case 5:
+                reader_type = (ReaderType) intVal((Value *) lfirst(lc));
+                break;
+            case 6:
+                rowgroups_list = (List *) lfirst(lc);
+                break;
+        }
+        ++i;
+    }
 
     MemoryContext cxt = estate->es_query_cxt;
     TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
     TupleDesc tupleDesc = slot->tts_tupleDescriptor;
 
+    reader_cxt = AllocSetContextCreate(cxt,
+                                       "parquet_fdw tuple data",
+                                       ALLOCSET_DEFAULT_SIZES);
+
+    std::list<SortSupportData> sort_keys;
+    foreach (lc, attrs_sorted)
+    {
+        SortSupportData sort_key;
+        int     attr = lfirst_int(lc);
+        Oid     typid;
+        int     typmod;
+        Oid     collid;
+        Oid     relid = RelationGetRelid(node->ss.ss_currentRelation);
+        Oid     sort_op;
+
+        memset(&sort_key, 0, sizeof(SortSupportData));
+
+        get_atttypetypmodcoll(relid, attr, &typid, &typmod, &collid);
+
+        sort_key.ssup_cxt = reader_cxt;
+        sort_key.ssup_collation = collid;
+        sort_key.ssup_nulls_first = true;
+        sort_key.ssup_attno = attr;
+        sort_key.abbreviate = false;
+
+        get_sort_group_operators(typid,
+                                 true, false, false,
+                                 &sort_op, NULL, NULL,
+                                 NULL);
+
+        PrepareSortSupportFromOrderingOp(sort_op, &sort_key);
+
+        try {
+            sort_keys.push_back(sort_key);
+        } catch (std::exception &e) {
+            elog(ERROR, "parquet_fdw: scan initialization failed: %s", e.what());
+        }
+    }
+
     try
     {
-        festate = create_parquet_state(filename,
-                                       tupleDesc,
-                                       cxt,
-                                       attrs_used,
-                                       use_mmap,
-                                       use_threads);
-    }
-    catch(const std::exception& e)
-    {
-        elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
-    }
-
-    rowgroups_list = (List *) llast(fdw_private);
-    foreach (lc, rowgroups_list)
-        festate->rowgroups.push_back(lfirst_int(lc));
-
-    node->fdw_state = festate;
-}
-
-static int
-get_arrow_list_elem_type(arrow::DataType *type)
-{
-    auto children = type->children();
-
-    Assert(children.size() == 1);
-    return children[0]->type()->id();
-}
-
-/*
- * initialize_castfuncs
- *      Check wether implicit cast will be required and prepare cast function
- *      call. For arrays find cast functions for its elements.
- */
-static void
-initialize_castfuncs(ParquetFdwExecutionState *festate, TupleDesc tupleDesc)
-{
-    festate->castfuncs.resize(festate->map.size());
-
-    for (uint i = 0; i < festate->map.size(); ++i)
-    {
-        int arrow_col = festate->map[i];
-
-        if (festate->map[i] < 0)
+        switch (reader_type)
         {
-            /* Null column */
-            festate->castfuncs[i] = NULL;
-            continue;
-        }
-
-        arrow::DataType *type = festate->types[arrow_col];
-        int     type_id = type->id();
-        int     src_type,
-                dst_type;
-        bool    src_is_list,
-                dst_is_array;
-        Oid     funcid;
-        CoercionPathType ct;
-
-        /* Find underlying type of list */
-        src_is_list = (type_id == arrow::Type::LIST);
-        if (src_is_list)
-            type_id = get_arrow_list_elem_type(type);
-
-        src_type = to_postgres_type(type_id);
-        dst_type = TupleDescAttr(tupleDesc, i)->atttypid;
-
-        if (!OidIsValid(src_type))
-            elog(ERROR, "parquet_fdw: unsupported column type: %s",
-                 type->name().c_str());
-
-        /* Find underlying type of array */
-        dst_is_array = type_is_array(dst_type);
-        if (dst_is_array)
-            dst_type = get_element_type(dst_type);
-
-        /* Make sure both types are compatible */
-        if (src_is_list != dst_is_array)
-        {
-            ereport(ERROR,
-                    (errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
-                     errmsg("parquet_fdw: incompatible types in column \"%s\"",
-                            festate->table->field(arrow_col)->name().c_str()),
-                     errhint(src_is_list ?
-                         "parquet column is of type list while postgres type is scalar" :
-                         "parquet column is of scalar type while postgres type is array")));
-        }
-
-        if (IsBinaryCoercible(src_type, dst_type))
-        {
-            festate->castfuncs[i] = NULL;
-            continue;
-        }
-
-        ct = find_coercion_pathway(dst_type,
-                                   src_type,
-                                   COERCION_EXPLICIT,
-                                   &funcid);
-        switch (ct)
-        {
-            case COERCION_PATH_FUNC:
-                {
-                    MemoryContext   oldctx;
-                    
-                    oldctx = MemoryContextSwitchTo(CurTransactionContext);
-                    festate->castfuncs[i] = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
-                    fmgr_info(funcid, festate->castfuncs[i]);
-                    MemoryContextSwitchTo(oldctx);
-                    break;
-                }
-            case COERCION_PATH_RELABELTYPE:
-            case COERCION_PATH_COERCEVIAIO:  /* TODO: double check that we
-                                              * shouldn't do anything here*/
-                /* Cast is not needed */
-                festate->castfuncs[i] = NULL;
+            case RT_SINGLE:
+                festate = new SingleFileExecutionState(reader_cxt, tupleDesc,
+                                                       attrs_used, use_threads,
+                                                       use_mmap);
+                break;
+            case RT_MULTI:
+                festate = new MultifileExecutionState(reader_cxt, tupleDesc,
+                                                      attrs_used, use_threads,
+                                                      use_mmap);
+                break;
+            case RT_MULTI_MERGE:
+                festate = new MultifileMergeExecutionState(reader_cxt, tupleDesc,
+                                                           attrs_used, sort_keys, 
+                                                           use_threads, use_mmap);
                 break;
             default:
-                elog(ERROR, "parquet_fdw: cast function is not found");
+                throw std::runtime_error("unknown reader type");
+        }
+
+        forboth (lc, filenames, lc2, rowgroups_list)
+        {
+            char *filename = strVal((Value *) lfirst(lc));
+            List *rowgroups = (List *) lfirst(lc2);
+
+            festate->add_file(filename, rowgroups);
         }
     }
-    festate->initialized = true;
-}
-
-/*
- * fast_alloc
- *      Preallocate a big memory segment and distribute blocks from it. When
- *      segment is exhausted it is added to garbage_segments list and freed
- *      on the next executor's iteration. If requested size is bigger that
- *      SEGMENT_SIZE then just palloc is used.
- */
-static inline void *
-fast_alloc(ParquetFdwExecutionState *festate, long size)
-{
-    void   *ret;
-
-    Assert(size >= 0);
-
-    /* If allocation is bigger than segment then just palloc */
-    if (size > SEGMENT_SIZE)
-        return palloc(size);
-
-    size = MAXALIGN(size);
-
-    /* If there is not enough space in current segment create a new one */
-    if (festate->segment_last_ptr - festate->segment_cur_ptr < size)
+    catch(std::exception &e)
     {
-        MemoryContext oldcxt;
-        
-        /*
-         * Recycle the last segment at the next iteration (if there
-         * was one)
-         */
-        if (festate->segment_start_ptr)
-            festate->garbage_segments.
-                push_back(festate->segment_start_ptr);
-
-        oldcxt = MemoryContextSwitchTo(festate->segments_cxt);
-        festate->segment_start_ptr = (char *) palloc(SEGMENT_SIZE);
-        festate->segment_cur_ptr = festate->segment_start_ptr;
-        festate->segment_last_ptr =
-            festate->segment_start_ptr + SEGMENT_SIZE - 1;
-        MemoryContextSwitchTo(oldcxt);
+        elog(ERROR, "parquet_fdw: %s", e.what());
     }
 
-    ret = (void *) festate->segment_cur_ptr;
-    festate->segment_cur_ptr += size;
+    /*
+     * Enable automatic execution state destruction by using memory context
+     * callback
+     */
+    callback = (MemoryContextCallback *) palloc(sizeof(MemoryContextCallback));
+    callback->func = destroy_parquet_state;
+    callback->arg = (void *) festate;
+    MemoryContextRegisterResetCallback(reader_cxt, callback);
 
-    return ret;
-}
-
-/*
- * read_primitive_type
- *      Returns primitive type value from arrow array
- */
-static Datum
-read_primitive_type(ParquetFdwExecutionState *festate,
-                    arrow::Array *array,
-                    int type_id, int64_t i,
-                    FmgrInfo *castfunc)
-{
-    Datum   res;
-
-    /* Get datum depending on the column type */
-    switch (type_id)
-    {
-        case arrow::Type::BOOL:
-        {
-            arrow::BooleanArray *boolarray = (arrow::BooleanArray *) array;
-
-            res = BoolGetDatum(boolarray->Value(i));
-            break;
-        }
-        case arrow::Type::INT32:
-        {
-            arrow::Int32Array *intarray = (arrow::Int32Array *) array;
-            int value = intarray->Value(i);
-
-            res = Int32GetDatum(value);
-            break;
-        }
-        case arrow::Type::INT64:
-        {
-            arrow::Int64Array *intarray = (arrow::Int64Array *) array;
-            int64 value = intarray->Value(i);
-
-            res = Int64GetDatum(value);
-            break;
-        }
-        case arrow::Type::FLOAT:
-        {
-            arrow::FloatArray *farray = (arrow::FloatArray *) array;
-            float value = farray->Value(i);
-
-            res = Float4GetDatum(value);
-            break;
-        }
-        case arrow::Type::DOUBLE:
-        {
-            arrow::DoubleArray *darray = (arrow::DoubleArray *) array;
-            double value = darray->Value(i);
-
-            res = Float8GetDatum(value);
-            break;
-        }
-        case arrow::Type::STRING:
-        case arrow::Type::BINARY:
-        {
-            arrow::BinaryArray *binarray = (arrow::BinaryArray *) array;
-
-            int32_t vallen = 0;
-            const char *value = reinterpret_cast<const char*>(binarray->GetValue(i, &vallen));
-
-            /* Build bytea */
-            int64 bytea_len = vallen + VARHDRSZ;
-            bytea *b = (bytea *) fast_alloc(festate, bytea_len);
-            SET_VARSIZE(b, bytea_len);
-            memcpy(VARDATA(b), value, vallen);
-
-            res = PointerGetDatum(b);
-            break;
-        }
-        case arrow::Type::TIMESTAMP:
-        {
-            /* TODO: deal with timezones */
-            TimestampTz ts;
-            arrow::TimestampArray *tsarray = (arrow::TimestampArray *) array;
-            auto tstype = (arrow::TimestampType *) array->type().get();
-
-            to_postgres_timestamp(tstype, tsarray->Value(i), ts);
-            res = TimestampGetDatum(ts);
-            break;
-        }
-        case arrow::Type::DATE32:
-        {
-            arrow::Date32Array *tsarray = (arrow::Date32Array *) array;
-            int32 d = tsarray->Value(i);
-
-            /*
-             * Postgres date starts with 2000-01-01 while unix date (which
-             * Parquet is using) starts with 1970-01-01. So we need to do
-             * simple calculations here.
-             */
-            res = DateADTGetDatum(d + (UNIX_EPOCH_JDATE - POSTGRES_EPOCH_JDATE));
-            break;
-        }
-        /* TODO: add other types */
-        default:
-            elog(ERROR,
-                 "parquet_fdw: unsupported column type: %d",
-                 type_id);
-    }
-
-    /* Call cast function if needed */
-    if (castfunc != NULL)
-        return FunctionCall1(castfunc, res);
-
-    return res;
-}
-
-/*
- * GetPrimitiveValues
- *      Get plain C value array. Copy-pasted from Arrow.
- */
-template <typename T>
-inline const T* GetPrimitiveValues(const arrow::Array& arr) {
-  if (arr.length() == 0) {
-    return nullptr;
-  }
-  const auto& prim_arr = arrow::internal::checked_cast<const arrow::PrimitiveArray&>(arr);
-  const T* raw_values = reinterpret_cast<const T*>(prim_arr.values()->data());
-  return raw_values + arr.offset();
-}
-
-/* 
- * copy_to_c_array
- *      memcpy plain values from Arrow array to a C array.
- */
-template<typename T> inline void
-copy_to_c_array(T *values, const arrow::Array *array, int elem_size)
-{
-    const T *in = GetPrimitiveValues<T>(*array);
-
-    memcpy(values, in, elem_size * array->length());
-}
-
-/*
- * nested_list_get_datum
- *      Returns postgres array build from elements of array. Only one
- *      dimensional arrays are supported.
- */
-static Datum
-nested_list_get_datum(ParquetFdwExecutionState *festate,
-                      arrow::Array *array, int type_id,
-                      Oid elem_type, FmgrInfo *castfunc)
-{
-    ArrayType  *res;
-    Datum      *values;
-    bool       *nulls = NULL;
-    int16       elem_len;
-    bool        elem_byval;
-    char        elem_align;
-    int         dims[1];
-    int         lbs[1];
-
-    values = (Datum *) fast_alloc(festate, sizeof(Datum) * array->length());
-    get_typlenbyvalalign(elem_type, &elem_len, &elem_byval, &elem_align);
-
-    /* Fill values and nulls arrays */
-    if (array->null_count() == 0 && type_id == arrow::Type::INT64)
-    {
-        /*
-         * Ok, there are no nulls, so probably we could just memcpy the
-         * entire array.
-         *
-         * Warning: the code below is based on the assumption that Datum is
-         * 8 bytes long, which is true for most contemporary systems but this
-         * will not work on some exotic or really old systems. In this case
-         * the entire "if" branch should just be removed.
-         */
-        copy_to_c_array<int64_t>((int64_t *) values, array, elem_len);
-        goto construct_array;
-    }
-    for (int64_t i = 0; i < array->length(); ++i)
-    {
-        if (!array->IsNull(i))
-            values[i] = read_primitive_type(festate, array, type_id, i, castfunc);
-        else
-        {
-            if (!nulls)
-            {
-                Size size = sizeof(bool) * array->length();
-
-                nulls = (bool *) fast_alloc(festate, size);
-                memset(nulls, 0, size);
-            }
-            nulls[i] = true;
-        }
-    }
-
-construct_array:
-    /* Construct one dimensional array */
-    dims[0] = array->length();
-    lbs[0] = 1;
-    res = construct_md_array(values, nulls, 1, dims, lbs,
-                             elem_type, elem_len, elem_byval, elem_align);
-
-    return PointerGetDatum(res);
-}
-
-/*
- * populate_slot
- *      Fill slot with the values from parquet row.
- *
- * If `fake` set to true the actual reading and populating the slot is skipped.
- * The purpose of this feature is to correctly skip rows to collect sparse
- * samples.
- */
-static void
-populate_slot(ParquetFdwExecutionState *festate,
-              TupleTableSlot *slot,
-              bool fake=false)
-{
-    /* Fill slot values */
-    for (int attr = 0; attr < slot->tts_tupleDescriptor->natts; attr++)
-    {
-        int arrow_col = festate->map[attr];
-        /*
-         * We only fill slot attributes if column was referred in targetlist
-         * or clauses. In other cases mark attribute as NULL.
-         * */
-        if (arrow_col >= 0)
-        {
-            ChunkInfo &chunkInfo = festate->chunk_info[arrow_col];
-            arrow::Array       *array = festate->chunks[arrow_col];
-            arrow::DataType    *arrow_type = festate->types[arrow_col];
-            int                 arrow_type_id = arrow_type->id();
-
-            chunkInfo.len = array->length();
-
-            if (chunkInfo.pos >= chunkInfo.len)
-            {
-                auto column = festate->table->column(arrow_col);
-
-                /* There are no more chunks */
-                if (++chunkInfo.chunk >= column->num_chunks())
-                    break;
-
-                array = column->chunk(chunkInfo.chunk).get();
-                festate->chunks[arrow_col] = array;
-                chunkInfo.pos = 0;
-                chunkInfo.len = array->length();
-            }
-
-            /* Don't do actual reading data into slot in fake mode */
-            if (fake)
-                continue;
-
-            /* Currently only primitive types and lists are supported */
-            if (arrow_type_id != arrow::Type::LIST)
-            {
-                if (festate->has_nulls[arrow_col] && array->IsNull(chunkInfo.pos))
-                {
-                    slot->tts_isnull[attr] = true;
-                }
-                else
-                {
-                    slot->tts_values[attr] = 
-                        read_primitive_type(festate,
-                                            array,
-                                            arrow_type_id,
-                                            chunkInfo.pos,
-                                            festate->castfuncs[attr]);
-                    slot->tts_isnull[attr] = false;
-                }
-            }
-            else
-            {
-                Oid     pg_type_id;
-
-                pg_type_id = TupleDescAttr(slot->tts_tupleDescriptor, attr)->atttypid;
-                if (!type_is_array(pg_type_id))
-                    elog(ERROR,
-                         "parquet_fdw: cannot convert parquet column of type "
-                         "LIST to postgres column of scalar type");
-
-                /* Figure out the base element types */
-                pg_type_id = get_element_type(pg_type_id);
-                arrow_type_id = get_arrow_list_elem_type(arrow_type);
-
-                int64 pos = chunkInfo.pos;
-                arrow::ListArray   *larray = (arrow::ListArray *) array;
-
-                if (festate->has_nulls[arrow_col] && array->IsNull(pos))
-                {
-                    slot->tts_isnull[attr] = true;
-                }
-                else
-                {
-                    std::shared_ptr<arrow::Array> slice =
-                        larray->values()->Slice(larray->value_offset(pos),
-                                                larray->value_length(pos));
-
-                    slot->tts_values[attr] =
-                        nested_list_get_datum(festate,
-                                              slice.get(),
-                                              arrow_type_id,
-                                              pg_type_id,
-                                              festate->castfuncs[attr]);
-                    slot->tts_isnull[attr] = false;
-                }
-            }
-
-            chunkInfo.pos++;
-        }
-        else
-        {
-            slot->tts_isnull[attr] = true;
-        }
-    }
+    node->fdw_state = festate;
 }
 
 /*
@@ -1477,87 +2716,6 @@ find_cmp_func(FmgrInfo *finfo, Oid type1, Oid type2)
     fmgr_info(cmp_proc_oid, finfo);
 }
 
-static bool
-read_next_rowgroup(ParquetFdwExecutionState *festate, TupleDesc tupleDesc)
-{
-    ParallelCoordinator        *coord;
-    arrow::Status               status;
-
-    coord = festate->coordinator;
-
-    /*
-     * Use atomic increment for parallel query or just regular one for single
-     * threaded execution.
-     */
-    if (coord)
-        festate->row_group = pg_atomic_fetch_add_u32(&coord->next_rowgroup, 1);
-    else
-        festate->row_group++;
-
-    /*
-     * row_group cannot be less than zero at this point so it is safe to cast
-     * it to unsigned int
-     */
-    if ((uint) festate->row_group >= festate->rowgroups.size())
-        return false;
-
-    int  rowgroup = festate->rowgroups[festate->row_group];
-    auto rowgroup_meta = festate->reader
-                            ->parquet_reader()
-                            ->metadata()
-                            ->RowGroup(rowgroup);
-
-    /* Determine which columns has null values */
-    for (uint i = 0; i < festate->map.size(); i++)
-    {
-        std::shared_ptr<parquet::Statistics>  stats;
-        int arrow_col = festate->map[i];
-
-        if (arrow_col < 0)
-            continue;
-
-        stats = rowgroup_meta
-            ->ColumnChunk(festate->indices[arrow_col])
-            ->statistics();
-
-        if (stats)
-            festate->has_nulls[arrow_col] = (stats->null_count() > 0);
-        else
-            festate->has_nulls[arrow_col] = true;
-    }
-
-    status = festate->reader
-        ->RowGroup(rowgroup)
-        ->ReadTable(festate->indices, &festate->table);
-
-    if (!status.ok())
-        throw std::runtime_error(status.message().c_str());
-
-    if (!festate->table)
-        throw std::runtime_error("got empty table");
-
-    /* Fill festate->columns and festate->types */
-    /* TODO: don't clear each time */
-    festate->chunk_info.clear();
-    festate->chunks.clear();
-    for (int i = 0; i < tupleDesc->natts; i++)
-    {
-        if (festate->map[i] >= 0)
-        {
-            ChunkInfo chunkInfo = { .chunk = 0, .pos = 0, .len = 0 };
-            auto column = festate->table->column(festate->map[i]);
-
-            festate->chunk_info.push_back(chunkInfo);
-            festate->chunks.push_back(column->chunk(0).get());
-        }
-    }
-
-    festate->row = 0;
-    festate->num_rows = festate->table->num_rows();
-
-    return true;
-}
-
 extern "C" TupleTableSlot *
 parquetIterateForeignScan(ForeignScanState *node)
 {
@@ -1565,39 +2723,14 @@ parquetIterateForeignScan(ForeignScanState *node)
 	TupleTableSlot             *slot = node->ss.ss_ScanTupleSlot;
 
 	ExecClearTuple(slot);
-
-    /* recycle old segments if any */
-    if (!festate->garbage_segments.empty())
+    try
     {
-        for (auto it : festate->garbage_segments)
-            pfree(it);
-        festate->garbage_segments.clear();
-        elog(DEBUG1, "parquet_fdw: garbage segments recycled");
+        festate->next(slot);
     }
-
-    if (festate->row >= festate->num_rows)
+    catch (std::exception &e)
     {
-        /* Read next row group */
-        try
-        {
-            if (!read_next_rowgroup(festate, slot->tts_tupleDescriptor))
-                return slot;
-        }
-        catch(const std::exception& e)
-        {
-            elog(ERROR,
-                 "parquet_fdw: failed to read row group %d: %s",
-                 festate->row_group, e.what());
-        }
-
-        /* Lookup cast funcs */
-        if (!festate->initialized)
-            initialize_castfuncs(festate, slot->tts_tupleDescriptor);
+        elog(ERROR, "parquet_fdw: %s", e.what());
     }
-
-    populate_slot(festate, slot);
-    festate->row++;
-    ExecStoreVirtualTuple(slot);
 
     return slot;
 }
@@ -1605,18 +2738,10 @@ parquetIterateForeignScan(ForeignScanState *node)
 extern "C" void
 parquetEndForeignScan(ForeignScanState *node)
 {
-    ParquetFdwExecutionState *festate = (ParquetFdwExecutionState *) node->fdw_state;
-
-    /* 
-     * Disable autodestruction to prevent double freeing of the execution
-     * state object. I could just remove `delete festate` below and let the
-     * memory context callback do its job. But it is more obvious for readers
-     * to see an explicit destruction of the execution state.
+    /*
+     * Destruction of execution state is done by memory context callback. See
+     * destroy_parquet_state()
      */
-    festate->autodestroy = false;
-
-    delete festate;
-
 }
 
 extern "C" void
@@ -1624,9 +2749,7 @@ parquetReScanForeignScan(ForeignScanState *node)
 {
     ParquetFdwExecutionState   *festate = (ParquetFdwExecutionState *) node->fdw_state;
 
-    festate->row_group = 0;
-    festate->row = 0;
-    festate->num_rows = 0;
+    festate->rescan();
 }
 
 static int
@@ -1637,51 +2760,73 @@ parquetAcquireSampleRowsFunc(Relation relation, int elevel,
 {
     ParquetFdwExecutionState   *festate;
     ParquetFdwPlanState         fdw_private;
+    MemoryContext               reader_cxt;
     TupleDesc       tupleDesc = RelationGetDescr(relation);
     TupleTableSlot *slot;
     std::set<int>   attrs_used;
-    int cnt = 0;
+    int             cnt = 0;
+    uint64          num_rows = 0;
+    ListCell       *lc;
 
     get_table_options(RelationGetRelid(relation), &fdw_private);
 
     for (int i = 0; i < tupleDesc->natts; ++i)
         attrs_used.insert(i + 1 - FirstLowInvalidHeapAttributeNumber);
 
-    /* Open parquet file and build execution state */
-    try
+    reader_cxt = AllocSetContextCreate(CurrentMemoryContext,
+                                       "parquet_fdw tuple data",
+                                       ALLOCSET_DEFAULT_SIZES);
+    festate = new MultifileExecutionState(reader_cxt,
+                                          tupleDesc,
+                                          attrs_used,
+                                          fdw_private.use_threads,
+                                          false);
+
+    foreach (lc, fdw_private.filenames)
     {
-        festate = create_parquet_state(fdw_private.filename,
-                                       tupleDesc,
-                                       CurrentMemoryContext,
-                                       attrs_used,
-                                       false,
-                                       fdw_private.use_threads);
-        festate->autodestroy = false;
-    }
-    catch(const std::exception& e)
-    {
-        elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
+        char *filename = strVal((Value *) lfirst(lc));
+
+        try
+        {
+            std::unique_ptr<parquet::arrow::FileReader> reader;
+            arrow::Status   status;
+            List           *rowgroups = NIL;
+
+            status = parquet::arrow::FileReader::Make(
+                        arrow::default_memory_pool(),
+                        parquet::ParquetFileReader::OpenFile(filename, false),
+                        &reader);
+            if (!status.ok())
+                throw Error("failed to open Parquet file: %s",
+                                     status.message().c_str());
+            auto meta = reader->parquet_reader()->metadata();
+            num_rows += meta->num_rows();
+
+            /* We need to scan all rowgroups */
+            for (int i = 0; i < meta->num_row_groups(); ++i)
+                rowgroups = lappend_int(rowgroups, i);
+            festate->add_file(filename, rowgroups);
+        }
+        catch(const std::exception &e)
+        {
+            elog(ERROR, "parquet_fdw: %s", e.what());
+        }
     }
 
     PG_TRY();
     {
-        auto meta = festate->reader->parquet_reader()->metadata();
-        int ratio = meta->num_rows() / targrows;
+        uint64  row = 0;
+        int     ratio = num_rows / targrows;
 
         /* Set ratio to at least 1 to avoid devision by zero issue */
         ratio = ratio < 1 ? 1 : ratio;
 
-        /* We need to scan all rowgroups */
-        for (int i = 0; i < meta->num_row_groups(); ++i)
-            festate->rowgroups.push_back(i);
 
 #if PG_VERSION_NUM < 120000
         slot = MakeSingleTupleTableSlot(tupleDesc);
 #else
         slot = MakeSingleTupleTableSlot(tupleDesc, &TTSOpsHeapTuple);
 #endif
-
-        initialize_castfuncs(festate, tupleDesc);
 
         while (true)
         {
@@ -1690,34 +2835,10 @@ parquetAcquireSampleRowsFunc(Relation relation, int elevel,
             if (cnt >= targrows)
                 break;
 
-            /* recycle old segments if any */
-            if (!festate->garbage_segments.empty())
-            {
-                for (auto it : festate->garbage_segments)
-                    pfree(it);
-                festate->garbage_segments.clear();
-                elog(DEBUG1, "parquet_fdw: garbage segments recycled");
-            }
-
-            if (festate->row >= festate->num_rows)
-            {
-                /* Read next row group */
-                try
-                {
-                    if (!read_next_rowgroup(festate, tupleDesc))
-                        break;
-                }
-                catch(const std::exception& e)
-                {
-                    elog(ERROR,
-                         "parquet_fdw: failed to read row group %d: %s",
-                         festate->row_group, e.what());
-                }
-            }
-
-            bool fake = (festate->row % ratio) != 0;
-
-            populate_slot(festate, slot, fake);
+            bool fake = (row % ratio) != 0;
+            ExecClearTuple(slot);
+            if (!festate->next(slot, fake))
+                break;
 
             if (!fake)
             {
@@ -1726,10 +2847,10 @@ parquetAcquireSampleRowsFunc(Relation relation, int elevel,
                                               slot->tts_isnull);
             }
 
-            festate->row++;
+            row++;
         }
 
-        *totalrows = meta->num_rows();
+        *totalrows = num_rows;
         *totaldeadrows = 0;
 
         ExecDropSingleTupleTableSlot(slot);
@@ -1748,9 +2869,9 @@ parquetAcquireSampleRowsFunc(Relation relation, int elevel,
 }
 
 extern "C" bool
-parquetAnalyzeForeignTable (Relation relation,
-                            AcquireSampleRowsFunc *func,
-                            BlockNumber *totalpages)
+parquetAnalyzeForeignTable(Relation relation,
+                           AcquireSampleRowsFunc *func,
+                           BlockNumber *totalpages)
 {
     *func = parquetAcquireSampleRowsFunc;
     return true;
@@ -1764,31 +2885,67 @@ extern "C" void
 parquetExplainForeignScan(ForeignScanState *node, ExplainState *es)
 {
     List	   *fdw_private;
-    List       *rowgroups;
-    ListCell   *lc;
+    ListCell   *lc, *lc2, *lc3;
     StringInfoData str;
-    bool        is_first = true;
+    List       *filenames;
+    List       *rowgroups_list;
+    ReaderType  reader_type;
 
     initStringInfo(&str);
 
 	fdw_private = ((ForeignScan *) node->ss.ps.plan)->fdw_private;
-    rowgroups = (List *) llast(fdw_private);
+    filenames = (List *) linitial(fdw_private);
+    reader_type = (ReaderType) intVal((Value *) list_nth(fdw_private, 5));
+    rowgroups_list = (List *) llast(fdw_private);
 
-    foreach(lc, rowgroups)
+    switch (reader_type)
     {
-        /*
-         * As parquet-tools use 1 based indexing for row groups it's probably
-         * a good idea to output row groups numbers in the same way.
-         */
-        int rowgroup = lfirst_int(lc) + 1;
+        case RT_SINGLE:
+            ExplainPropertyText("Reader", "Single File", es);
+            break;
+        case RT_MULTI:
+            ExplainPropertyText("Reader", "Multifile", es);
+            break;
+        case RT_MULTI_MERGE:
+            ExplainPropertyText("Reader", "Multifile Merge", es);
+            break;
+    }
 
-        if (is_first)
+    forboth(lc, filenames, lc2, rowgroups_list)
+    {
+        char   *filename = strVal((Value *) lfirst(lc));
+        List   *rowgroups = (List *) lfirst(lc2);
+        bool    is_first = true;
+
+        /* Only print filename if there're more than one file */
+        if (list_length(filenames) > 1)
         {
-            appendStringInfo(&str, "%i", rowgroup);
-            is_first = false;
+            appendStringInfoChar(&str, '\n');
+            appendStringInfoSpaces(&str, (es->indent + 1) * 2);
+
+#ifdef _GNU_SOURCE
+        appendStringInfo(&str, "%s: ", basename(filename));
+#else
+        appendStringInfo(&str, "%s: ", basename(pstrdup(filename)));
+#endif
         }
-        else
-            appendStringInfo(&str, ", %i", rowgroup);
+
+        foreach(lc3, rowgroups)
+        {
+            /*
+             * As parquet-tools use 1 based indexing for row groups it's probably
+             * a good idea to output row groups numbers in the same way.
+             */
+            int rowgroup = lfirst_int(lc3) + 1;
+
+            if (is_first)
+            {
+                appendStringInfo(&str, "%i", rowgroup);
+                is_first = false;
+            }
+            else
+                appendStringInfo(&str, ", %i", rowgroup);
+        }
     }
 
     ExplainPropertyText("Row groups", str.data, es);
@@ -1817,9 +2974,10 @@ parquetInitializeDSMForeignScan(ForeignScanState *node, ParallelContext *pcxt,
     ParallelCoordinator        *coord = (ParallelCoordinator *) coordinate;
     ParquetFdwExecutionState   *festate;
 
-    pg_atomic_write_u32(&coord->next_rowgroup, 0);
+    coord->next_rowgroup = 0;
+    coord->next_reader = 0;
     festate = (ParquetFdwExecutionState *) node->fdw_state;
-    festate->coordinator = coord;
+    festate->set_coordinator(coord);
 }
 
 extern "C" void
@@ -1828,7 +2986,7 @@ parquetReInitializeDSMForeignScan(ForeignScanState *node,
 {
     ParallelCoordinator    *coord = (ParallelCoordinator *) coordinate;
 
-    pg_atomic_write_u32(&coord->next_rowgroup, 0);
+    coord->next_rowgroup = 0;
 }
 
 extern "C" void
@@ -1839,161 +2997,14 @@ parquetInitializeWorkerForeignScan(ForeignScanState *node,
     ParallelCoordinator        *coord   = (ParallelCoordinator *) coordinate;
     ParquetFdwExecutionState   *festate;
 
+    coord = new(coordinate) ParallelCoordinator;
     festate = (ParquetFdwExecutionState *) node->fdw_state;
-    festate->coordinator = coord;
+    festate->set_coordinator(coord);
 }
 
 extern "C" void
 parquetShutdownForeignScan(ForeignScanState *node)
 {
-    ParquetFdwExecutionState   *festate;
-
-    festate = (ParquetFdwExecutionState *) node->fdw_state;
-    festate->coordinator = NULL;
-}
-
-/*
- * extract_parquet_fields
- *      Read parquet file and return a list of its fields
- */
-std::list<std::pair<std::string, Oid> >
-extract_parquet_fields(ImportForeignSchemaStmt *stmt, const char *path)
-{
-    std::list<std::pair<std::string, Oid> >     res;
-    std::unique_ptr<parquet::arrow::FileReader> reader;
-    std::shared_ptr<arrow::Schema>              schema;
-
-    try
-    {
-        parquet::arrow::FileReader::Make(
-                arrow::default_memory_pool(),
-                parquet::ParquetFileReader::OpenFile(path, false),
-                &reader
-        );
-
-    }
-    catch(const std::exception& e)
-    {
-        elog(ERROR, "parquet_fdw: parquet initialization failed: %s", e.what());
-    }
-
-    PG_TRY();
-    {
-        auto meta = reader->parquet_reader()->metadata();
-        parquet::ArrowReaderProperties props;
-
-        if (!parquet::arrow::FromParquetSchema(meta->schema(), props, &schema).ok())
-            elog(ERROR, "parquet_fdw: error reading parquet schema");
-
-        for (int k = 0; k < schema->num_fields(); ++k)
-        {
-            std::shared_ptr<arrow::Field>       field;
-            std::shared_ptr<arrow::DataType>    type;
-            Oid     pg_type;
-
-            /* Convert to arrow field to get appropriate type */
-            field = schema->field(k);
-            type = field->type();
-
-            if (type->id() == arrow::Type::LIST)
-            {
-                int subtype_id;
-                Oid pg_subtype;
-
-                if (type->children().size() != 1)
-                    elog(ERROR, "parquet_fdw: lists of structs are not supported");
-
-                subtype_id = get_arrow_list_elem_type(type.get());
-                pg_subtype = to_postgres_type(subtype_id);
-
-                pg_type = get_array_type(pg_subtype);
-            }
-            else
-            {
-                pg_type = to_postgres_type(type->id());
-            }
-
-            if (pg_type != InvalidOid)
-            {
-                res.push_back(std::pair<std::string, Oid>(field->name(), pg_type));
-            }
-            else
-            {
-                elog(ERROR,
-                     "parquet_fdw: cannot convert field '%s' of type '%s' in %s",
-                     field->name().c_str(), type->name().c_str(), path);
-            }
-        }
-    }
-    PG_CATCH();
-    {
-        /* Destroy the reader on error */
-        reader.reset();
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
-
-    return res;
-}
-
-/*
- * autodiscover_parquet_file
- *      Builds CREATE FOREIGN TABLE query based on specified parquet file
- */
-static char *
-autodiscover_parquet_file(ImportForeignSchemaStmt *stmt, char *filename)
-{
-    char           *path = psprintf("%s/%s", stmt->remote_schema, filename);
-    StringInfoData  str;
-    auto            fields = extract_parquet_fields(stmt, path);
-    bool            is_first = true;
-    char           *ext;
-    ListCell       *lc;
-
-    initStringInfo(&str);
-    appendStringInfo(&str, "CREATE FOREIGN TABLE ");
-
-    /* append table name */
-    ext = strrchr(filename, '.');
-    *ext = '\0';
-    if (stmt->local_schema)
-        appendStringInfo(&str, "%s.%s (",
-                         stmt->local_schema, quote_identifier(filename));
-    else
-        appendStringInfo(&str, "%s (", quote_identifier(filename));
-    *ext = '.';
-
-    /* append columns */
-    for (auto field: fields)
-    {
-        std::string &name = field.first;
-        Oid pg_type = field.second;
-
-        const char *type_name = format_type_be(pg_type);
-
-        if (!is_first)
-            appendStringInfo(&str, ", %s %s", name.c_str(), type_name);
-        else
-        {
-            appendStringInfo(&str, "%s %s", name.c_str(), type_name);
-            is_first = false;
-        }
-    }
-    appendStringInfo(&str, ") SERVER %s ", stmt->server_name);
-    appendStringInfo(&str, "OPTIONS (filename '%s'", path);
-
-    /* append options */
-    foreach (lc, stmt->options)
-    {
-		DefElem    *def = (DefElem *) lfirst(lc);
-
-        appendStringInfo(&str, ", %s '%s'", def->defname, defGetString(def));
-    }
-    appendStringInfo(&str, ")");
-
-    elog(DEBUG1, "parquet_fdw: %s", str.data);
-
-    return str.data;
 }
 
 extern "C" List *
@@ -2021,7 +3032,12 @@ parquetImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
         {
             ListCell   *lc;
             bool        skip = false;
-            char       *filename = f->d_name;
+            List       *fields;
+            char       *filename = pstrdup(f->d_name);
+            char       *path;
+            char       *query;
+
+            path = psprintf("%s/%s", stmt->remote_schema, filename);
 
             /* check that file extension is "parquet" */
             char *ext = strrchr(filename, '.');
@@ -2062,13 +3078,346 @@ parquetImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
             if (skip)
                 continue;
 
-            /* Return dot back */
-            *ext = '.';
-            cmds = lappend(cmds, autodiscover_parquet_file(stmt, filename));
+            fields = extract_parquet_fields(path);
+            query = create_foreign_table_query(filename, stmt->local_schema,
+                                               stmt->server_name, &path, 1,
+                                               fields, stmt->options);
+            cmds = lappend(cmds, query);
         }
 
     }
     FreeDir(d);
 
     return cmds;
+}
+
+extern "C" Datum
+parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
+{
+    List       *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
+    Oid         catalog = PG_GETARG_OID(1);
+    ListCell   *lc;
+    bool        filename_provided = false;
+
+    /* Only check table options */
+    if (catalog != ForeignTableRelationId)
+        PG_RETURN_VOID();
+
+    foreach(lc, options_list)
+    {
+        DefElem    *def = (DefElem *) lfirst(lc);
+
+        if (strcmp(def->defname, "filename") == 0)
+        {
+            char   *filename = pstrdup(defGetString(def));
+            List   *filenames;
+            ListCell *lc;
+
+            filenames = parse_filenames_list(filename);
+
+            foreach(lc, filenames)
+            {
+                struct stat stat_buf;
+                char       *fn = strVal((Value *) lfirst(lc));
+
+                if (stat(fn, &stat_buf) != 0)
+                {
+                    int e = errno;
+
+                    ereport(ERROR,
+                            (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                             errmsg("parquet_fdw: %s", strerror(e))));
+                }
+            }
+            pfree(filenames);
+            pfree(filename);
+            filename_provided = true;
+        }
+        else if (strcmp(def->defname, "sorted") == 0)
+            ;  /* do nothing */
+        else if (strcmp(def->defname, "batch_size") == 0)
+            /* check that int value is valid */
+            strtol(defGetString(def), NULL, 10);
+        else if (strcmp(def->defname, "use_mmap") == 0)
+        {
+            /* Check that bool value is valid */
+            bool    use_mmap;
+
+            if (!parse_bool(defGetString(def), &use_mmap))
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("invalid value for boolean option \"%s\": %s",
+                                def->defname, defGetString(def))));
+        }
+        else if (strcmp(def->defname, "use_threads") == 0)
+        {
+            /* Check that bool value is valid */
+            bool    use_threads;
+
+            if (!parse_bool(defGetString(def), &use_threads))
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("invalid value for boolean option \"%s\": %s",
+                                def->defname, defGetString(def))));
+        }
+        else
+        {
+            ereport(ERROR,
+                    (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+                     errmsg("parquet_fdw: invalid option \"%s\"",
+                            def->defname)));
+        }
+    }
+
+    if (!filename_provided)
+        elog(ERROR, "parquet_fdw: filename is required");
+
+    PG_RETURN_VOID();
+}
+
+static List *
+jsonb_to_options_list(Jsonb *options)
+{
+    List           *res = NIL;
+	JsonbIterator  *it;
+    JsonbValue      v;
+    JsonbIteratorToken  type = WJB_DONE;
+
+    if (!options)
+        return NIL;
+
+    if (!JsonContainerIsObject(&options->root))
+        elog(ERROR, "options must be represented by a jsonb object");
+
+    it = JsonbIteratorInit(&options->root);
+    while ((type = JsonbIteratorNext(&it, &v, false)) != WJB_DONE)
+    {
+        switch (type)
+        {
+            case WJB_BEGIN_OBJECT:
+            case WJB_END_OBJECT:
+                break;
+            case WJB_KEY:
+                {
+                    DefElem    *elem;
+                    char       *key;
+                    char       *val;
+
+                    if (v.type != jbvString)
+                        elog(ERROR, "expected a string key");
+                    key = pnstrdup(v.val.string.val, v.val.string.len);
+
+                    /* read value directly after key */
+                    type = JsonbIteratorNext(&it, &v, false);
+                    if (type != WJB_VALUE || v.type != jbvString)
+                        elog(ERROR, "expected a string value");
+                    val = pnstrdup(v.val.string.val, v.val.string.len);
+
+                    elem = makeDefElem(key, (Node *) makeString(val), 0);
+                    res = lappend(res, elem);
+
+                    break;
+                }
+            default:
+                elog(ERROR, "wrong options format");
+        }
+    }
+
+    return res;
+}
+
+static List *
+array_to_fields_list(ArrayType *attnames, ArrayType *atttypes)
+{
+    List   *res = NIL;
+    Datum  *names;
+    Datum  *types;
+    bool   *nulls;
+    int     nnames;
+    int     ntypes;
+
+    if (!attnames || !atttypes)
+        elog(ERROR, "attnames and atttypes arrays must not be NULL");
+
+    if (ARR_HASNULL(attnames))
+        elog(ERROR, "attnames array must not contain NULLs");
+
+    if (ARR_HASNULL(atttypes))
+        elog(ERROR, "atttypes array must not contain NULLs");
+
+    deconstruct_array(attnames, TEXTOID, -1, false, 'i', &names, &nulls, &nnames);
+    deconstruct_array(atttypes, REGTYPEOID, 4, true, 'i', &types, &nulls, &ntypes);
+
+    if (nnames != ntypes)
+        elog(ERROR, "attnames and attypes arrays must have same length");
+
+    for (int i = 0; i < nnames; ++i)
+    {
+        FieldInfo  *field = (FieldInfo *) palloc(sizeof(FieldInfo));
+        char       *attname;
+        attname = text_to_cstring(DatumGetTextP(names[i]));
+
+        if (strlen(attname) >= NAMEDATALEN)
+            elog(ERROR, "attribute name cannot be longer than %i", NAMEDATALEN - 1);
+
+        strcpy(field->name, attname);
+        field->oid = types[i];
+
+        res = lappend(res, field);
+    }
+
+    return res;
+}
+
+static void
+validate_import_args(const char *tablename, const char *servername, Oid funcoid)
+{
+    if (!tablename)
+        elog(ERROR, "foreign table name is mandatory");
+
+    if (!servername)
+        elog(ERROR, "foreign server name is mandatory");
+
+    if (!OidIsValid(funcoid))
+        elog(ERROR, "function must be specified");
+}
+
+static void
+import_parquet_internal(const char *tablename, const char *schemaname,
+                        const char *servername, List *fields, Oid funcid,
+                        Jsonb *arg, Jsonb *options) noexcept
+{
+    Datum       res;
+    FmgrInfo    finfo;
+    ArrayType  *arr;
+    Oid         ret_type;
+    List       *optlist;
+    char       *query;
+
+    validate_import_args(tablename, servername, funcid);
+
+    if ((ret_type = get_func_rettype(funcid)) != TEXTARRAYOID)
+    {
+        elog(ERROR,
+             "return type of '%s' function is %s; expected text[]",
+             get_func_name(funcid), format_type_be(ret_type));
+    }
+
+    optlist = jsonb_to_options_list(options);
+
+    /* Call the user provided function */
+    fmgr_info(funcid, &finfo);
+    res = FunctionCall1(&finfo, (Datum) arg);
+
+    /*
+     * In case function returns NULL the ERROR is thrown. So it's safe to
+     * assume function returned something. Just for the sake of readability
+     * I leave this condition
+     */
+    if (res != (Datum) 0)
+    {
+        Datum  *values;
+        bool   *nulls;
+        int     num;
+        int     ret;
+
+        arr = DatumGetArrayTypeP(res);
+        deconstruct_array(arr, TEXTOID, -1, false, 'i', &values, &nulls, &num);
+
+        if (num == 0)
+        {
+            elog(WARNING,
+                 "'%s' function returned an empty array; foreign table wasn't created",
+                 get_func_name(funcid));
+            return;
+        }
+
+        /* Convert values to cstring array */
+        char **paths = (char **) palloc(num * sizeof(char *));
+        for (int i = 0; i < num; ++i)
+        {
+            if (nulls[i])
+                elog(ERROR, "user function returned an array containing NULL value(s)");
+            paths[i] = text_to_cstring(DatumGetTextP(values[i]));
+        }
+
+        /*
+         * If attributes list is provided then use it. Otherwise get the list
+         * from the first file provided by the user function. We trust the user
+         * to provide a list of files with the same structure.
+         */
+        fields = fields ? fields : extract_parquet_fields(paths[0]);
+
+        query = create_foreign_table_query(tablename, schemaname, servername,
+                                           paths, num, fields, optlist);
+
+        /* Execute query */
+        if (SPI_connect() < 0)
+            elog(ERROR, "parquet_fdw: SPI_connect failed");
+
+        if ((ret = SPI_exec(query, 0)) != SPI_OK_UTILITY)
+            elog(ERROR, "parquet_fdw: failed to create table '%s': %s",
+                 tablename, SPI_result_code_string(ret));
+
+        SPI_finish();
+    }
+}
+
+extern "C"
+{
+
+PG_FUNCTION_INFO_V1(import_parquet);
+Datum
+import_parquet(PG_FUNCTION_ARGS)
+{
+    char       *tablename;
+    char       *schemaname;
+    char       *servername;
+    Oid         funcid;
+    Jsonb      *arg;
+    Jsonb      *options;
+
+    tablename = PG_ARGISNULL(0) ? NULL : text_to_cstring(PG_GETARG_TEXT_P(0));
+    schemaname = PG_ARGISNULL(1) ? NULL : text_to_cstring(PG_GETARG_TEXT_P(1));
+    servername = PG_ARGISNULL(2) ? NULL : text_to_cstring(PG_GETARG_TEXT_P(2));
+    funcid = PG_ARGISNULL(3) ? InvalidOid : PG_GETARG_OID(3);
+    arg = PG_ARGISNULL(4) ? NULL : PG_GETARG_JSONB_P(4);
+    options = PG_ARGISNULL(5) ? NULL : PG_GETARG_JSONB_P(5);
+
+    import_parquet_internal(tablename, schemaname, servername, NULL, funcid, arg, options);
+
+    PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(import_parquet_with_attrs);
+Datum
+import_parquet_with_attrs(PG_FUNCTION_ARGS)
+{
+    char       *tablename;
+    char       *schemaname;
+    char       *servername;
+    ArrayType  *attnames;
+    ArrayType  *atttypes;
+    Oid         funcid;
+    Jsonb      *arg;
+    Jsonb      *options;
+    List       *fields;
+
+    tablename = PG_ARGISNULL(0) ? NULL : text_to_cstring(PG_GETARG_TEXT_P(0));
+    schemaname = PG_ARGISNULL(1) ? NULL : text_to_cstring(PG_GETARG_TEXT_P(1));
+    servername = PG_ARGISNULL(2) ? NULL : text_to_cstring(PG_GETARG_TEXT_P(2));
+    attnames = PG_ARGISNULL(3) ? NULL : PG_GETARG_ARRAYTYPE_P(3);
+    atttypes = PG_ARGISNULL(4) ? NULL : PG_GETARG_ARRAYTYPE_P(4);
+    funcid = PG_ARGISNULL(5) ? InvalidOid : PG_GETARG_OID(5);
+    arg = PG_ARGISNULL(6) ? NULL : PG_GETARG_JSONB_P(6);
+    options = PG_ARGISNULL(7) ? NULL : PG_GETARG_JSONB_P(7);
+
+    fields = array_to_fields_list(attnames, atttypes);
+
+    import_parquet_internal(tablename, schemaname, servername, fields,
+                            funcid, arg, options);
+
+    PG_RETURN_VOID();
+}
+
 }

@@ -5,9 +5,9 @@ PGFILEDESC = "parquet_fdw - foreign data wrapper for parquet"
 SHLIB_LINK = -lm -lstdc++ -lparquet -larrow
 
 EXTENSION = parquet_fdw
-DATA = parquet_fdw--0.1.sql
+DATA = parquet_fdw--0.1.sql parquet_fdw--0.1--0.2.sql
 
-REGRESS = parquet_fdw
+REGRESS = parquet_fdw import
 
 EXTRA_CLEAN = sql/parquet_fdw.sql expected/parquet_fdw.out
 
@@ -32,6 +32,9 @@ ifeq ($(shell test $(VERSION_NUM) -lt 110000; echo $$?), 0)
 	override CXXFLAGS += $(CFLAGS_SL)
 endif
 
+# PostgreSQL uses link time optimization option which may break compilation
+# (this happens on travis-ci). Redefine COMPILE.cxx.bc without this option.
+COMPILE.cxx.bc = $(CLANG) -xc++ -Wno-ignored-attributes $(BITCODE_CXXFLAGS) $(CPPFLAGS) -emit-llvm -c
 
 # XXX: a hurdle to use common compiler flags when building bytecode from C++
 # files. should be not unnecessary, but src/Makefile.global omits passing those

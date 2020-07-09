@@ -1,5 +1,3 @@
-#include <sys/stat.h>
-
 #include "postgres.h"
 #include "fmgr.h"
 
@@ -59,6 +57,7 @@ extern void parquetInitializeWorkerForeignScan(ForeignScanState *node,
                                                void *coordinate);
 extern void parquetShutdownForeignScan(ForeignScanState *node);
 extern List *parquetImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid);
+extern Datum parquet_fdw_validator_impl(PG_FUNCTION_ARGS);
 
 /* GUC variable */
 extern bool parquet_fdw_use_threads;
@@ -77,6 +76,13 @@ _PG_init(void)
 							NULL,
 							NULL);
 
+}
+
+PG_FUNCTION_INFO_V1(parquet_fdw_validator);
+Datum
+parquet_fdw_validator(PG_FUNCTION_ARGS)
+{
+    return parquet_fdw_validator_impl(fcinfo);
 }
 
 PG_FUNCTION_INFO_V1(parquet_fdw_handler);
@@ -103,78 +109,5 @@ parquet_fdw_handler(PG_FUNCTION_ARGS)
     fdwroutine->ImportForeignSchema = parquetImportForeignSchema;
 
     PG_RETURN_POINTER(fdwroutine);
-}
-
-PG_FUNCTION_INFO_V1(parquet_fdw_validator);
-Datum
-parquet_fdw_validator(PG_FUNCTION_ARGS)
-{
-    List       *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
-    Oid         catalog = PG_GETARG_OID(1);
-    ListCell   *lc;
-    bool        filename_provided = false;
-
-    /* Only check table options */
-    if (catalog != ForeignTableRelationId)
-        PG_RETURN_VOID();
-
-    foreach(lc, options_list)
-    {
-        DefElem    *def = (DefElem *) lfirst(lc);
-
-        if (strcmp(def->defname, "filename") == 0)
-        {
-            struct stat stat_buf;
-
-            if (stat(defGetString(def), &stat_buf) != 0)
-            {
-                int e = errno;
-
-                ereport(ERROR,
-                        (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
-                         errmsg("parquet_fdw: %s", strerror(e))));
-            }
-            filename_provided = true;
-        }
-        else if (strcmp(def->defname, "sorted") == 0)
-            ;  /* do nothing */
-        else if (strcmp(def->defname, "batch_size") == 0)
-            /* Check that int value is valid */
-            strtol(defGetString(def), NULL, 10);
-        else if (strcmp(def->defname, "use_mmap") == 0)
-        {
-            /* Check that bool value is valid */
-            bool    use_mmap;
-
-            if (!parse_bool(defGetString(def), &use_mmap))
-                ereport(ERROR,
-                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                         errmsg("invalid value for boolean option \"%s\": %s",
-                                def->defname, defGetString(def))));
-        }
-        else if (strcmp(def->defname, "use_threads") == 0)
-        {
-            /* Check that bool value is valid */
-            bool    use_threads;
-
-            if (!parse_bool(defGetString(def), &use_threads))
-                ereport(ERROR,
-                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                         errmsg("invalid value for boolean option \"%s\": %s",
-                                def->defname, defGetString(def))));
-        }
-        else
-        {
-            ereport(ERROR,
-                    (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
-                     errmsg("parquet_fdw: invalid option \"%s\"",
-                            def->defname)));
-        }
-    }
-
-    if (!filename_provided)
-        elog(ERROR, "parquet_fdw: filename is required");
-
-    PG_RETURN_VOID();
 }
 
