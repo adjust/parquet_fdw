@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import pyarrow.parquet as pq
 import numpy as np
@@ -17,7 +17,8 @@ df1 = pd.DataFrame({'one': [1, 2, 3],
                     'five': [date(2018, 1, 1),
                              date(2018, 1, 2),
                              date(2018, 1, 3)],
-                    'six': [True, False, True]})
+                    'six': [True, False, True],
+                    'seven': [0.5, None, 1.0]})
 table1 = pa.Table.from_pandas(df1)
 
 # row group 2
@@ -30,7 +31,8 @@ df2 = pd.DataFrame({'one': [4, 5, 6],
                     'five': [date(2018, 1, 4),
                              date(2018, 1, 5),
                              date(2018, 1, 6)],
-                    'six': [False, False, False]})
+                    'six': [False, False, False],
+                    'seven': [0.5, None, 1.0]})
 table2 = pa.Table.from_pandas(df2)
 
 with pq.ParquetWriter('example1.parquet', table1.schema) as writer:

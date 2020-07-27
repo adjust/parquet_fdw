@@ -1,5 +1,6 @@
 SET datestyle = 'ISO';
 SET client_min_messages = WARNING;
+SET log_statement TO 'none';
 CREATE EXTENSION parquet_fdw;
 DROP ROLE IF EXISTS regress_parquet_fdw;
 CREATE ROLE regress_parquet_fdw LOGIN SUPERUSER;
@@ -16,7 +17,8 @@ CREATE FOREIGN TABLE example1 (
     three   TEXT,
     four    TIMESTAMP,
     five    DATE,
-    six     BOOL)
+    six     BOOL,
+    seven   FLOAT8)
 SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/example1.parquet', sorted 'one');
 
@@ -40,6 +42,8 @@ SELECT * FROM example1 WHERE one = 2;
 SELECT * FROM example1 WHERE one = 7;
 SELECT * FROM example1 WHERE six = true;
 SELECT * FROM example1 WHERE six = false;
+SELECT * FROM example1 WHERE seven < 0.9;
+SELECT * FROM example1 WHERE seven IS NULL;
 
 -- prepared statements
 prepare prep(date) as select * from example1 where five < $1;
@@ -108,10 +112,11 @@ CREATE FOREIGN TABLE example_seq (
     three   TEXT,
     four    TIMESTAMP,
     five    DATE,
-    six     BOOL)
+    six     BOOL,
+    seven   FLOAT8)
 SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/example1.parquet @abs_srcdir@/data/example2.parquet');
-EXPLAIN SELECT * FROM example_seq;
+EXPLAIN (COSTS OFF) SELECT * FROM example_seq;
 SELECT * FROM example_seq;
 
 -- multifile merge reader
@@ -121,7 +126,8 @@ CREATE FOREIGN TABLE example_sorted (
     three   TEXT,
     four    TIMESTAMP,
     five    DATE,
-    six     BOOL)
+    six     BOOL,
+    seven   FLOAT8)
 SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/example1.parquet @abs_srcdir@/data/example2.parquet', sorted 'one');
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY one;
@@ -139,5 +145,18 @@ EXPLAIN (COSTS OFF) SELECT * FROM example_seq ORDER BY two;
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted;
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY one;
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY two;
+
+-- multiple sorting keys
+CREATE FOREIGN TABLE example_multisort (
+    one     INT8,
+    two     INT8[],
+    three   TEXT,
+    four    TIMESTAMP,
+    five    DATE,
+    six     BOOL)
+SERVER parquet_srv
+OPTIONS (filename '@abs_srcdir@/data/example1.parquet', sorted 'one five');
+EXPLAIN (COSTS OFF) SELECT * FROM example_multisort ORDER BY one, five;
+SELECT * FROM example_multisort ORDER BY one, five;
 
 DROP EXTENSION parquet_fdw CASCADE;

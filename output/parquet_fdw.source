@@ -1,5 +1,6 @@
 SET datestyle = 'ISO';
 SET client_min_messages = WARNING;
+SET log_statement TO 'none';
 CREATE EXTENSION parquet_fdw;
 DROP ROLE IF EXISTS regress_parquet_fdw;
 CREATE ROLE regress_parquet_fdw LOGIN SUPERUSER;
@@ -13,18 +14,19 @@ CREATE FOREIGN TABLE example1 (
     three   TEXT,
     four    TIMESTAMP,
     five    DATE,
-    six     BOOL)
+    six     BOOL,
+    seven   FLOAT8)
 SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/example1.parquet', sorted 'one');
 SELECT * FROM example1;
- one |    two     | three |        four         |    five    | six 
------+------------+-------+---------------------+------------+-----
-   1 | {1,2,3}    | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t
-   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f
-   3 | {7,8,9}    | baz   | 2018-01-03 00:00:00 | 2018-01-03 | t
-   4 | {10,11,12} | uno   | 2018-01-04 00:00:00 | 2018-01-04 | f
-   5 | {13,14,15} | dos   | 2018-01-05 00:00:00 | 2018-01-05 | f
-   6 | {16,17,18} | tres  | 2018-01-06 00:00:00 | 2018-01-06 | f
+ one |    two     | three |        four         |    five    | six | seven 
+-----+------------+-------+---------------------+------------+-----+-------
+   1 | {1,2,3}    | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t   |   0.5
+   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f   |      
+   3 | {7,8,9}    | baz   | 2018-01-03 00:00:00 | 2018-01-03 | t   |     1
+   4 | {10,11,12} | uno   | 2018-01-04 00:00:00 | 2018-01-04 | f   |   0.5
+   5 | {13,14,15} | dos   | 2018-01-05 00:00:00 | 2018-01-05 | f   |      
+   6 | {16,17,18} | tres  | 2018-01-06 00:00:00 | 2018-01-06 | f   |     1
 (6 rows)
 
 -- no explicit columns mentions
@@ -69,77 +71,91 @@ SET client_min_messages = DEBUG1;
 SELECT * FROM example1 WHERE one < 1;
 DEBUG:  parquet_fdw: skip rowgroup 1
 DEBUG:  parquet_fdw: skip rowgroup 2
- one | two | three | four | five | six 
------+-----+-------+------+------+-----
+ one | two | three | four | five | six | seven 
+-----+-----+-------+------+------+-----+-------
 (0 rows)
 
 SELECT * FROM example1 WHERE one <= 1;
 DEBUG:  parquet_fdw: skip rowgroup 2
- one |   two   | three |        four         |    five    | six 
------+---------+-------+---------------------+------------+-----
-   1 | {1,2,3} | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t
+ one |   two   | three |        four         |    five    | six | seven 
+-----+---------+-------+---------------------+------------+-----+-------
+   1 | {1,2,3} | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t   |   0.5
 (1 row)
 
 SELECT * FROM example1 WHERE one > 6;
 DEBUG:  parquet_fdw: skip rowgroup 1
 DEBUG:  parquet_fdw: skip rowgroup 2
- one | two | three | four | five | six 
------+-----+-------+------+------+-----
+ one | two | three | four | five | six | seven 
+-----+-----+-------+------+------+-----+-------
 (0 rows)
 
 SELECT * FROM example1 WHERE one >= 6;
 DEBUG:  parquet_fdw: skip rowgroup 1
- one |    two     | three |        four         |    five    | six 
------+------------+-------+---------------------+------------+-----
-   6 | {16,17,18} | tres  | 2018-01-06 00:00:00 | 2018-01-06 | f
+ one |    two     | three |        four         |    five    | six | seven 
+-----+------------+-------+---------------------+------------+-----+-------
+   6 | {16,17,18} | tres  | 2018-01-06 00:00:00 | 2018-01-06 | f   |     1
 (1 row)
 
 SELECT * FROM example1 WHERE one = 2;
 DEBUG:  parquet_fdw: skip rowgroup 2
- one |    two     | three |        four         |    five    | six 
------+------------+-------+---------------------+------------+-----
-   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f
+ one |    two     | three |        four         |    five    | six | seven 
+-----+------------+-------+---------------------+------------+-----+-------
+   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f   |      
 (1 row)
 
 SELECT * FROM example1 WHERE one = 7;
 DEBUG:  parquet_fdw: skip rowgroup 1
 DEBUG:  parquet_fdw: skip rowgroup 2
- one | two | three | four | five | six 
------+-----+-------+------+------+-----
+ one | two | three | four | five | six | seven 
+-----+-----+-------+------+------+-----+-------
 (0 rows)
 
 SELECT * FROM example1 WHERE six = true;
 DEBUG:  parquet_fdw: skip rowgroup 2
- one |   two   | three |        four         |    five    | six 
------+---------+-------+---------------------+------------+-----
-   1 | {1,2,3} | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t
-   3 | {7,8,9} | baz   | 2018-01-03 00:00:00 | 2018-01-03 | t
+ one |   two   | three |        four         |    five    | six | seven 
+-----+---------+-------+---------------------+------------+-----+-------
+   1 | {1,2,3} | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t   |   0.5
+   3 | {7,8,9} | baz   | 2018-01-03 00:00:00 | 2018-01-03 | t   |     1
 (2 rows)
 
 SELECT * FROM example1 WHERE six = false;
- one |    two     | three |        four         |    five    | six 
------+------------+-------+---------------------+------------+-----
-   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f
-   4 | {10,11,12} | uno   | 2018-01-04 00:00:00 | 2018-01-04 | f
-   5 | {13,14,15} | dos   | 2018-01-05 00:00:00 | 2018-01-05 | f
-   6 | {16,17,18} | tres  | 2018-01-06 00:00:00 | 2018-01-06 | f
+ one |    two     | three |        four         |    five    | six | seven 
+-----+------------+-------+---------------------+------------+-----+-------
+   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f   |      
+   4 | {10,11,12} | uno   | 2018-01-04 00:00:00 | 2018-01-04 | f   |   0.5
+   5 | {13,14,15} | dos   | 2018-01-05 00:00:00 | 2018-01-05 | f   |      
+   6 | {16,17,18} | tres  | 2018-01-06 00:00:00 | 2018-01-06 | f   |     1
 (4 rows)
+
+SELECT * FROM example1 WHERE seven < 0.9;
+ one |    two     | three |        four         |    five    | six | seven 
+-----+------------+-------+---------------------+------------+-----+-------
+   1 | {1,2,3}    | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t   |   0.5
+   4 | {10,11,12} | uno   | 2018-01-04 00:00:00 | 2018-01-04 | f   |   0.5
+(2 rows)
+
+SELECT * FROM example1 WHERE seven IS NULL;
+ one |    two     | three |        four         |    five    | six | seven 
+-----+------------+-------+---------------------+------------+-----+-------
+   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f   |      
+   5 | {13,14,15} | dos   | 2018-01-05 00:00:00 | 2018-01-05 | f   |      
+(2 rows)
 
 -- prepared statements
 prepare prep(date) as select * from example1 where five < $1;
 execute prep('2018-01-03');
 DEBUG:  parquet_fdw: skip rowgroup 2
- one |    two     | three |        four         |    five    | six 
------+------------+-------+---------------------+------------+-----
-   1 | {1,2,3}    | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t
-   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f
+ one |    two     | three |        four         |    five    | six | seven 
+-----+------------+-------+---------------------+------------+-----+-------
+   1 | {1,2,3}    | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t   |   0.5
+   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f   |      
 (2 rows)
 
 execute prep('2018-01-01');
 DEBUG:  parquet_fdw: skip rowgroup 1
 DEBUG:  parquet_fdw: skip rowgroup 2
- one | two | three | four | five | six 
------+-----+-------+------+------+-----
+ one | two | three | four | five | six | seven 
+-----+-----+-------+------+------+-----+-------
 (0 rows)
 
 -- invalid options
@@ -225,13 +241,14 @@ CREATE FOREIGN TABLE example_seq (
     three   TEXT,
     four    TIMESTAMP,
     five    DATE,
-    six     BOOL)
+    six     BOOL,
+    seven   FLOAT8)
 SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/example1.parquet @abs_srcdir@/data/example2.parquet');
-EXPLAIN SELECT * FROM example_seq;
-                           QUERY PLAN                            
------------------------------------------------------------------
- Foreign Scan on example_seq  (cost=0.00..0.11 rows=11 width=85)
+EXPLAIN (COSTS OFF) SELECT * FROM example_seq;
+         QUERY PLAN          
+-----------------------------
+ Foreign Scan on example_seq
    Reader: Multifile
    Row groups: 
      example1.parquet: 1, 2
@@ -239,19 +256,19 @@ EXPLAIN SELECT * FROM example_seq;
 (5 rows)
 
 SELECT * FROM example_seq;
- one |    two     | three |        four         |    five    | six 
------+------------+-------+---------------------+------------+-----
-   1 | {1,2,3}    | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t
-   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f
-   3 | {7,8,9}    | baz   | 2018-01-03 00:00:00 | 2018-01-03 | t
-   4 | {10,11,12} | uno   | 2018-01-04 00:00:00 | 2018-01-04 | f
-   5 | {13,14,15} | dos   | 2018-01-05 00:00:00 | 2018-01-05 | f
-   6 | {16,17,18} | tres  | 2018-01-06 00:00:00 | 2018-01-06 | f
-   1 | {19,20}    | eins  | 2018-01-01 00:00:00 | 2018-01-01 | t
-   3 | {21,22}    | zwei  | 2018-01-03 00:00:00 | 2018-01-03 | f
-   5 | {23,24}    | drei  | 2018-01-05 00:00:00 | 2018-01-05 | t
-   7 | {25,26}    | vier  | 2018-01-07 00:00:00 | 2018-01-07 | f
-   9 | {27,28}    | fünf  | 2018-01-09 00:00:00 | 2018-01-09 | t
+ one |    two     | three |        four         |    five    | six | seven 
+-----+------------+-------+---------------------+------------+-----+-------
+   1 | {1,2,3}    | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t   |   0.5
+   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f   |      
+   3 | {7,8,9}    | baz   | 2018-01-03 00:00:00 | 2018-01-03 | t   |     1
+   4 | {10,11,12} | uno   | 2018-01-04 00:00:00 | 2018-01-04 | f   |   0.5
+   5 | {13,14,15} | dos   | 2018-01-05 00:00:00 | 2018-01-05 | f   |      
+   6 | {16,17,18} | tres  | 2018-01-06 00:00:00 | 2018-01-06 | f   |     1
+   1 | {19,20}    | eins  | 2018-01-01 00:00:00 | 2018-01-01 | t   |      
+   3 | {21,22}    | zwei  | 2018-01-03 00:00:00 | 2018-01-03 | f   |      
+   5 | {23,24}    | drei  | 2018-01-05 00:00:00 | 2018-01-05 | t   |      
+   7 | {25,26}    | vier  | 2018-01-07 00:00:00 | 2018-01-07 | f   |      
+   9 | {27,28}    | fünf  | 2018-01-09 00:00:00 | 2018-01-09 | t   |      
 (11 rows)
 
 -- multifile merge reader
@@ -261,7 +278,8 @@ CREATE FOREIGN TABLE example_sorted (
     three   TEXT,
     four    TIMESTAMP,
     five    DATE,
-    six     BOOL)
+    six     BOOL,
+    seven   FLOAT8)
 SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/example1.parquet @abs_srcdir@/data/example2.parquet', sorted 'one');
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY one;
@@ -275,19 +293,19 @@ EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY one;
 (5 rows)
 
 SELECT * FROM example_sorted ORDER BY one;
- one |    two     | three |        four         |    five    | six 
------+------------+-------+---------------------+------------+-----
-   1 | {19,20}    | eins  | 2018-01-01 00:00:00 | 2018-01-01 | t
-   1 | {1,2,3}    | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t
-   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f
-   3 | {21,22}    | zwei  | 2018-01-03 00:00:00 | 2018-01-03 | f
-   3 | {7,8,9}    | baz   | 2018-01-03 00:00:00 | 2018-01-03 | t
-   4 | {10,11,12} | uno   | 2018-01-04 00:00:00 | 2018-01-04 | f
-   5 | {23,24}    | drei  | 2018-01-05 00:00:00 | 2018-01-05 | t
-   5 | {13,14,15} | dos   | 2018-01-05 00:00:00 | 2018-01-05 | f
-   6 | {16,17,18} | tres  | 2018-01-06 00:00:00 | 2018-01-06 | f
-   7 | {25,26}    | vier  | 2018-01-07 00:00:00 | 2018-01-07 | f
-   9 | {27,28}    | fünf  | 2018-01-09 00:00:00 | 2018-01-09 | t
+ one |    two     | three |        four         |    five    | six | seven 
+-----+------------+-------+---------------------+------------+-----+-------
+   1 | {19,20}    | eins  | 2018-01-01 00:00:00 | 2018-01-01 | t   |      
+   1 | {1,2,3}    | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t   |   0.5
+   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f   |      
+   3 | {21,22}    | zwei  | 2018-01-03 00:00:00 | 2018-01-03 | f   |      
+   3 | {7,8,9}    | baz   | 2018-01-03 00:00:00 | 2018-01-03 | t   |     1
+   4 | {10,11,12} | uno   | 2018-01-04 00:00:00 | 2018-01-04 | f   |   0.5
+   5 | {23,24}    | drei  | 2018-01-05 00:00:00 | 2018-01-05 | t   |      
+   5 | {13,14,15} | dos   | 2018-01-05 00:00:00 | 2018-01-05 | f   |      
+   6 | {16,17,18} | tres  | 2018-01-06 00:00:00 | 2018-01-06 | f   |     1
+   7 | {25,26}    | vier  | 2018-01-07 00:00:00 | 2018-01-07 | f   |      
+   9 | {27,28}    | fünf  | 2018-01-09 00:00:00 | 2018-01-09 | t   |      
 (11 rows)
 
 -- parallel execution
@@ -373,5 +391,34 @@ EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY two;
                  example1.parquet: 1, 2
                  example2.parquet: 1
 (9 rows)
+
+-- multiple sorting keys
+CREATE FOREIGN TABLE example_multisort (
+    one     INT8,
+    two     INT8[],
+    three   TEXT,
+    four    TIMESTAMP,
+    five    DATE,
+    six     BOOL)
+SERVER parquet_srv
+OPTIONS (filename '@abs_srcdir@/data/example1.parquet', sorted 'one five');
+EXPLAIN (COSTS OFF) SELECT * FROM example_multisort ORDER BY one, five;
+            QUERY PLAN             
+-----------------------------------
+ Foreign Scan on example_multisort
+   Reader: Single File
+   Row groups: 1, 2
+(3 rows)
+
+SELECT * FROM example_multisort ORDER BY one, five;
+ one |    two     | three |        four         |    five    | six 
+-----+------------+-------+---------------------+------------+-----
+   1 | {1,2,3}    | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t
+   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f
+   3 | {7,8,9}    | baz   | 2018-01-03 00:00:00 | 2018-01-03 | t
+   4 | {10,11,12} | uno   | 2018-01-04 00:00:00 | 2018-01-04 | f
+   5 | {13,14,15} | dos   | 2018-01-05 00:00:00 | 2018-01-05 | f
+   6 | {16,17,18} | tres  | 2018-01-06 00:00:00 | 2018-01-06 | f
+(6 rows)
 
 DROP EXTENSION parquet_fdw CASCADE;

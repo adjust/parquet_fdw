@@ -1,5 +1,6 @@
 SET datestyle = 'ISO';
 SET client_min_messages = WARNING;
+SET log_statement TO 'none';
 CREATE EXTENSION parquet_fdw;
 DROP ROLE IF EXISTS regress_parquet_fdw;
 CREATE ROLE regress_parquet_fdw LOGIN SUPERUSER;
@@ -25,7 +26,7 @@ language sql;
 
 select import_parquet('example_import', 'public', 'parquet_srv', 'list_parquet_files', '{"dir": "@abs_srcdir@/data"}', '{"sorted": "one"}');
 SELECT * FROM example_import ORDER BY one, three;
-select import_parquet_explicit('example_import2', 'public', 'parquet_srv', array[['one', 'int8'], ['three', 'text'], ['six', 'bool']], 'list_parquet_files', '{"dir": "@abs_srcdir@/data"}', '{"sorted": "one"}');
+select import_parquet_explicit('example_import2', 'public', 'parquet_srv', array['one', 'three', 'six'], array['int8', 'text', 'bool']::regtype[], 'list_parquet_files', '{"dir": "@abs_srcdir@/data"}', '{"sorted": "one"}');
 SELECT * FROM example_import2;
 
 DROP EXTENSION parquet_fdw CASCADE;
