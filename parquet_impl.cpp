@@ -993,33 +993,34 @@ public:
                 if (IsBinaryCoercible(src_type, dst_type))
                 {
                     this->castfuncs[i] = NULL;
-                    continue;
                 }
-
-                ct = find_coercion_pathway(dst_type,
-                                           src_type,
-                                           COERCION_EXPLICIT,
-                                           &funcid);
-                switch (ct)
+                else
                 {
-                    case COERCION_PATH_FUNC:
-                        {
-                            MemoryContext   oldctx;
+                    ct = find_coercion_pathway(dst_type,
+                                               src_type,
+                                               COERCION_EXPLICIT,
+                                               &funcid);
+                    switch (ct)
+                    {
+                        case COERCION_PATH_FUNC:
+                            {
+                                MemoryContext   oldctx;
 
-                            oldctx = MemoryContextSwitchTo(CurTransactionContext);
-                            this->castfuncs[i] = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
-                            fmgr_info(funcid, this->castfuncs[i]);
-                            MemoryContextSwitchTo(oldctx);
+                                oldctx = MemoryContextSwitchTo(CurTransactionContext);
+                                this->castfuncs[i] = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
+                                fmgr_info(funcid, this->castfuncs[i]);
+                                MemoryContextSwitchTo(oldctx);
+                                break;
+                            }
+                        case COERCION_PATH_RELABELTYPE:
+                        case COERCION_PATH_COERCEVIAIO:  /* TODO: double check that we
+                                                          * shouldn't do anything here*/
+                            /* Cast is not needed */
+                            this->castfuncs[i] = NULL;
                             break;
-                        }
-                    case COERCION_PATH_RELABELTYPE:
-                    case COERCION_PATH_COERCEVIAIO:  /* TODO: double check that we
-                                                      * shouldn't do anything here*/
-                        /* Cast is not needed */
-                        this->castfuncs[i] = NULL;
-                        break;
-                    default:
-                        elog(ERROR, "cast function is not found");
+                        default:
+                            elog(ERROR, "cast function is not found");
+                    }
                 }
             }
             PG_CATCH();
