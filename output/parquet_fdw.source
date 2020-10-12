@@ -190,10 +190,10 @@ CREATE FOREIGN TABLE example_seq (
     seven   FLOAT8)
 SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/example1.parquet @abs_srcdir@/data/example2.parquet');
-EXPLAIN SELECT * FROM example_seq;
-                           QUERY PLAN                            
------------------------------------------------------------------
- Foreign Scan on example_seq  (cost=0.00..0.11 rows=11 width=93)
+EXPLAIN (COSTS OFF) SELECT * FROM example_seq;
+         QUERY PLAN          
+-----------------------------
+ Foreign Scan on example_seq
    Reader: Multifile
    Row groups: 
      example1.parquet: 1, 2

@@ -79,7 +79,7 @@ CREATE FOREIGN TABLE example_seq (
     seven   FLOAT8)
 SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/example1.parquet @abs_srcdir@/data/example2.parquet');
-EXPLAIN SELECT * FROM example_seq;
+EXPLAIN (COSTS OFF) SELECT * FROM example_seq;
 SELECT * FROM example_seq;
 
 -- multifile merge reader
