@@ -1692,6 +1692,7 @@ row_group_matches_filter(parquet::Statistics *stats,
 
                 if (l < 0 || u > 0)
                     return false;
+                break;
             }
 
         default:
@@ -1711,8 +1712,7 @@ typedef enum
 
 /*
  * parse_filenames_list
- *      Parse space separated list of filenames. This function modifies 
- *      the original string.
+ *      Parse space separated list of filenames.
  */
 static List *
 parse_filenames_list(const char *str)
@@ -1767,6 +1767,7 @@ parse_filenames_list(const char *str)
                     default:
                         break;
                 }
+                break;
             default:
                 elog(ERROR, "parquet_fdw: unknown parse state");
         }
@@ -2323,7 +2324,11 @@ parquetGetForeignPaths(PlannerInfo *root,
     extract_rowgroup_filters(baserel->baserestrictinfo, filters);
 
     rte = root->simple_rte_array[baserel->relid];
+#if PG_VERSION_NUM < 120000
     rel = heap_open(rte->relid, AccessShareLock);
+#else
+    rel = table_open(rte->relid, AccessShareLock);
+#endif
     tupleDesc = RelationGetDescr(rel);
 
     /*
@@ -2339,7 +2344,11 @@ parquetGetForeignPaths(PlannerInfo *root,
 
         fdw_private->rowgroups = lappend(fdw_private->rowgroups, rowgroups);
     }
+#if PG_VERSION_NUM < 120000
     heap_close(rel, AccessShareLock);
+#else
+    table_close(rel, AccessShareLock);
+#endif
 
     estimate_costs(root, baserel, &startup_cost, &run_cost, &total_cost);
 
