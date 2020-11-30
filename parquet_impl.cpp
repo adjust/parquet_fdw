@@ -995,35 +995,36 @@ public:
                 if (IsBinaryCoercible(src_type, dst_type))
                 {
                     this->castfuncs[i] = NULL;
-                    continue;
                 }
-
-                ct = find_coercion_pathway(dst_type,
-                                           src_type,
-                                           COERCION_EXPLICIT,
-                                           &funcid);
-                switch (ct)
+                else
                 {
-                    case COERCION_PATH_FUNC:
-                        {
-                            MemoryContext   oldctx;
+                    ct = find_coercion_pathway(dst_type,
+                                               src_type,
+                                               COERCION_EXPLICIT,
+                                               &funcid);
+                    switch (ct)
+                    {
+                        case COERCION_PATH_FUNC:
+                            {
+                                MemoryContext   oldctx;
 
-                            oldctx = MemoryContextSwitchTo(CurTransactionContext);
-                            this->castfuncs[i] = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
-                            fmgr_info(funcid, this->castfuncs[i]);
-                            MemoryContextSwitchTo(oldctx);
+                                oldctx = MemoryContextSwitchTo(CurTransactionContext);
+                                this->castfuncs[i] = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
+                                fmgr_info(funcid, this->castfuncs[i]);
+                                MemoryContextSwitchTo(oldctx);
+                                break;
+                            }
+                        case COERCION_PATH_RELABELTYPE:
+                        case COERCION_PATH_COERCEVIAIO:  /* TODO: double check that we
+                                                          * shouldn't do anything here*/
+                            /* Cast is not needed */
+                            this->castfuncs[i] = NULL;
                             break;
-                        }
-                    case COERCION_PATH_RELABELTYPE:
-                    case COERCION_PATH_COERCEVIAIO:  /* TODO: double check that we
-                                                      * shouldn't do anything here*/
-                        /* Cast is not needed */
-                        this->castfuncs[i] = NULL;
-                        break;
-                    default:
-                        elog(ERROR, "cast function to %s ('%s' column) is not found",
-                             format_type_be(dst_type),
-                             NameStr(TupleDescAttr(tupleDesc, i)->attname));
+                        default:
+                            elog(ERROR, "cast function to %s ('%s' column) is not found",
+                                 format_type_be(dst_type),
+                                 NameStr(TupleDescAttr(tupleDesc, i)->attname));
+                    }
                 }
             }
             PG_CATCH();
@@ -1695,6 +1696,7 @@ row_group_matches_filter(parquet::Statistics *stats,
 
                 if (l < 0 || u > 0)
                     return false;
+                break;
             }
 
         default:
@@ -1714,8 +1716,7 @@ typedef enum
 
 /*
  * parse_filenames_list
- *      Parse space separated list of filenames. This function modifies 
- *      the original string.
+ *      Parse space separated list of filenames.
  */
 static List *
 parse_filenames_list(const char *str)
@@ -1770,6 +1771,7 @@ parse_filenames_list(const char *str)
                     default:
                         break;
                 }
+                break;
             default:
                 elog(ERROR, "parquet_fdw: unknown parse state");
         }
@@ -2426,7 +2428,11 @@ parquetGetForeignPaths(PlannerInfo *root,
     extract_rowgroup_filters(baserel->baserestrictinfo, filters);
 
     rte = root->simple_rte_array[baserel->relid];
+#if PG_VERSION_NUM < 120000
     rel = heap_open(rte->relid, AccessShareLock);
+#else
+    rel = table_open(rte->relid, AccessShareLock);
+#endif
     tupleDesc = RelationGetDescr(rel);
 
     /*
@@ -2442,7 +2448,11 @@ parquetGetForeignPaths(PlannerInfo *root,
 
         fdw_private->rowgroups = lappend(fdw_private->rowgroups, rowgroups);
     }
+#if PG_VERSION_NUM < 120000
     heap_close(rel, AccessShareLock);
+#else
+    table_close(rel, AccessShareLock);
+#endif
 
     estimate_costs(root, baserel, &startup_cost, &run_cost, &total_cost);
 
