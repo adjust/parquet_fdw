@@ -333,7 +333,7 @@ private:
         char    elem_align;
     };
 public:
-    /* id needed for parallel execution */
+    /* The reader identifier needed for parallel execution */
     int32                           reader_id;
 
     std::unique_ptr<parquet::arrow::FileReader> reader;
@@ -393,7 +393,12 @@ public:
     /* Wether object is properly initialized */
     bool     initialized;
 
-    ParquetFdwReader(int reader_id)
+    /* 
+     * Constructor.
+     * The reader_id parameter is only used for parallel execution of
+     * MultifileExecutionState.
+     */
+    ParquetFdwReader(int reader_id = -1)
         : reader_id(reader_id), row_group(-1), row(0), num_rows(0),
           coordinator(NULL), initialized(false)
     { }
@@ -515,14 +520,17 @@ public:
         coord = this->coordinator;
 
         /*
-         * Use atomic increment for parallel query or just regular one for single
-         * threaded execution.
+         * In case of parallel query get the row group index from the
+         * coordinator. Otherwise just increment it.
          */
         if (coord)
         {
             std::lock_guard<std::mutex> guard(coord->lock);
+
+            /* Did we finish reading from this reader? */
             if (this->reader_id != (coord->next_reader - 1))
                 return false;
+
             this->row_group = coord->next_rowgroup++;
         }
         else
@@ -541,7 +549,7 @@ public:
                                 ->metadata()
                                 ->RowGroup(rowgroup);
 
-        /* Determine which columns has null values */
+        /* Determine which columns have null values */
         for (uint i = 0; i < this->map.size(); i++)
         {
             std::shared_ptr<parquet::Statistics>  stats;
@@ -1135,12 +1143,11 @@ public:
     {
         ListCell           *lc;
         std::vector<int>    rg;
-        int                 reader_id = 0;
 
         foreach (lc, rowgroups)
             rg.push_back(lfirst_int(lc));
 
-        reader = new ParquetFdwReader(reader_id);
+        reader = new ParquetFdwReader();
         reader->open(filename, cxt, tupleDesc, attrs_used, use_threads, use_mmap);
         reader->set_rowgroups_list(rg);
     }
@@ -1485,14 +1492,14 @@ public:
 
     void add_file(const char *filename, List *rowgroups)
     {
-        ParquetFdwReader *r;
-        ListCell         *lc;
+        ParquetFdwReader   *r;
+        ListCell           *lc;
         std::vector<int>    rg;
 
         foreach (lc, rowgroups)
             rg.push_back(lfirst_int(lc));
 
-        r = new ParquetFdwReader(0);
+        r = new ParquetFdwReader();
         r->open(filename, cxt, tupleDesc, attrs_used, use_threads, use_mmap);
         r->set_rowgroups_list(rg);
         readers.push_back(r);

@@ -314,6 +314,7 @@ SET parallel_tuple_cost = 0.001;
 SET cpu_operator_cost = 0.000025;
 ANALYZE example_seq;
 ANALYZE example_sorted;
+ANALYZE example1;
 EXPLAIN (COSTS OFF) SELECT * FROM example_seq;
                  QUERY PLAN                 
 --------------------------------------------
@@ -391,6 +392,22 @@ EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY two;
                  example1.parquet: 1, 2
                  example2.parquet: 1
 (9 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM example1;
+               QUERY PLAN                
+-----------------------------------------
+ Gather
+   Workers Planned: 2
+   ->  Parallel Foreign Scan on example1
+         Reader: Single File
+         Row groups: 1, 2
+(5 rows)
+
+SELECT SUM(one) FROM example1;
+ sum 
+-----
+  21
+(1 row)
 
 -- multiple sorting keys
 CREATE FOREIGN TABLE example_multisort (

@@ -139,12 +139,15 @@ SET parallel_tuple_cost = 0.001;
 SET cpu_operator_cost = 0.000025;
 ANALYZE example_seq;
 ANALYZE example_sorted;
+ANALYZE example1;
 EXPLAIN (COSTS OFF) SELECT * FROM example_seq;
 EXPLAIN (COSTS OFF) SELECT * FROM example_seq ORDER BY one;
 EXPLAIN (COSTS OFF) SELECT * FROM example_seq ORDER BY two;
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted;
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY one;
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY two;
+EXPLAIN (COSTS OFF) SELECT * FROM example1;
+SELECT SUM(one) FROM example1;
 
 -- multiple sorting keys
 CREATE FOREIGN TABLE example_multisort (
