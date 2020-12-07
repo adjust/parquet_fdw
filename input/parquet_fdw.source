@@ -18,7 +18,8 @@ CREATE FOREIGN TABLE example1 (
     four    TIMESTAMP,
     five    DATE,
     six     BOOL,
-    seven   FLOAT8)
+    seven   FLOAT8,
+    eight   TIME)
 SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/example1.parquet', sorted 'one');
 

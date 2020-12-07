@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-from datetime import datetime, date
+from datetime import datetime, date, time, timezone, timedelta
 
 # row group 1
 df1 = pd.DataFrame({'one': [1, 2, 3],
@@ -18,7 +18,12 @@ df1 = pd.DataFrame({'one': [1, 2, 3],
                              date(2018, 1, 2),
                              date(2018, 1, 3)],
                     'six': [True, False, True],
-                    'seven': [0.5, None, 1.0]})
+                    'seven': [0.5, None, 1.0],
+                    'eight': [
+                        time(12),
+                        time(13, 14, 15),
+                        time(16, 17, 18, 5432),
+                    ]})
 table1 = pa.Table.from_pandas(df1)
 
 # row group 2
@@ -32,7 +37,12 @@ df2 = pd.DataFrame({'one': [4, 5, 6],
                              date(2018, 1, 5),
                              date(2018, 1, 6)],
                     'six': [False, False, False],
-                    'seven': [0.5, None, 1.0]})
+                    'seven': [0.5, None, 1.0],
+                    'eight': [
+                        time(12, tzinfo=timezone(timedelta(hours=3))),
+                        time(13, tzinfo=timezone(timedelta(hours=2))),
+                        time(14, tzinfo=timezone(timedelta(hours=1))),
+                    ]})
 table2 = pa.Table.from_pandas(df2)
 
 with pq.ParquetWriter('example1.parquet', table1.schema) as writer:
