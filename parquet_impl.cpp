@@ -22,6 +22,8 @@
 #include "parquet/file_reader.h"
 #include "parquet/statistics.h"
 
+#include "heap.hpp"
+
 extern "C"
 {
 #include "postgres.h"
@@ -99,6 +101,28 @@ extern "C"
 #if PG_VERSION_NUM < 110000
 #define PG_GETARG_JSONB_P PG_GETARG_JSONB
 #endif
+
+#if PG_VERSION_NUM < 110000
+#define MakeTupleTableSlotCompat(tupleDesc) MakeSingleTupleTableSlot(tupleDesc)
+#elif PG_VERSION_NUM < 120000
+#define MakeTupleTableSlotCompat(tupleDesc) MakeTupleTableSlot(tupleDesc)
+#else
+#define MakeTupleTableSlotCompat(tupleDesc) MakeTupleTableSlot(tupleDesc, &TTSOpsVirtual)
+#endif
+
+/*
+ * More compact form of common PG_TRY/PG_CATCH block which throws a c++
+ * exception in case of errors.
+ */
+#define PG_TRY_INLINE(code_block, err) \
+    do { \
+        bool error = false; \
+        PG_TRY(); \
+        code_block \
+        PG_CATCH(); { error = true; } \
+        PG_END_TRY(); \
+        if (error) { throw std::runtime_error(err); } \
+    } while(0)
 
 
 static void find_cmp_func(FmgrInfo *finfo, Oid type1, Oid type2);
@@ -1286,12 +1310,11 @@ public:
 
 class MultifileMergeExecutionState : public ParquetFdwExecutionState
 {
-    struct FileSlot
+    struct ReaderSlot
     {
         int             reader_id;
         TupleTableSlot *slot;
     };
-    typedef std::vector<FileSlot> BinHeap;
 private:
     std::vector<ParquetFdwReader *>   readers;
 
@@ -1310,56 +1333,81 @@ private:
      * heap is rebuilt to sustain its properties. The idea is taken from
      * nodeGatherMerge.c in PostgreSQL but reimplemented using STL.
      */
-    BinHeap             slots;
+    Heap<ReaderSlot>    slots;
     bool                slots_initialized;
 
 private:
     /* 
-     * Compares two slots according to sort keys. Returns true if a > b,
-     * false otherwise. The function is stolen from nodeGatherMerge.c
-     * (postgres) and adapted.
+     * compare_slots
+     *      Compares two slots according to sort keys. Returns true if a > b,
+     *      false otherwise. The function is stolen from nodeGatherMerge.c
+     *      (postgres) and adapted.
      */
-    bool compare_slots(FileSlot &a, FileSlot &b)
+    bool compare_slots(const ReaderSlot &a, const ReaderSlot &b)
     {
-        bool    error = false;
+        TupleTableSlot *s1 = a.slot;
+        TupleTableSlot *s2 = b.slot;
 
-        PG_TRY();
+        Assert(!TupIsNull(s1));
+        Assert(!TupIsNull(s2));
+
+        for (auto sort_key: sort_keys)
         {
-            TupleTableSlot *s1 = a.slot;
-            TupleTableSlot *s2 = b.slot;
+            AttrNumber  attno = sort_key.ssup_attno;
+            Datum       datum1,
+                        datum2;
+            bool        isNull1,
+                        isNull2;
+            int         compare;
 
-            Assert(!TupIsNull(s1));
-            Assert(!TupIsNull(s2));
+            datum1 = slot_getattr(s1, attno, &isNull1);
+            datum2 = slot_getattr(s2, attno, &isNull2);
 
-            for (auto sort_key: sort_keys)
-            {
-                AttrNumber  attno = sort_key.ssup_attno;
-                Datum       datum1,
-                            datum2;
-                bool        isNull1,
-                            isNull2;
-                int         compare;
-
-                datum1 = slot_getattr(s1, attno, &isNull1);
-                datum2 = slot_getattr(s2, attno, &isNull2);
-
-                compare = ApplySortComparator(datum1, isNull1,
-                                              datum2, isNull2,
-                                              &sort_key);
-                if (compare != 0)
-                    return (compare > 0);
-            }
+            compare = ApplySortComparator(datum1, isNull1,
+                                          datum2, isNull2,
+                                          &sort_key);
+            if (compare != 0)
+                return (compare > 0);
         }
-        PG_CATCH();
-        {
-            error = true;
-        }
-        PG_END_TRY();
-
-        if (error)
-            throw std::runtime_error("slots comparison failed");
 
         return false;
+    }
+
+    /*
+     * initialize_slots
+     *      Initialize slots binary heap on the first run.
+     */
+    void initialize_slots()
+    {
+        std::function<bool(const ReaderSlot &, const ReaderSlot &)> cmp =
+            [this] (const ReaderSlot &a, const ReaderSlot &b) { return compare_slots(a, b); };
+        int i = 0;
+
+        slots.init(readers.size(), cmp);
+        for (auto reader: readers)
+        {
+            ReaderSlot    rs;
+
+            PG_TRY_INLINE(
+                {
+                    MemoryContext oldcxt;
+
+                    oldcxt = MemoryContextSwitchTo(cxt);
+                    rs.slot = MakeTupleTableSlotCompat(tupleDesc);
+                    MemoryContextSwitchTo(oldcxt);
+                }, "failed to create a TupleTableSlot"
+            );
+
+            if (reader->next(rs.slot))
+            {
+                ExecStoreVirtualTuple(rs.slot);
+                rs.reader_id = i;
+                slots.append(rs);
+            }
+            ++i;
+        }
+        PG_TRY_INLINE({ slots.heapify(); }, "heapify failed");
+        slots_initialized = true;
     }
 
 public:
@@ -1378,8 +1426,8 @@ public:
     {
 #if PG_VERSION_NUM < 110000
         /* Destroy tuple slots if any */
-        for (auto it: slots)
-            ExecDropSingleTupleTableSlot(it.slot);
+        for (int i = 0; i < slots.size(); i++)
+            ExecDropSingleTupleTableSlot(slots[i].slot);
 #endif
 
         for (auto it: readers)
@@ -1388,96 +1436,45 @@ public:
 
     bool next(TupleTableSlot *slot, bool fake=false)
     {
-        bool error = false;
-        auto cmp = [this] (FileSlot &a, FileSlot &b) { return compare_slots(a, b); };
-
         if (unlikely(!slots_initialized))
-        {
-            /* Initialize binary heap on the first run */
-            int i = 0;
-
-            for (auto reader: readers)
-            {
-                FileSlot    fs;
-                bool        error = false;
-
-                PG_TRY();
-                {
-                    MemoryContext oldcxt;
-
-                    oldcxt = MemoryContextSwitchTo(cxt);
-#if PG_VERSION_NUM < 110000
-                    fs.slot = MakeSingleTupleTableSlot(tupleDesc);
-#elif PG_VERSION_NUM < 120000
-                    fs.slot = MakeTupleTableSlot(tupleDesc);
-#else
-                    fs.slot = MakeTupleTableSlot(tupleDesc, &TTSOpsVirtual);
-#endif
-                    MemoryContextSwitchTo(oldcxt);
-                }
-                PG_CATCH();
-                {
-                    error = true;
-                }
-                PG_END_TRY();
-
-                if (error)
-                    throw std::runtime_error("failed to create a TupleTableSlot");
-
-                if (reader->next(fs.slot))
-                {
-                    ExecStoreVirtualTuple(fs.slot);
-                    fs.reader_id = i;
-                    slots.push_back(fs);
-                }
-                ++i;
-            }
-            std::make_heap(slots.begin(), slots.end(), cmp);
-            slots_initialized = true;
-        }
+            initialize_slots();
 
         if (unlikely(slots.empty()))
             return false;
 
-        const FileSlot &fs = slots.front();
+        /* Copy slot with the smallest key into the resulting slot */
+        const ReaderSlot &head = slots.head();
+        PG_TRY_INLINE(
+            {
+                ExecCopySlot(slot, head.slot);
+                ExecClearTuple(head.slot);
+            }, "failed to copy a virtual tuple slot"
+        );
 
-        PG_TRY();
+        /*
+         * Try to read another record from the same reader as in the head slot.
+         * In case of success the new record makes it into the heap and the
+         * heap gets reheapified. Else if there are no more records in the
+         * reader then current head is removed from the heap and heap gets
+         * reheapified.
+         */
+        if (readers[head.reader_id]->next(head.slot))
         {
-            ExecCopySlot(slot, fs.slot);
-            ExecClearTuple(fs.slot);
-        }
-        PG_CATCH();
-        {
-            error = true;
-        }
-        PG_END_TRY();
-        if (error)
-            throw std::runtime_error("failed to copy a virtual tuple slot");
-
-        if (readers[fs.reader_id]->next(fs.slot))
-        {
-            ExecStoreVirtualTuple(fs.slot);
+            ExecStoreVirtualTuple(head.slot);
+            PG_TRY_INLINE({ slots.heapify_head(); }, "heapify failed");
         }
         else
         {
-            /* Finished reading from this reader */
 #if PG_VERSION_NUM < 110000
-            PG_TRY();
-            {
-                ExecDropSingleTupleTableSlot(fs.slot);
-            }
-            PG_CATCH();
-            {
-                error = true;
-            }
-            PG_END_TRY();
-            if (error)
-                throw std::runtime_error("failed to drop a tuple slot");
+            /* Release slot resources */
+            PG_TRY_INLINE(
+                {
+                    ExecDropSingleTupleTableSlot(head.slot);
+                }, "failed to drop a tuple slot"
+            );
 #endif
-            std::pop_heap(slots.begin(), slots.end(), cmp);
-            slots.pop_back();
+            slots.pop();
         }
-        std::make_heap(slots.begin(), slots.end(), cmp);
         return true;
     }
 
