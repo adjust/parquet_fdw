@@ -32,7 +32,7 @@ df2 = pd.DataFrame({'one': [4, 5, 6],
                              date(2018, 1, 5),
                              date(2018, 1, 6)],
                     'six': [False, False, False],
-                    'seven': [0.5, None, 1.0]})
+                    'seven': [1.5, None, 2.0]})
 table2 = pa.Table.from_pandas(df2)
 
 with pq.ParquetWriter('example1.parquet', table1.schema) as writer:
