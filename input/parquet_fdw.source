@@ -42,7 +42,11 @@ SELECT * FROM example1 WHERE one = 2;
 SELECT * FROM example1 WHERE one = 7;
 SELECT * FROM example1 WHERE six = true;
 SELECT * FROM example1 WHERE six = false;
-SELECT * FROM example1 WHERE seven < 0.9;
+SELECT * FROM example1 WHERE seven < 1.5;
+SELECT * FROM example1 WHERE seven <= 1.5;
+SELECT * FROM example1 WHERE seven = 1.5;
+SELECT * FROM example1 WHERE seven > 1;
+SELECT * FROM example1 WHERE seven >= 1;
 SELECT * FROM example1 WHERE seven IS NULL;
 
 -- prepared statements

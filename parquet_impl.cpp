@@ -2795,9 +2795,9 @@ bytes_to_postgres_type(const char *bytes, arrow::DataType *arrow_type)
         case arrow::Type::INT64:
             return Int64GetDatum(*(int64 *) bytes);
         case arrow::Type::FLOAT:
-            return Int32GetDatum(*(float *) bytes);
+            return Float4GetDatum(*(float *) bytes);
         case arrow::Type::DOUBLE:
-            return Int64GetDatum(*(double *) bytes);
+            return Float8GetDatum(*(double *) bytes);
         case arrow::Type::STRING:
         case arrow::Type::BINARY:
             return CStringGetTextDatum(bytes);
