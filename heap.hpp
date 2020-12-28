@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <functional> 
 
 
 template<class T>
