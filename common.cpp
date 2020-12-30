@@ -105,7 +105,7 @@ bytes_to_postgres_type(const char *bytes, arrow::DataType *arrow_type)
     }
 }
 
-int
+arrow::Type::type
 get_arrow_list_elem_type(arrow::DataType *type)
 {
     auto children = type->children();
