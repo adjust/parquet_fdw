@@ -50,7 +50,7 @@ protected:
          * Textual representation of the type corresponding to type_id (if it's
          * not a list) or elem_type_id (otherwise).
          */
-        char                type_name[32];  
+        std::string         type_name;
     };
 
 public:
@@ -76,6 +76,8 @@ public:
      */
     std::vector<FmgrInfo *>         castfuncs;
 
+    /* TODO: probably unite those things into single object */
+    std::vector<std::string>             column_names;
     std::vector<PgTypeInfo>         pg_types;
     std::vector<ArrowTypeInfo>      arrow_types;
 

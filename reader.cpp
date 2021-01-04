@@ -39,7 +39,7 @@ tolowercase(const char *input, char *output)
 {
     int i = 0;
 
-    Assert(strlen(input) < 254);
+    Assert(strlen(input) < NAMEDATALEN - 1);
 
     do
     {
@@ -180,7 +180,14 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, std::set<int> &at
         {
             parquet::schema::NodePtr node = schema->Column(k)->schema_node();
             std::vector<std::string> path = node->path()->ToDotVector();
-            char    parquet_colname[255];
+            char    parquet_colname[NAMEDATALEN];
+
+            /* 
+             * Postgres names are NAMEDATALEN bytes long at most (including
+             * terminal zero)
+             */
+            if (path[0].length() > NAMEDATALEN - 1)
+                continue;
 
             tolowercase(path[0].c_str(), parquet_colname);
 
@@ -201,16 +208,23 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, std::set<int> &at
                 /* Found mapping! */
                 this->indices.push_back(k);
 
+                this->column_names.push_back(path[0]);
+
                 /* index of last element */
                 this->map[i] = this->indices.size() - 1;
 
                 arrow_typinfo.type_id = arrow_type->id();
                 if (arrow_typinfo.type_id == arrow::Type::LIST) {
-                    arrow_typinfo.elem_type_id = get_arrow_list_elem_type(arrow_type);
-                    strncpy(arrow_typinfo.type_name, arrow_type->name().c_str(), 32); 
+                    auto children = arrow_type->children();
+
+                    Assert(children.size() == 1);
+                    auto child_type = children[0]->type();
+
+                    arrow_typinfo.elem_type_id = child_type->id();
+                    arrow_typinfo.type_name = child_type->name();
                 } else {
                     arrow_typinfo.elem_type_id = arrow::Type::NA;
-                    strncpy(arrow_typinfo.type_name, arrow_type->name().c_str(), 32); 
+                    arrow_typinfo.type_name = arrow_type->name();
                 }
                 this->arrow_types.push_back(arrow_typinfo);
 
@@ -237,7 +251,6 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, std::set<int> &at
                 if (error)
                     throw Error("failed to get the element type of '%s' column", pg_colname);
                 this->pg_types.push_back(pg_typinfo);
-
                 break;
             }
         }
@@ -493,7 +506,7 @@ void ParquetReader::initialize_castfuncs(TupleDesc tupleDesc)
         dst_type = TupleDescAttr(tupleDesc, i)->atttypid;
 
         if (!OidIsValid(src_type))
-            throw Error("unsupported column type: %s", arrow_typinfo.type_name);
+            throw Error("unsupported column type: %s", arrow_typinfo.type_name.c_str());
 
         /* Find underlying type of array */
         dst_is_array = type_is_array(dst_type);
@@ -504,8 +517,7 @@ void ParquetReader::initialize_castfuncs(TupleDesc tupleDesc)
         if (src_is_list != dst_is_array)
         {
             throw Error("incompatible types in column \"%s\"; %s",
-                        "test",
-                        // TODO: this->table->field(arrow_col)->name().c_str(),
+                        this->column_names[arrow_col].c_str(),
                         src_is_list ?
                             "parquet column is of type list while postgres type is scalar" :
                             "parquet column is of scalar type while postgres type is array");
