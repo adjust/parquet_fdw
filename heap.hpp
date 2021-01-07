@@ -1,5 +1,5 @@
-#ifndef HEAP_HPP
-#define HEAP_HPP
+#ifndef PARQUET_FDW_HEAP_HPP
+#define PARQUET_FDW_HEAP_HPP
 
 #include <algorithm>
 #include <cstddef>

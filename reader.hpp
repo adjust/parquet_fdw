@@ -1,5 +1,5 @@
-#ifndef PARQUET_READER_HPP
-#define PARQUET_READER_HPP
+#ifndef PARQUET_FDW_READER_HPP
+#define PARQUET_FDW_READER_HPP
 
 #include <memory>
 #include <mutex>
@@ -10,15 +10,17 @@ extern "C"
 {
 #include "postgres.h"
 #include "fmgr.h"
-#include "nodes/pg_list.h"
 #include "access/tupdesc.h"
 #include "executor/tuptable.h"
+#include "nodes/pg_list.h"
+#include "storage/spin.h"
 }
 
 
 struct ParallelCoordinator
 {
-    std::mutex  lock;
+    //std::mutex  lock;
+    slock_t     lock;
     int32       next_reader;
     int32       next_rowgroup;
 };
@@ -53,7 +55,7 @@ protected:
         std::string         type_name;
     };
 
-public:
+protected:
     /* The reader identifier needed for parallel execution */
     int32                           reader_id;
 
@@ -77,7 +79,7 @@ public:
     std::vector<FmgrInfo *>         castfuncs;
 
     /* TODO: probably unite those things into single object */
-    std::vector<std::string>             column_names;
+    std::vector<std::string>        column_names;
     std::vector<PgTypeInfo>         pg_types;
     std::vector<ArrowTypeInfo>      arrow_types;
 
@@ -120,6 +122,7 @@ public:
     virtual ~ParquetReader() = 0;
 
     void set_rowgroups_list(const std::vector<int> &rowgroups);
+    void set_coordinator(ParallelCoordinator *coord);
 };
 
 ParquetReader *parquet_reader_create(int reader_id = -1);

@@ -211,7 +211,7 @@ public:
     void set_coordinator(ParallelCoordinator *coord)
     {
         if (reader)
-            reader->coordinator = coord;
+            reader->set_coordinator(coord);
     }
 };
 
@@ -244,8 +244,25 @@ private:
 
         if (coord)
         {
-            std::lock_guard<std::mutex> guard(coord->lock);
-            cur_reader = coord->next_reader++;
+            int32 reader_id;
+
+            SpinLockAcquire(&coord->lock);
+
+            /* 
+             * First let's check if the file other workers are reading has more
+             * rowgroups to read
+             */
+            reader_id = coord->next_reader - 1;
+            if (reader_id >= 0 && reader_id < (int) files.size()
+                && (int) files[reader_id].rowgroups.size() > coord->next_rowgroup) {
+                /* yep */;
+            } else {
+                /* If that's not the case then open the next file */
+                reader_id = coord->next_reader++;
+                coord->next_rowgroup = 0;
+            }
+            this->cur_reader = reader_id;
+            SpinLockRelease(&coord->lock);
         }
 
         if (cur_reader >= files.size())
@@ -254,6 +271,7 @@ private:
         r = parquet_reader_create(cur_reader);
         r->open(files[cur_reader].filename.c_str(), cxt, tupleDesc, attrs_used, use_threads, use_mmap);
         r->set_rowgroups_list(files[cur_reader].rowgroups);
+        r->set_coordinator(coord);
 
         cur_reader++;
 
@@ -466,7 +484,7 @@ public:
             delete it;
     }
 
-    bool next(TupleTableSlot *slot, bool fake=false)
+    bool next(TupleTableSlot *slot, bool /* fake=false */)
     {
         if (unlikely(!slots_initialized))
             initialize_slots();
@@ -534,7 +552,7 @@ public:
         readers.push_back(r);
     }
 
-    void set_coordinator(ParallelCoordinator *coord)
+    void set_coordinator(ParallelCoordinator * /* coord */)
     {
         Assert(true);   /* not supported, should never happen */
     }
@@ -1299,7 +1317,7 @@ get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
 }
 
 extern "C" void
-parquetGetForeignRelSize(PlannerInfo *root,
+parquetGetForeignRelSize(PlannerInfo * /* root */,
                          RelOptInfo *baserel,
                          Oid foreigntableid)
 {
@@ -1413,7 +1431,7 @@ cost_merge(Path *path, uint32 nfiles, Cost input_startup_cost,
 extern "C" void
 parquetGetForeignPaths(PlannerInfo *root,
                        RelOptInfo *baserel,
-                       Oid foreigntableid)
+                       Oid /* foreigntableid */)
 {
 	ParquetFdwPlanState *fdw_private;
     Path       *foreign_path;
@@ -1578,9 +1596,9 @@ parquetGetForeignPaths(PlannerInfo *root,
 }
 
 extern "C" ForeignScan *
-parquetGetForeignPlan(PlannerInfo *root,
+parquetGetForeignPlan(PlannerInfo * /* root */,
                       RelOptInfo *baserel,
-                      Oid foreigntableid,
+                      Oid /* foreigntableid */,
                       ForeignPath *best_path,
                       List *tlist,
                       List *scan_clauses,
@@ -1637,7 +1655,7 @@ parquetGetForeignPlan(PlannerInfo *root,
 }
 
 extern "C" void
-parquetBeginForeignScan(ForeignScanState *node, int eflags)
+parquetBeginForeignScan(ForeignScanState *node, int /* eflags */)
 {
     ParquetFdwExecutionState   *festate;
     MemoryContextCallback      *callback;
@@ -1822,7 +1840,7 @@ parquetIterateForeignScan(ForeignScanState *node)
 }
 
 extern "C" void
-parquetEndForeignScan(ForeignScanState *node)
+parquetEndForeignScan(ForeignScanState * /* node */)
 {
     /*
      * Destruction of execution state is done by memory context callback. See
@@ -1839,7 +1857,7 @@ parquetReScanForeignScan(ForeignScanState *node)
 }
 
 static int
-parquetAcquireSampleRowsFunc(Relation relation, int elevel,
+parquetAcquireSampleRowsFunc(Relation relation, int /* elevel */,
                              HeapTuple *rows, int targrows,
                              double *totalrows,
                              double *totaldeadrows)
@@ -1955,9 +1973,9 @@ parquetAcquireSampleRowsFunc(Relation relation, int elevel,
 }
 
 extern "C" bool
-parquetAnalyzeForeignTable(Relation relation,
+parquetAnalyzeForeignTable(Relation /* relation */,
                            AcquireSampleRowsFunc *func,
-                           BlockNumber *totalpages)
+                           BlockNumber * /* totalpages */)
 {
     *func = parquetAcquireSampleRowsFunc;
     return true;
@@ -2040,21 +2058,24 @@ parquetExplainForeignScan(ForeignScanState *node, ExplainState *es)
 /* Parallel query execution */
 
 extern "C" bool
-parquetIsForeignScanParallelSafe(PlannerInfo *root, RelOptInfo *rel,
-                                 RangeTblEntry *rte)
+parquetIsForeignScanParallelSafe(PlannerInfo * /* root */,
+                                 RelOptInfo *rel,
+                                 RangeTblEntry * /* rte */)
 {
     /* Use parallel execution only when statistics are collected */
     return (rel->tuples > 0);
 }
 
 extern "C" Size
-parquetEstimateDSMForeignScan(ForeignScanState *node, ParallelContext *pcxt)
+parquetEstimateDSMForeignScan(ForeignScanState * /* node */,
+                              ParallelContext * /* pcxt */)
 {
     return sizeof(ParallelCoordinator);
 }
 
 extern "C" void
-parquetInitializeDSMForeignScan(ForeignScanState *node, ParallelContext *pcxt,
+parquetInitializeDSMForeignScan(ForeignScanState *node,
+                                ParallelContext * /* pcxt */,
                                 void *coordinate)
 {
     ParallelCoordinator        *coord = (ParallelCoordinator *) coordinate;
@@ -2062,13 +2083,15 @@ parquetInitializeDSMForeignScan(ForeignScanState *node, ParallelContext *pcxt,
 
     coord->next_rowgroup = 0;
     coord->next_reader = 0;
+    SpinLockInit(&coord->lock);
     festate = (ParquetFdwExecutionState *) node->fdw_state;
     festate->set_coordinator(coord);
 }
 
 extern "C" void
-parquetReInitializeDSMForeignScan(ForeignScanState *node,
-                                  ParallelContext *pcxt, void *coordinate)
+parquetReInitializeDSMForeignScan(ForeignScanState * /* node */,
+                                  ParallelContext * /* pcxt */,
+                                  void *coordinate)
 {
     ParallelCoordinator    *coord = (ParallelCoordinator *) coordinate;
 
@@ -2077,7 +2100,7 @@ parquetReInitializeDSMForeignScan(ForeignScanState *node,
 
 extern "C" void
 parquetInitializeWorkerForeignScan(ForeignScanState *node,
-                                   shm_toc *toc,
+                                   shm_toc * /* toc */,
                                    void *coordinate)
 {
     ParallelCoordinator        *coord   = (ParallelCoordinator *) coordinate;
@@ -2089,12 +2112,12 @@ parquetInitializeWorkerForeignScan(ForeignScanState *node,
 }
 
 extern "C" void
-parquetShutdownForeignScan(ForeignScanState *node)
+parquetShutdownForeignScan(ForeignScanState * /* node */)
 {
 }
 
 extern "C" List *
-parquetImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
+parquetImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid /* serverOid */)
 {
     struct dirent  *f;
     DIR            *d;

@@ -361,7 +361,6 @@ Datum ParquetReader::read_primitive_type(arrow::Array *array, int type_id,
     {
         MemoryContext   ccxt = CurrentMemoryContext;
         bool            error = false;
-        Datum           res;
         char            errstr[ERROR_STR_LEN];
 
         PG_TRY();
@@ -610,6 +609,10 @@ void ParquetReader::set_rowgroups_list(const std::vector<int> &rowgroups)
     this->rowgroups = rowgroups;
 }
 
+void ParquetReader::set_coordinator(ParallelCoordinator *coord)
+{
+    this->coordinator = coord;
+}
 
 class ParquetFdwReader : public ParquetReader
 {
@@ -685,24 +688,24 @@ public:
 
     bool read_next_rowgroup(TupleDesc tupleDesc)
     {
-        ParallelCoordinator        *coord;
         arrow::Status               status;
-
-        coord = this->coordinator;
 
         /*
          * In case of parallel query get the row group index from the
          * coordinator. Otherwise just increment it.
          */
-        if (coord)
+        if (this->coordinator)
         {
-            std::lock_guard<std::mutex> guard(coord->lock);
+            SpinLockAcquire(&this->coordinator->lock);
 
             /* Did we finish reading from this reader? */
-            if (this->reader_id != (coord->next_reader - 1))
+            if (this->reader_id != (this->coordinator->next_reader - 1)) {
+                SpinLockRelease(&this->coordinator->lock);
                 return false;
+            }
+            this->row_group = this->coordinator->next_rowgroup++;
 
-            this->row_group = coord->next_rowgroup++;
+            SpinLockRelease(&this->coordinator->lock);
         }
         else
             this->row_group++;
