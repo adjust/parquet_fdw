@@ -834,7 +834,6 @@ public:
         {
             MemoryContext   ccxt = CurrentMemoryContext;
             bool            error = false;
-            Datum           res;
             char            errstr[ERROR_STR_LEN];
 
             PG_TRY();
