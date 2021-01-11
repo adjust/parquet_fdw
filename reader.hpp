@@ -56,6 +56,8 @@ protected:
     };
 
 protected:
+    std::string                     filename;
+
     /* The reader identifier needed for parallel execution */
     int32                           reader_id;
 
@@ -95,11 +97,16 @@ protected:
 
     FastAllocator                  *allocator;
 
+    /*
+     * libparquet options
+     */
+     bool    use_threads;
+     bool    use_mmap;
+
     /* Wether object is properly initialized */
     bool     initialized;
 
 protected:
-    void create_column_mapping(TupleDesc tupleDesc, std::set<int> &attrs_used);
     Datum read_primitive_type(arrow::Array *array, int type_id,
                               int64_t i, FmgrInfo *castfunc);
     Datum nested_list_get_datum(arrow::Array *array, int arrow_type,
@@ -111,20 +118,19 @@ protected:
     template <typename T> inline const T* GetPrimitiveValues(const arrow::Array& arr);
 
 public:
+    virtual ~ParquetReader() = 0;
     virtual bool next(TupleTableSlot *slot, bool fake=false) = 0;
     virtual void rescan() = 0;
-    virtual void open(const char *filename,
-              MemoryContext cxt,
-              TupleDesc tupleDesc,
-              std::set<int> &attrs_used,
-              bool use_threads,
-              bool use_mmap) = 0;
-    virtual ~ParquetReader() = 0;
+    virtual void open() = 0;
 
+    void create_column_mapping(TupleDesc tupleDesc, std::set<int> &attrs_used);
     void set_rowgroups_list(const std::vector<int> &rowgroups);
+    void set_options(bool use_threads, bool use_mmap);
     void set_coordinator(ParallelCoordinator *coord);
 };
 
-ParquetReader *parquet_reader_create(int reader_id = -1);
+ParquetReader *parquet_reader_create(const char *filename,
+                                     MemoryContext cxt,
+                                     int reader_id = -1);
 
 #endif

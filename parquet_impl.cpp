@@ -157,7 +157,7 @@ class SingleFileExecutionState : public ParquetFdwExecutionState
 private:
     ParquetReader      *reader;
     MemoryContext       cxt;
-    TupleDesc           tupleDesc;
+    TupleDesc           tuple_desc;
     std::set<int>       attrs_used;
     bool                use_mmap;
     bool                use_threads;
@@ -166,11 +166,11 @@ public:
     MemoryContext       estate_cxt;
 
     SingleFileExecutionState(MemoryContext cxt,
-                             TupleDesc tupleDesc,
+                             TupleDesc tuple_desc,
                              std::set<int> attrs_used,
                              bool use_threads,
                              bool use_mmap)
-        : cxt(cxt), tupleDesc(tupleDesc), attrs_used(attrs_used),
+        : cxt(cxt), tuple_desc(tuple_desc), attrs_used(attrs_used),
           use_mmap(use_mmap), use_threads(use_threads)
     { }
 
@@ -203,9 +203,11 @@ public:
         foreach (lc, rowgroups)
             rg.push_back(lfirst_int(lc));
 
-        reader = parquet_reader_create();
-        reader->open(filename, cxt, tupleDesc, attrs_used, use_threads, use_mmap);
+        reader = parquet_reader_create(filename, cxt);
+        reader->set_options(use_threads, use_mmap);
         reader->set_rowgroups_list(rg);
+        reader->open();
+        reader->create_column_mapping(tuple_desc, attrs_used);
     }
 
     void set_coordinator(ParallelCoordinator *coord)
@@ -230,7 +232,7 @@ private:
     uint64_t                cur_reader;
 
     MemoryContext           cxt;
-    TupleDesc               tupleDesc;
+    TupleDesc               tuple_desc;
     std::set<int>           attrs_used;
     bool                    use_threads;
     bool                    use_mmap;
@@ -268,10 +270,12 @@ private:
         if (cur_reader >= files.size())
             return NULL;
 
-        r = parquet_reader_create(cur_reader);
-        r->open(files[cur_reader].filename.c_str(), cxt, tupleDesc, attrs_used, use_threads, use_mmap);
+        r = parquet_reader_create(files[cur_reader].filename.c_str(), cxt, cur_reader);
         r->set_rowgroups_list(files[cur_reader].rowgroups);
+        r->set_options(use_threads, use_mmap);
         r->set_coordinator(coord);
+        r->open();
+        r->create_column_mapping(tuple_desc, attrs_used);
 
         cur_reader++;
 
@@ -280,11 +284,11 @@ private:
 
 public:
     MultifileExecutionState(MemoryContext cxt,
-                            TupleDesc tupleDesc,
+                            TupleDesc tuple_desc,
                             std::set<int> attrs_used,
                             bool use_threads,
                             bool use_mmap)
-        : reader(NULL), cur_reader(0), cxt(cxt), tupleDesc(tupleDesc),
+        : reader(NULL), cur_reader(0), cxt(cxt), tuple_desc(tuple_desc),
           attrs_used(attrs_used), use_threads(use_threads), use_mmap(use_mmap),
           coord(NULL)
     { }
@@ -369,7 +373,7 @@ private:
     std::vector<ParquetReader *> readers;
 
     MemoryContext       cxt;
-    TupleDesc           tupleDesc;
+    TupleDesc           tuple_desc;
     std::set<int>       attrs_used;
     std::list<SortSupportData> sort_keys;
     bool                use_threads;
@@ -443,7 +447,7 @@ private:
                     MemoryContext oldcxt;
 
                     oldcxt = MemoryContextSwitchTo(cxt);
-                    rs.slot = MakeTupleTableSlotCompat(tupleDesc);
+                    rs.slot = MakeTupleTableSlotCompat(tuple_desc);
                     MemoryContextSwitchTo(oldcxt);
                 }, "failed to create a TupleTableSlot"
             );
@@ -462,12 +466,12 @@ private:
 
 public:
     MultifileMergeExecutionState(MemoryContext cxt,
-                                 TupleDesc tupleDesc,
+                                 TupleDesc tuple_desc,
                                  std::set<int> attrs_used,
                                  std::list<SortSupportData> sort_keys,
                                  bool use_threads,
                                  bool use_mmap)
-        : cxt(cxt), tupleDesc(tupleDesc), attrs_used(attrs_used),
+        : cxt(cxt), tuple_desc(tuple_desc), attrs_used(attrs_used),
           sort_keys(sort_keys), use_threads(use_threads), use_mmap(use_mmap),
           slots_initialized(false)
     { }
@@ -546,9 +550,11 @@ public:
         foreach (lc, rowgroups)
             rg.push_back(lfirst_int(lc));
 
-        r = parquet_reader_create();
-        r->open(filename, cxt, tupleDesc, attrs_used, use_threads, use_mmap);
+        r = parquet_reader_create(filename, cxt);
         r->set_rowgroups_list(rg);
+        r->set_options(use_threads, use_mmap);
+        r->open();
+        r->create_column_mapping(tuple_desc, attrs_used);
         readers.push_back(r);
     }
 

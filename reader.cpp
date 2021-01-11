@@ -609,12 +609,18 @@ void ParquetReader::set_rowgroups_list(const std::vector<int> &rowgroups)
     this->rowgroups = rowgroups;
 }
 
+void ParquetReader::set_options(bool use_threads, bool use_mmap)
+{
+    this->use_threads = use_threads;
+    this->use_mmap = use_mmap;
+}
+
 void ParquetReader::set_coordinator(ParallelCoordinator *coord)
 {
     this->coordinator = coord;
 }
 
-class ParquetFdwReader : public ParquetReader
+class DefaultParquetReader : public ParquetReader
 {
 private:
     struct ChunkInfo
@@ -646,26 +652,23 @@ public:
      * The reader_id parameter is only used for parallel execution of
      * MultifileExecutionState.
      */
-    ParquetFdwReader(int reader_id = -1)
+    DefaultParquetReader(const char* filename, MemoryContext cxt, int reader_id = -1)
         : row_group(-1), row(0), num_rows(0)
     {
+        this->filename = filename;
         this->reader_id = reader_id;
         this->coordinator = NULL;
         this->initialized = false;
+        this->allocator = new FastAllocator(cxt);
     }
 
-    ~ParquetFdwReader()
+    ~DefaultParquetReader()
     {
         if (allocator)
             delete allocator;
     }
 
-    void open(const char *filename,
-              MemoryContext cxt,
-              TupleDesc tupleDesc,
-              std::set<int> &attrs_used,
-              bool use_threads,
-              bool use_mmap)
+    void open()
     {
         arrow::Status   status;
         std::unique_ptr<parquet::arrow::FileReader> reader;
@@ -680,10 +683,7 @@ public:
         this->reader = std::move(reader);
 
         /* Enable parallel columns decoding/decompression if needed */
-        this->reader->set_use_threads(use_threads && parquet_fdw_use_threads);
-
-        create_column_mapping(tupleDesc, attrs_used);
-        this->allocator = new FastAllocator(cxt);
+        this->reader->set_use_threads(this->use_threads && parquet_fdw_use_threads);
     }
 
     bool read_next_rowgroup(TupleDesc tupleDesc)
@@ -902,9 +902,11 @@ public:
     }
 };
 
-ParquetReader *parquet_reader_create(int reader_id)
+ParquetReader *parquet_reader_create(const char *filename,
+                                     MemoryContext cxt,
+                                     int reader_id)
 {
-    return new ParquetFdwReader(reader_id);
+    return new DefaultParquetReader(filename, cxt, reader_id);
 }
 
 
