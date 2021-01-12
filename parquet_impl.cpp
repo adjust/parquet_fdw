@@ -11,7 +11,6 @@
 #include <math.h>
 #include <list>
 #include <set>
-#include <mutex>
 
 #include "arrow/api.h"
 #include "arrow/io/api.h"
@@ -23,6 +22,7 @@
 #include "parquet/statistics.h"
 
 #include "heap.hpp"
+#include "exec_state.hpp"
 #include "reader.hpp"
 #include "common.hpp"
 
@@ -83,28 +83,6 @@ extern "C"
 #define PG_GETARG_JSONB_P PG_GETARG_JSONB
 #endif
 
-#if PG_VERSION_NUM < 110000
-#define MakeTupleTableSlotCompat(tupleDesc) MakeSingleTupleTableSlot(tupleDesc)
-#elif PG_VERSION_NUM < 120000
-#define MakeTupleTableSlotCompat(tupleDesc) MakeTupleTableSlot(tupleDesc)
-#else
-#define MakeTupleTableSlotCompat(tupleDesc) MakeTupleTableSlot(tupleDesc, &TTSOpsVirtual)
-#endif
-
-/*
- * More compact form of common PG_TRY/PG_CATCH block which throws a c++
- * exception in case of errors.
- */
-#define PG_TRY_INLINE(code_block, err) \
-    do { \
-        bool error = false; \
-        PG_TRY(); \
-        code_block \
-        PG_CATCH(); { error = true; } \
-        PG_END_TRY(); \
-        if (error) { throw std::runtime_error(err); } \
-    } while(0)
-
 
 static void find_cmp_func(FmgrInfo *finfo, Oid type1, Oid type2);
 static void destroy_parquet_state(void *arg);
@@ -120,13 +98,6 @@ struct RowGroupFilter
     int         strategy;
 };
 
-enum ReaderType
-{
-    RT_SINGLE = 0,
-    RT_MULTI,
-    RT_MULTI_MERGE
-};
-
 /*
  * Plain C struct for fdw_state
  */
@@ -140,428 +111,6 @@ struct ParquetFdwPlanState
     List       *rowgroups;      /* List of Lists (per filename) */
     uint64      ntuples;
     ReaderType  type;
-};
-
-class ParquetFdwExecutionState
-{
-public:
-    virtual ~ParquetFdwExecutionState() {};
-    virtual bool next(TupleTableSlot *slot, bool fake=false) = 0;
-    virtual void rescan(void) = 0;
-    virtual void add_file(const char *filename, List *rowgroups) = 0;
-    virtual void set_coordinator(ParallelCoordinator *coord) = 0;
-};
-
-class SingleFileExecutionState : public ParquetFdwExecutionState
-{
-private:
-    ParquetReader      *reader;
-    MemoryContext       cxt;
-    TupleDesc           tuple_desc;
-    std::set<int>       attrs_used;
-    bool                use_mmap;
-    bool                use_threads;
-
-public:
-    MemoryContext       estate_cxt;
-
-    SingleFileExecutionState(MemoryContext cxt,
-                             TupleDesc tuple_desc,
-                             std::set<int> attrs_used,
-                             bool use_threads,
-                             bool use_mmap)
-        : cxt(cxt), tuple_desc(tuple_desc), attrs_used(attrs_used),
-          use_mmap(use_mmap), use_threads(use_threads)
-    { }
-
-    ~SingleFileExecutionState()
-    {
-        if (reader)
-            delete reader;
-    }
-
-    bool next(TupleTableSlot *slot, bool fake)
-    {
-        bool res;
-
-        if ((res = reader->next(slot, fake)) == true)
-            ExecStoreVirtualTuple(slot);
-
-        return res;
-    }
-
-    void rescan(void)
-    {
-        reader->rescan();
-    }
-
-    void add_file(const char *filename, List *rowgroups)
-    {
-        ListCell           *lc;
-        std::vector<int>    rg;
-
-        foreach (lc, rowgroups)
-            rg.push_back(lfirst_int(lc));
-
-        reader = parquet_reader_create(filename, cxt);
-        reader->set_options(use_threads, use_mmap);
-        reader->set_rowgroups_list(rg);
-        reader->open();
-        reader->create_column_mapping(tuple_desc, attrs_used);
-    }
-
-    void set_coordinator(ParallelCoordinator *coord)
-    {
-        if (reader)
-            reader->set_coordinator(coord);
-    }
-};
-
-class MultifileExecutionState : public ParquetFdwExecutionState
-{
-private:
-    struct FileRowgroups
-    {
-        std::string         filename;
-        std::vector<int>    rowgroups;
-    };
-private:
-    ParquetReader          *reader;
-
-    std::vector<FileRowgroups> files;
-    uint64_t                cur_reader;
-
-    MemoryContext           cxt;
-    TupleDesc               tuple_desc;
-    std::set<int>           attrs_used;
-    bool                    use_threads;
-    bool                    use_mmap;
-
-    ParallelCoordinator    *coord;
-
-private:
-    ParquetReader *get_next_reader()
-    {
-        ParquetReader *r;
-
-        if (coord)
-        {
-            int32 reader_id;
-
-            SpinLockAcquire(&coord->lock);
-
-            /* 
-             * First let's check if the file other workers are reading has more
-             * rowgroups to read
-             */
-            reader_id = coord->next_reader - 1;
-            if (reader_id >= 0 && reader_id < (int) files.size()
-                && (int) files[reader_id].rowgroups.size() > coord->next_rowgroup) {
-                /* yep */;
-            } else {
-                /* If that's not the case then open the next file */
-                reader_id = coord->next_reader++;
-                coord->next_rowgroup = 0;
-            }
-            this->cur_reader = reader_id;
-            SpinLockRelease(&coord->lock);
-        }
-
-        if (cur_reader >= files.size())
-            return NULL;
-
-        r = parquet_reader_create(files[cur_reader].filename.c_str(), cxt, cur_reader);
-        r->set_rowgroups_list(files[cur_reader].rowgroups);
-        r->set_options(use_threads, use_mmap);
-        r->set_coordinator(coord);
-        r->open();
-        r->create_column_mapping(tuple_desc, attrs_used);
-
-        cur_reader++;
-
-        return r;
-    }
-
-public:
-    MultifileExecutionState(MemoryContext cxt,
-                            TupleDesc tuple_desc,
-                            std::set<int> attrs_used,
-                            bool use_threads,
-                            bool use_mmap)
-        : reader(NULL), cur_reader(0), cxt(cxt), tuple_desc(tuple_desc),
-          attrs_used(attrs_used), use_threads(use_threads), use_mmap(use_mmap),
-          coord(NULL)
-    { }
-
-    ~MultifileExecutionState()
-    {
-        if (reader)
-            delete reader;
-    }
-
-    bool next(TupleTableSlot *slot, bool fake=false)
-    {
-        bool    res;
-
-        if (unlikely(reader == NULL))
-        {
-            if ((reader = this->get_next_reader()) == NULL)
-                return false;
-        }
-
-        res = reader->next(slot, fake);
-
-        /* Finished reading current reader? Proceed to the next one */
-        if (unlikely(!res))
-        {
-            while (true)
-            {
-                if (reader)
-                    delete reader;
-
-                reader = this->get_next_reader();
-                if (!reader)
-                    return false;
-                res = reader->next(slot, fake);
-                if (res)
-                    break;
-            }
-        }
-
-        if (res)
-        {
-            /*
-             * ExecStoreVirtualTuple doesn't throw postgres exceptions thus no
-             * need to wrap it into PG_TRY / PG_CATCH
-             */
-            ExecStoreVirtualTuple(slot);
-        }
-
-        return res;
-    }
-
-    void rescan(void)
-    {
-        reader->rescan();
-    }
-
-    void add_file(const char *filename, List *rowgroups)
-    {
-        FileRowgroups   fr;
-        ListCell       *lc;
-
-        fr.filename = filename;
-        foreach (lc, rowgroups)
-            fr.rowgroups.push_back(lfirst_int(lc));
-        files.push_back(fr);
-    }
-
-    void set_coordinator(ParallelCoordinator *coord)
-    {
-        this->coord = coord;
-    }
-};
-
-class MultifileMergeExecutionState : public ParquetFdwExecutionState
-{
-    struct ReaderSlot
-    {
-        int             reader_id;
-        TupleTableSlot *slot;
-    };
-private:
-    std::vector<ParquetReader *> readers;
-
-    MemoryContext       cxt;
-    TupleDesc           tuple_desc;
-    std::set<int>       attrs_used;
-    std::list<SortSupportData> sort_keys;
-    bool                use_threads;
-    bool                use_mmap;
-
-    /*
-     * Heap is used to store tuples in prioritized manner along with file
-     * number. Priority is given to the tuples with minimal key. Once next
-     * tuple is requested it is being taken from the top of the heap and a new
-     * tuple from the same file is read and inserted back into the heap. Then
-     * heap is rebuilt to sustain its properties. The idea is taken from
-     * nodeGatherMerge.c in PostgreSQL but reimplemented using STL.
-     */
-    Heap<ReaderSlot>    slots;
-    bool                slots_initialized;
-
-private:
-    /* 
-     * compare_slots
-     *      Compares two slots according to sort keys. Returns true if a > b,
-     *      false otherwise. The function is stolen from nodeGatherMerge.c
-     *      (postgres) and adapted.
-     */
-    bool compare_slots(const ReaderSlot &a, const ReaderSlot &b)
-    {
-        TupleTableSlot *s1 = a.slot;
-        TupleTableSlot *s2 = b.slot;
-
-        Assert(!TupIsNull(s1));
-        Assert(!TupIsNull(s2));
-
-        for (auto sort_key: sort_keys)
-        {
-            AttrNumber  attno = sort_key.ssup_attno;
-            Datum       datum1,
-                        datum2;
-            bool        isNull1,
-                        isNull2;
-            int         compare;
-
-            datum1 = slot_getattr(s1, attno, &isNull1);
-            datum2 = slot_getattr(s2, attno, &isNull2);
-
-            compare = ApplySortComparator(datum1, isNull1,
-                                          datum2, isNull2,
-                                          &sort_key);
-            if (compare != 0)
-                return (compare > 0);
-        }
-
-        return false;
-    }
-
-    /*
-     * initialize_slots
-     *      Initialize slots binary heap on the first run.
-     */
-    void initialize_slots()
-    {
-        std::function<bool(const ReaderSlot &, const ReaderSlot &)> cmp =
-            [this] (const ReaderSlot &a, const ReaderSlot &b) { return compare_slots(a, b); };
-        int i = 0;
-
-        slots.init(readers.size(), cmp);
-        for (auto reader: readers)
-        {
-            ReaderSlot    rs;
-
-            PG_TRY_INLINE(
-                {
-                    MemoryContext oldcxt;
-
-                    oldcxt = MemoryContextSwitchTo(cxt);
-                    rs.slot = MakeTupleTableSlotCompat(tuple_desc);
-                    MemoryContextSwitchTo(oldcxt);
-                }, "failed to create a TupleTableSlot"
-            );
-
-            if (reader->next(rs.slot))
-            {
-                ExecStoreVirtualTuple(rs.slot);
-                rs.reader_id = i;
-                slots.append(rs);
-            }
-            ++i;
-        }
-        PG_TRY_INLINE({ slots.heapify(); }, "heapify failed");
-        slots_initialized = true;
-    }
-
-public:
-    MultifileMergeExecutionState(MemoryContext cxt,
-                                 TupleDesc tuple_desc,
-                                 std::set<int> attrs_used,
-                                 std::list<SortSupportData> sort_keys,
-                                 bool use_threads,
-                                 bool use_mmap)
-        : cxt(cxt), tuple_desc(tuple_desc), attrs_used(attrs_used),
-          sort_keys(sort_keys), use_threads(use_threads), use_mmap(use_mmap),
-          slots_initialized(false)
-    { }
-
-    ~MultifileMergeExecutionState()
-    {
-#if PG_VERSION_NUM < 110000
-        /* Destroy tuple slots if any */
-        for (int i = 0; i < slots.size(); i++)
-            ExecDropSingleTupleTableSlot(slots[i].slot);
-#endif
-
-        for (auto it: readers)
-            delete it;
-    }
-
-    bool next(TupleTableSlot *slot, bool /* fake=false */)
-    {
-        if (unlikely(!slots_initialized))
-            initialize_slots();
-
-        if (unlikely(slots.empty()))
-            return false;
-
-        /* Copy slot with the smallest key into the resulting slot */
-        const ReaderSlot &head = slots.head();
-        PG_TRY_INLINE(
-            {
-                ExecCopySlot(slot, head.slot);
-                ExecClearTuple(head.slot);
-            }, "failed to copy a virtual tuple slot"
-        );
-
-        /*
-         * Try to read another record from the same reader as in the head slot.
-         * In case of success the new record makes it into the heap and the
-         * heap gets reheapified. Else if there are no more records in the
-         * reader then current head is removed from the heap and heap gets
-         * reheapified.
-         */
-        if (readers[head.reader_id]->next(head.slot))
-        {
-            ExecStoreVirtualTuple(head.slot);
-            PG_TRY_INLINE({ slots.heapify_head(); }, "heapify failed");
-        }
-        else
-        {
-#if PG_VERSION_NUM < 110000
-            /* Release slot resources */
-            PG_TRY_INLINE(
-                {
-                    ExecDropSingleTupleTableSlot(head.slot);
-                }, "failed to drop a tuple slot"
-            );
-#endif
-            slots.pop();
-        }
-        return true;
-    }
-
-    void rescan(void)
-    {
-        /* TODO: clean binheap */
-        for (auto reader: readers)
-            reader->rescan();
-        slots.clear();
-        slots_initialized = false;
-    }
-
-    void add_file(const char *filename, List *rowgroups)
-    {
-        ParquetReader      *r;
-        ListCell           *lc;
-        std::vector<int>    rg;
-
-        foreach (lc, rowgroups)
-            rg.push_back(lfirst_int(lc));
-
-        r = parquet_reader_create(filename, cxt);
-        r->set_rowgroups_list(rg);
-        r->set_options(use_threads, use_mmap);
-        r->open();
-        r->create_column_mapping(tuple_desc, attrs_used);
-        readers.push_back(r);
-    }
-
-    void set_coordinator(ParallelCoordinator * /* coord */)
-    {
-        Assert(true);   /* not supported, should never happen */
-    }
 };
 
 /*
@@ -673,11 +222,14 @@ extract_rowgroup_filters(List *scan_clauses,
         };
 
         /* potentially inserting elements may throw exceptions */
+        bool error = false;
         try {
             filters.push_back(f);
         } catch (std::exception &e) {
-            elog(ERROR, "extracting row filters failed: %s", e.what());
+            error = true;
         }
+        if (error)
+            elog(ERROR, "extracting row filters failed");
     }
 }
 
@@ -857,6 +409,7 @@ extract_rowgroups_list(const char *filename,
     std::unique_ptr<parquet::arrow::FileReader> reader;
     arrow::Status   status;
     List           *rowgroups = NIL;
+    std::string     error;
 
     /* Open parquet file to read meta information */
     try
@@ -964,10 +517,15 @@ extract_rowgroups_list(const char *filename,
             }
         }  /* loop over rowgroups */
     }
-    catch(const std::exception& e)
-    {
-        elog(ERROR, "parquet_fdw: failed to exctract row groups from Parquet file: %s", e.what());
+    catch(const std::exception& e) {
+        error = e.what();
     }
+    if (!error.empty()) {
+        elog(ERROR,
+             "parquet_fdw: failed to exctract row groups from Parquet file: %s",
+             error.c_str());
+    }
+
     return rowgroups;
 }
 
@@ -988,6 +546,7 @@ extract_parquet_fields(const char *path) noexcept
     std::shared_ptr<arrow::Schema>              schema;
     arrow::Status   status;
     List           *res = NIL;
+    std::string     error;
 
     try
     {
@@ -1070,8 +629,10 @@ extract_parquet_fields(const char *path) noexcept
     {
         /* Destroy the reader on error */
         reader.reset();
-        elog(ERROR, "parquet_fdw: %s", e.what());
+        error = e.what();
     }
+    if (!error.empty())
+        elog(ERROR, "parquet_fdw: %s", error.c_str());
 
     return res;
 }
@@ -1679,6 +1240,7 @@ parquetBeginForeignScan(ForeignScanState *node, int /* eflags */)
     bool            use_threads = false;
     int             i = 0;
     ReaderType      reader_type = RT_SINGLE;
+    std::string     error;
 
     /* Unwrap fdw_private */
     foreach (lc, fdw_private)
@@ -1712,9 +1274,9 @@ parquetBeginForeignScan(ForeignScanState *node, int /* eflags */)
         ++i;
     }
 
-    MemoryContext cxt = estate->es_query_cxt;
+    MemoryContext   cxt = estate->es_query_cxt;
     TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
-    TupleDesc tupleDesc = slot->tts_tupleDescriptor;
+    TupleDesc       tupleDesc = slot->tts_tupleDescriptor;
 
     reader_cxt = AllocSetContextCreate(cxt,
                                        "parquet_fdw tuple data",
@@ -1751,35 +1313,20 @@ parquetBeginForeignScan(ForeignScanState *node, int /* eflags */)
         try {
             sort_keys.push_back(sort_key);
         } catch (std::exception &e) {
-            elog(ERROR, "parquet_fdw: scan initialization failed: %s", e.what());
+            error = e.what();
         }
+        if (!error.empty())
+            elog(ERROR, "parquet_fdw: scan initialization failed: %s", error.c_str());
     }
 
     try
     {
-        switch (reader_type)
-        {
-            case RT_SINGLE:
-                festate = new SingleFileExecutionState(reader_cxt, tupleDesc,
-                                                       attrs_used, use_threads,
-                                                       use_mmap);
-                break;
-            case RT_MULTI:
-                festate = new MultifileExecutionState(reader_cxt, tupleDesc,
-                                                      attrs_used, use_threads,
-                                                      use_mmap);
-                break;
-            case RT_MULTI_MERGE:
-                festate = new MultifileMergeExecutionState(reader_cxt, tupleDesc,
-                                                           attrs_used, sort_keys, 
-                                                           use_threads, use_mmap);
-                break;
-            default:
-                throw std::runtime_error("unknown reader type");
-        }
+        festate = create_parquet_execution_state(reader_type, reader_cxt, tupleDesc,
+                                                 attrs_used, sort_keys,
+                                                 use_threads, use_mmap);
 
         if (!filenames)
-            elog(ERROR, "parquet_fdw: got an empty filenames list");
+            throw std::runtime_error("parquet_fdw: got an empty filenames list");
 
         forboth (lc, filenames, lc2, rowgroups_list)
         {
@@ -1791,8 +1338,10 @@ parquetBeginForeignScan(ForeignScanState *node, int /* eflags */)
     }
     catch(std::exception &e)
     {
-        elog(ERROR, "parquet_fdw: %s", e.what());
+        error = e.what();
     }
+    if (!error.empty())
+        elog(ERROR, "parquet_fdw: %s", error.c_str());
 
     /*
      * Enable automatic execution state destruction by using memory context
@@ -1831,6 +1380,7 @@ parquetIterateForeignScan(ForeignScanState *node)
 {
     ParquetFdwExecutionState   *festate = (ParquetFdwExecutionState *) node->fdw_state;
 	TupleTableSlot             *slot = node->ss.ss_ScanTupleSlot;
+    std::string                 error;
 
 	ExecClearTuple(slot);
     try
@@ -1839,8 +1389,10 @@ parquetIterateForeignScan(ForeignScanState *node)
     }
     catch (std::exception &e)
     {
-        elog(ERROR, "parquet_fdw: %s", e.what());
+        error = e.what();
     }
+    if (!error.empty())
+        elog(ERROR, "parquet_fdw: %s", error.c_str());
 
     return slot;
 }
@@ -1877,6 +1429,7 @@ parquetAcquireSampleRowsFunc(Relation relation, int /* elevel */,
     int             cnt = 0;
     uint64          num_rows = 0;
     ListCell       *lc;
+    std::string     error;
 
     get_table_options(RelationGetRelid(relation), &fdw_private);
 
@@ -1886,11 +1439,10 @@ parquetAcquireSampleRowsFunc(Relation relation, int /* elevel */,
     reader_cxt = AllocSetContextCreate(CurrentMemoryContext,
                                        "parquet_fdw tuple data",
                                        ALLOCSET_DEFAULT_SIZES);
-    festate = new MultifileExecutionState(reader_cxt,
-                                          tupleDesc,
-                                          attrs_used,
-                                          fdw_private.use_threads,
-                                          false);
+    festate = create_parquet_execution_state(RT_MULTI, reader_cxt, tupleDesc,
+                                             attrs_used, std::list<SortSupportData>(),
+                                             fdw_private.use_threads,
+                                             false);
 
     foreach (lc, fdw_private.filenames)
     {
@@ -1919,8 +1471,10 @@ parquetAcquireSampleRowsFunc(Relation relation, int /* elevel */,
         }
         catch(const std::exception &e)
         {
-            elog(ERROR, "parquet_fdw: %s", e.what());
+            error = e.what();
         }
+        if (!error.empty())
+            elog(ERROR, "parquet_fdw: %s", error.c_str());
     }
 
     PG_TRY();

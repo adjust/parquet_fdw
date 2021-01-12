@@ -1,5 +1,5 @@
 MODULE_big = parquet_fdw
-OBJS = common.o reader.o parquet_impl.o parquet_fdw.o
+OBJS = common.o reader.o exec_state.o parquet_impl.o parquet_fdw.o
 PGFILEDESC = "parquet_fdw - foreign data wrapper for parquet"
 
 SHLIB_LINK = -lm -lstdc++ -lparquet -larrow

@@ -6,6 +6,9 @@
 #include <set>
 #include <vector>
 
+#include "arrow/api.h"
+#include "parquet/arrow/reader.h"
+
 extern "C"
 {
 #include "postgres.h"
@@ -19,7 +22,6 @@ extern "C"
 
 struct ParallelCoordinator
 {
-    //std::mutex  lock;
     slock_t     lock;
     int32       next_reader;
     int32       next_rowgroup;
