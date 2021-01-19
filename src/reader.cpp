@@ -524,9 +524,11 @@ void ParquetReader::initialize_castfuncs(TupleDesc tupleDesc)
 
         PG_TRY();
         {
+            FmgrInfo *castfunc;
+
             if (IsBinaryCoercible(src_type, dst_type))
             {
-                this->castfuncs[i] = NULL;
+                castfunc = NULL;
             }
             else
             {
@@ -541,8 +543,8 @@ void ParquetReader::initialize_castfuncs(TupleDesc tupleDesc)
                             MemoryContext   oldctx;
 
                             oldctx = MemoryContextSwitchTo(CurTransactionContext);
-                            this->castfuncs[i] = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
-                            fmgr_info(funcid, this->castfuncs[i]);
+                            castfunc = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
+                            fmgr_info(funcid, castfunc);
                             MemoryContextSwitchTo(oldctx);
                             break;
                         }
@@ -550,7 +552,7 @@ void ParquetReader::initialize_castfuncs(TupleDesc tupleDesc)
                     case COERCION_PATH_COERCEVIAIO:  /* TODO: double check that we
                                                       * shouldn't do anything here*/
                         /* Cast is not needed */
-                        this->castfuncs[i] = NULL;
+                        castfunc = NULL;
                         break;
                     default:
                         elog(ERROR, "cast function to %s ('%s' column) is not found",
@@ -558,6 +560,8 @@ void ParquetReader::initialize_castfuncs(TupleDesc tupleDesc)
                              NameStr(TupleDescAttr(tupleDesc, i)->attname));
                 }
             }
+
+            this->castfuncs.push_back(castfunc);
         }
         PG_CATCH();
         {
@@ -643,8 +647,6 @@ private:
     uint32_t        row;                /* current row within row group */
     uint32_t        num_rows;           /* total rows in row group */
     std::vector<ChunkInfo> chunk_info;  /* current chunk and position per-column */
-
-private:
 
 public:
     /* 
@@ -755,6 +757,8 @@ public:
         /* TODO: don't clear each time */
         this->chunk_info.clear();
         this->chunks.clear();
+
+        /* TODO: don't need tupleDesc in this function at all */
         for (int i = 0; i < tupleDesc->natts; i++)
         {
             if (this->map[i] >= 0)
@@ -852,7 +856,7 @@ public:
                             this->read_primitive_type(array,
                                                       arrow_type.type_id,
                                                       chunkInfo.pos,
-                                                      this->castfuncs[attr]);
+                                                      this->castfuncs[arrow_col]);
                         slot->tts_isnull[attr] = false;
                     }
                 }
@@ -880,7 +884,7 @@ public:
                             this->nested_list_get_datum(slice.get(),
                                                         arrow_type.elem_type_id,
                                                         &pg_type,
-                                                        this->castfuncs[attr]);
+                                                        this->castfuncs[arrow_col]);
                         slot->tts_isnull[attr] = false;
                     }
                 }
@@ -902,11 +906,234 @@ public:
     }
 };
 
+class CachedParquetReader : public ParquetReader
+{
+private:
+    std::vector<Datum *>            column_data;
+    std::vector<std::vector<bool> > column_nulls;
+
+    int             row_group;          /* current row group index */
+    uint32_t        row;                /* current row within row group */
+    uint32_t        num_rows;           /* total rows in row group */
+
+public:
+    CachedParquetReader(const char* filename, MemoryContext cxt, int reader_id = -1)
+        : row_group(-1), row(0), num_rows(0)
+    {
+        this->filename = filename;
+        this->reader_id = reader_id;
+        this->coordinator = NULL;
+        this->initialized = false;
+        this->allocator = new FastAllocator(cxt);
+    }
+
+    ~CachedParquetReader()
+    {
+        if (allocator)
+            delete allocator;
+    }
+
+    void open()
+    {
+        arrow::Status   status;
+        std::unique_ptr<parquet::arrow::FileReader> reader;
+
+        status = parquet::arrow::FileReader::Make(
+                        arrow::default_memory_pool(),
+                        parquet::ParquetFileReader::OpenFile(filename, use_mmap),
+                        &reader);
+        if (!status.ok())
+            throw Error("failed to open Parquet file %s",
+                                 status.message().c_str());
+        this->reader = std::move(reader);
+
+        /* Enable parallel columns decoding/decompression if needed */
+        this->reader->set_use_threads(this->use_threads && parquet_fdw_use_threads);
+    }
+
+    bool read_next_rowgroup(TupleDesc)
+    {
+        arrow::Status                   status;
+        std::shared_ptr<arrow::Table>   table;
+
+        /* TODO: release previously stored data */
+        this->column_data.resize(this->indices.size(), nullptr);
+        this->column_nulls.resize(this->indices.size());
+
+        /*
+         * In case of parallel query get the row group index from the
+         * coordinator. Otherwise just increment it.
+         */
+        if (this->coordinator)
+        {
+            SpinLockAcquire(&this->coordinator->lock);
+
+            /* Did we finish reading from this reader? */
+            if (this->reader_id != (this->coordinator->next_reader - 1)) {
+                SpinLockRelease(&this->coordinator->lock);
+                return false;
+            }
+            this->row_group = this->coordinator->next_rowgroup++;
+
+            SpinLockRelease(&this->coordinator->lock);
+        }
+        else
+            this->row_group++;
+
+        /*
+         * row_group cannot be less than zero at this point so it is safe to cast
+         * it to unsigned int
+         */
+        if ((uint) this->row_group >= this->rowgroups.size())
+            return false;
+
+        int  rowgroup = this->rowgroups[this->row_group];
+        auto rowgroup_meta = this->reader
+                                ->parquet_reader()
+                                ->metadata()
+                                ->RowGroup(rowgroup);
+
+        status = this->reader
+            ->RowGroup(rowgroup)
+            ->ReadTable(this->indices, &table);
+
+        /* Release resources acquired in the previous iteration */
+        allocator->recycle();
+
+        /* Read columns data and store it into column_data vector */
+        for (std::vector<int>::size_type idx = 0; idx < indices.size(); ++idx)
+        {
+            int             arrow_col = indices[idx];
+            ArrowTypeInfo  &arrow_type = this->arrow_types[idx];
+            PgTypeInfo     &pg_type = this->pg_types[idx];
+            int             row = 0;
+            bool            has_nulls;
+            std::shared_ptr<parquet::Statistics>  stats;
+
+            std::shared_ptr<arrow::ChunkedArray> column = table->column(idx);
+            stats = rowgroup_meta->ColumnChunk(arrow_col)->statistics();
+
+            has_nulls = stats ? stats->null_count() > 0 : true;
+
+            if (this->column_data[idx])
+                pfree(this->column_data[idx]);
+            this->column_data[idx] = (Datum *)
+                MemoryContextAlloc(allocator->context(),
+                                   sizeof(Datum) * table->num_rows());
+
+            this->num_rows = table->num_rows();
+            this->column_nulls[idx].resize(this->num_rows);
+
+            for (int i = 0; i < column->num_chunks(); ++i) {
+                arrow::Array *array = column->chunk(i).get();
+
+                for (int j = 0; j < array->length(); ++j) {
+                    if (arrow_type.type_id != arrow::Type::LIST)
+                    {
+                        if (has_nulls && array->IsNull(j))
+                        {
+                            this->column_nulls[idx][row] = true;
+                        }
+                        else
+                        {
+                            this->column_data[idx][row] =
+                                this->read_primitive_type(array,
+                                                          arrow_type.type_id,
+                                                          j,
+                                                          this->castfuncs[idx]);
+                            this->column_nulls[idx][row] = false;
+                        }
+                    }
+                    else
+                    {
+                        if (!OidIsValid(pg_type.elem_type))
+                        {
+                            throw std::runtime_error("parquet_fdw: cannot convert parquet column of type "
+                                                     "LIST to postgres column of scalar type");
+                        }
+                        auto larray = (arrow::ListArray *) array;
+                        auto slice =
+                            larray->values()->Slice(larray->value_offset(j),
+                                                    larray->value_length(j));
+
+                        if (has_nulls && array->IsNull(j))
+                        {
+                            this->column_nulls[idx][row] = true;
+                        }
+                        else
+                        {
+                            this->column_data[idx][row] =
+                                this->nested_list_get_datum(slice.get(),
+                                                            arrow_type.elem_type_id,
+                                                            &pg_type,
+                                                            this->castfuncs[idx]);
+                            this->column_nulls[idx][row] = false;
+                        }
+                    }
+                    row++;
+                }
+            }
+        }
+
+        this->row = 0;
+        return true;
+    }
+
+    bool next(TupleTableSlot *slot, bool fake=false)
+    {
+        if (this->row >= this->num_rows)
+        {
+            /* Lookup cast funcs */
+            if (!this->initialized)
+                this->initialize_castfuncs(slot->tts_tupleDescriptor);
+
+            /* Read next row group */
+            if (!this->read_next_rowgroup(slot->tts_tupleDescriptor))
+                return false;
+        }
+
+        this->populate_slot(slot, fake);
+
+        return true;
+    }
+
+    void populate_slot(TupleTableSlot *slot, bool fake=false)
+    {
+        /* Fill slot values */
+        for (int attr = 0; attr < slot->tts_tupleDescriptor->natts; attr++)
+        {
+            int arrow_col = this->map[attr];
+            /*
+             * We only fill slot attributes if column was referred in targetlist
+             * or clauses. In other cases mark attribute as NULL.
+             * */
+            if (arrow_col >= 0)
+            {
+                slot->tts_values[attr] = column_data[arrow_col][this->row];
+                slot->tts_isnull[attr] = column_nulls[arrow_col][this->row];
+            }
+            else
+            {
+                slot->tts_isnull[attr] = true;
+            }
+        }
+
+        this->row++;
+    }
+
+    void rescan(void)
+    {
+        this->row_group = 0;
+        this->row = 0;
+        this->num_rows = 0;
+    }
+};
+
 ParquetReader *parquet_reader_create(const char *filename,
                                      MemoryContext cxt,
                                      int reader_id)
 {
-    return new DefaultParquetReader(filename, cxt, reader_id);
+    return new CachedParquetReader(filename, cxt, reader_id);
 }
 
 

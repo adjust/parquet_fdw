@@ -238,14 +238,16 @@ public:
     }
 };
 
-class MultifileMergeExecutionState : public ParquetFdwExecutionState
+class MultifileMergeExecutionStateBase : public ParquetFdwExecutionState
 {
+protected:
     struct ReaderSlot
     {
         int             reader_id;
         TupleTableSlot *slot;
     };
-private:
+
+protected:
     std::vector<ParquetReader *> readers;
 
     MemoryContext       cxt;
@@ -266,7 +268,7 @@ private:
     Heap<ReaderSlot>    slots;
     bool                slots_initialized;
 
-private:
+protected:
     /*
      * compare_slots
      *      Compares two slots according to sort keys. Returns true if a > b,
@@ -302,7 +304,11 @@ private:
 
         return false;
     }
+};
 
+class MultifileMergeExecutionState : public MultifileMergeExecutionStateBase
+{
+private:
     /*
      * initialize_slots
      *      Initialize slots binary heap on the first run.
@@ -347,10 +353,15 @@ public:
                                  std::list<SortSupportData> sort_keys,
                                  bool use_threads,
                                  bool use_mmap)
-        : cxt(cxt), tuple_desc(tuple_desc), attrs_used(attrs_used),
-          sort_keys(sort_keys), use_threads(use_threads), use_mmap(use_mmap),
-          slots_initialized(false)
-    { }
+    {
+        this->cxt = cxt;
+        this->tuple_desc = tuple_desc;
+        this->attrs_used = attrs_used;
+        this->sort_keys = sort_keys;
+        this->use_threads = use_threads;
+        this->use_mmap = use_mmap;
+        this->slots_initialized = false;
+    }
 
     ~MultifileMergeExecutionState()
     {
