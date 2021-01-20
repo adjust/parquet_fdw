@@ -909,7 +909,7 @@ public:
 class CachedParquetReader : public ParquetReader
 {
 private:
-    std::vector<Datum *>            column_data;
+    std::vector<void *>             column_data;
     std::vector<std::vector<bool> > column_nulls;
 
     int             row_group;          /* current row group index */
@@ -1001,82 +1001,136 @@ public:
         allocator->recycle();
 
         /* Read columns data and store it into column_data vector */
-        for (std::vector<int>::size_type idx = 0; idx < indices.size(); ++idx)
+        for (std::vector<int>::size_type col = 0; col < indices.size(); ++col)
         {
-            int             arrow_col = indices[idx];
-            ArrowTypeInfo  &arrow_type = this->arrow_types[idx];
-            PgTypeInfo     &pg_type = this->pg_types[idx];
+            int             arrow_col = indices[col];
             int             row = 0;
             bool            has_nulls;
             std::shared_ptr<parquet::Statistics>  stats;
 
-            std::shared_ptr<arrow::ChunkedArray> column = table->column(idx);
             stats = rowgroup_meta->ColumnChunk(arrow_col)->statistics();
 
             has_nulls = stats ? stats->null_count() > 0 : true;
 
-            if (this->column_data[idx])
-                pfree(this->column_data[idx]);
-            this->column_data[idx] = (Datum *)
+            if (this->column_data[col])
+                pfree(this->column_data[col]);
+            this->column_data[col] = (Datum *)
                 MemoryContextAlloc(allocator->context(),
                                    sizeof(Datum) * table->num_rows());
 
             this->num_rows = table->num_rows();
-            this->column_nulls[idx].resize(this->num_rows);
+            this->column_nulls[col].resize(this->num_rows);
 
-            for (int i = 0; i < column->num_chunks(); ++i) {
-                arrow::Array *array = column->chunk(i).get();
-
-                for (int j = 0; j < array->length(); ++j) {
-                    if (arrow_type.type_id != arrow::Type::LIST)
-                    {
-                        if (has_nulls && array->IsNull(j))
-                        {
-                            this->column_nulls[idx][row] = true;
-                        }
-                        else
-                        {
-                            this->column_data[idx][row] =
-                                this->read_primitive_type(array,
-                                                          arrow_type.type_id,
-                                                          j,
-                                                          this->castfuncs[idx]);
-                            this->column_nulls[idx][row] = false;
-                        }
-                    }
-                    else
-                    {
-                        if (!OidIsValid(pg_type.elem_type))
-                        {
-                            throw std::runtime_error("parquet_fdw: cannot convert parquet column of type "
-                                                     "LIST to postgres column of scalar type");
-                        }
-                        auto larray = (arrow::ListArray *) array;
-                        auto slice =
-                            larray->values()->Slice(larray->value_offset(j),
-                                                    larray->value_length(j));
-
-                        if (has_nulls && array->IsNull(j))
-                        {
-                            this->column_nulls[idx][row] = true;
-                        }
-                        else
-                        {
-                            this->column_data[idx][row] =
-                                this->nested_list_get_datum(slice.get(),
-                                                            arrow_type.elem_type_id,
-                                                            &pg_type,
-                                                            this->castfuncs[idx]);
-                            this->column_nulls[idx][row] = false;
-                        }
-                    }
-                    row++;
-                }
-            }
+            this->read_column(table, col, has_nulls);
         }
 
         this->row = 0;
         return true;
+    }
+
+    void read_column(std::shared_ptr<arrow::Table> table,
+                     int col,
+                     bool has_nulls)
+    {
+        std::shared_ptr<arrow::ChunkedArray> column = table->column(col);
+        ArrowTypeInfo  &arrow_type = this->arrow_types[col];
+        PgTypeInfo     &pg_type = this->pg_types[col];
+        void   *data;
+        size_t  sz;
+        int     row = 0;
+
+        switch(arrow_type.type_id) {
+            case arrow::Type::BOOL:
+                sz = sizeof(bool);
+                break;
+            case arrow::Type::INT32:
+                sz = sizeof(int32);
+                break;
+            case arrow::Type::FLOAT:
+                sz = sizeof(float);
+                break;
+            case arrow::Type::DATE32:
+                sz = sizeof(int);
+                break;
+            default:
+                sz = sizeof(Datum);
+        }
+
+        data = MemoryContextAlloc(allocator->context(), sz * num_rows);
+
+        for (int i = 0; i < column->num_chunks(); ++i) {
+            arrow::Array *array = column->chunk(i).get();
+
+            for (int j = 0; j < array->length(); ++j) {
+                if (has_nulls && array->IsNull(j)) {
+                    this->column_nulls[col][row++] = true;
+                    continue;
+                }
+                switch (arrow_type.type_id)
+                {
+                    /*
+                     * For types smaller than Datum (assuming 8 bytes) we
+                     * copy raw values to save memory and only convert them
+                     * into Datum on the slot population stage.
+                     */
+                    case arrow::Type::BOOL:
+                        {
+                            arrow::BooleanArray *boolarray = (arrow::BooleanArray *) array;
+                            ((bool *) data)[row] = boolarray->Value(row);
+                            break;
+                        }
+                    case arrow::Type::INT32:
+                        {
+                            arrow::Int32Array *intarray = (arrow::Int32Array *) array;
+                            ((int *) data)[row] = intarray->Value(row);
+                            break;
+                        }
+                    case arrow::Type::FLOAT:
+                        {
+                            arrow::FloatArray *farray = (arrow::FloatArray *) array;
+                            ((int *) data)[row] = farray->Value(row);
+                            break;
+                        }
+                    case arrow::Type::DATE32:
+                        {
+                            arrow::Date32Array *tsarray = (arrow::Date32Array *) array;
+                            ((int *) data)[row] = tsarray->Value(row);
+                            break;
+                        }
+
+                    case arrow::Type::LIST:
+                        /* Special case for lists */
+                        {
+                            auto larray = (arrow::ListArray *) array;
+                            auto slice =
+                                larray->values()->Slice(larray->value_offset(j),
+                                                        larray->value_length(j));
+                            ((Datum *) data)[row] =
+                                this->nested_list_get_datum(slice.get(),
+                                                            arrow_type.elem_type_id,
+                                                            &pg_type,
+                                                            this->castfuncs[col]);
+                            break;
+                        }
+
+                    default:
+                        /*
+                         * For larger types we copy already converted into
+                         * Datum values.
+                         */
+                        ((Datum *) data)[row] =
+                            this->read_primitive_type(array,
+                                                      arrow_type.type_id,
+                                                      j,
+                                                      this->castfuncs[col]);
+                }
+                this->column_nulls[col][row] = false;
+
+                row++;
+            }
+        }
+
+        this->column_data[col] = data;
     }
 
     bool next(TupleTableSlot *slot, bool fake=false)
@@ -1092,7 +1146,8 @@ public:
                 return false;
         }
 
-        this->populate_slot(slot, fake);
+        if (!fake)
+            this->populate_slot(slot, false);
 
         return true;
     }
@@ -1109,8 +1164,36 @@ public:
              * */
             if (arrow_col >= 0)
             {
-                slot->tts_values[attr] = column_data[arrow_col][this->row];
-                slot->tts_isnull[attr] = column_nulls[arrow_col][this->row];
+                ArrowTypeInfo &arrow_type = this->arrow_types[arrow_col];
+                void *data = this->column_data[arrow_col];
+
+                switch(arrow_type.type_id)
+                {
+                    case arrow::Type::BOOL:
+                        slot->tts_values[attr] = BoolGetDatum(((bool *) data)[this->row]);
+                        break;
+                    case arrow::Type::INT32:
+                        slot->tts_values[attr] = Int32GetDatum(((int *) data)[this->row]);
+                        break;
+                    case arrow::Type::FLOAT:
+                        slot->tts_values[attr] = Float4GetDatum(((float *) data)[this->row]);
+                        break;
+                    case arrow::Type::DATE32:
+                        {
+                            /*
+                             * Postgres date starts with 2000-01-01 while unix date (which
+                             * Parquet is using) starts with 1970-01-01. So we need to do
+                             * simple calculations here.
+                             */
+                            int dt = ((int *) data)[this->row]
+                                + (UNIX_EPOCH_JDATE - POSTGRES_EPOCH_JDATE);
+                            slot->tts_values[attr] = DateADTGetDatum(dt);
+                        }
+                        break;
+                    default:
+                        slot->tts_values[attr] = ((Datum *) data)[this->row];
+                }
+                slot->tts_isnull[attr] = this->column_nulls[arrow_col][this->row];
             }
             else
             {
