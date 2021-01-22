@@ -1,6 +1,7 @@
 #include "exec_state.hpp"
 #include "heap.hpp"
 
+#include <sys/time.h>
 #include <functional>
 #include <list>
 
@@ -60,7 +61,7 @@ public:
     {
         bool res;
 
-        if ((res = reader->next(slot, fake)) == true)
+        if ((res = reader->next(slot, fake)) == RS_SUCCESS)
             ExecStoreVirtualTuple(slot);
 
         return res;
@@ -177,7 +178,7 @@ public:
 
     bool next(TupleTableSlot *slot, bool fake=false)
     {
-        bool    res;
+        ReadStatus  res;
 
         if (unlikely(reader == NULL))
         {
@@ -188,7 +189,7 @@ public:
         res = reader->next(slot, fake);
 
         /* Finished reading current reader? Proceed to the next one */
-        if (unlikely(!res))
+        if (unlikely(res != RS_SUCCESS))
         {
             while (true)
             {
@@ -199,12 +200,12 @@ public:
                 if (!reader)
                     return false;
                 res = reader->next(slot, fake);
-                if (res)
+                if (res == RS_SUCCESS)
                     break;
             }
         }
 
-        if (res)
+        if (res == RS_SUCCESS)
         {
             /*
              * ExecStoreVirtualTuple doesn't throw postgres exceptions thus no
@@ -334,7 +335,7 @@ private:
                 }, "failed to create a TupleTableSlot"
             );
 
-            if (reader->next(rs.slot))
+            if (reader->next(rs.slot) == RS_SUCCESS)
             {
                 ExecStoreVirtualTuple(rs.slot);
                 rs.reader_id = i;
@@ -451,6 +452,227 @@ public:
     }
 };
 
+/*
+ * CachingMultifileMergeExecutionState
+ *      This is a specialized version of MultifileMergeExecutionState that is
+ *      capable of merging large amount of files without keeping all of them
+ *      open at the same time. For that it utilizes CachingParquetReader which
+ *      stores all read data in the internal buffers.
+ */
+class CachingMultifileMergeExecutionState : public MultifileMergeExecutionStateBase
+{
+private:
+    /* Per-reader activation timestamps */
+    std::vector<uint64_t>  ts_active;
+
+    unsigned int            num_active_readers;
+
+private:
+    /*
+     * initialize_slots
+     *      Initialize slots binary heap on the first run.
+     */
+    void initialize_slots()
+    {
+        std::function<bool(const ReaderSlot &, const ReaderSlot &)> cmp =
+            [this] (const ReaderSlot &a, const ReaderSlot &b) { return compare_slots(a, b); };
+        int i = 0;
+
+        this->ts_active.resize(readers.size(), 0);
+
+        slots.init(readers.size(), cmp);
+        for (auto reader: readers)
+        {
+            ReaderSlot    rs;
+
+            PG_TRY_INLINE(
+                {
+                    MemoryContext oldcxt;
+
+                    oldcxt = MemoryContextSwitchTo(cxt);
+                    rs.slot = MakeTupleTableSlotCompat(tuple_desc);
+                    MemoryContextSwitchTo(oldcxt);
+                }, "failed to create a TupleTableSlot"
+            );
+
+            activate_reader(reader);
+            reader->create_column_mapping(tuple_desc, attrs_used);
+
+            if (reader->next(rs.slot) == RS_SUCCESS)
+            {
+                ExecStoreVirtualTuple(rs.slot);
+                rs.reader_id = i;
+                slots.append(rs);
+            }
+            ++i;
+        }
+        PG_TRY_INLINE({ slots.heapify(); }, "heapify failed");
+        slots_initialized = true;
+    }
+
+    /*
+     * activate_reader
+     *      Opens reader if it's not already active. If the number of active
+     *      readers exceeds the limit, function closes the least recently used
+     *      one.
+     */
+    ParquetReader *activate_reader(ParquetReader *reader)
+    {
+        struct timeval tv;
+
+        Assert(readers.size() > 0);
+
+        /* If reader's already active then we're done here */
+        if (ts_active[reader->id()] > 0)
+            return reader;
+
+        /* Does the number of active readers exceeds limit? */
+        /* TODO */
+        if (num_active_readers >= 1)
+        {
+            uint64_t    ts_min = -1;  /* initialize with max uint64_t */
+            int         idx_min = -1;
+
+            /* Find the least recently used reader */
+            for (std::vector<ParquetReader *>::size_type i = 0; i < readers.size(); ++i) {
+                if (ts_active[i] > 0 && ts_active[i] < ts_min) {
+                    ts_min = ts_active[i];
+                    idx_min = i;
+                }
+            }
+
+            if (idx_min < 0)
+                throw std::runtime_error("failed to find a reader to deactivate");
+            readers[idx_min]->close();
+            ts_active[idx_min] = 0;
+            num_active_readers--;
+        }
+
+        /* Reopen the reader and update timestamp */
+        gettimeofday(&tv, NULL);
+        ts_active[reader->id()] = tv.tv_sec*1000LL + tv.tv_usec/1000;
+        reader->open();
+        num_active_readers++;
+
+        return reader;
+    }
+
+public:
+    CachingMultifileMergeExecutionState(MemoryContext cxt,
+                                        TupleDesc tuple_desc,
+                                        std::set<int> attrs_used,
+                                        std::list<SortSupportData> sort_keys,
+                                        bool use_threads,
+                                        bool use_mmap)
+        : num_active_readers(0)
+    {
+        this->cxt = cxt;
+        this->tuple_desc = tuple_desc;
+        this->attrs_used = attrs_used;
+        this->sort_keys = sort_keys;
+        this->use_threads = use_threads;
+        this->use_mmap = use_mmap;
+        this->slots_initialized = false;
+    }
+
+    ~CachingMultifileMergeExecutionState()
+    {
+#if PG_VERSION_NUM < 110000
+        /* Destroy tuple slots if any */
+        for (int i = 0; i < slots.size(); i++)
+            ExecDropSingleTupleTableSlot(slots[i].slot);
+#endif
+
+        for (auto it: readers)
+            delete it;
+    }
+
+    bool next(TupleTableSlot *slot, bool /* fake=false */)
+    {
+        if (unlikely(!slots_initialized))
+            initialize_slots();
+
+        if (unlikely(slots.empty()))
+            return false;
+
+        /* Copy slot with the smallest key into the resulting slot */
+        const ReaderSlot &head = slots.head();
+        PG_TRY_INLINE(
+            {
+                ExecCopySlot(slot, head.slot);
+                ExecClearTuple(head.slot);
+            }, "failed to copy a virtual tuple slot"
+        );
+
+        /*
+         * Try to read another record from the same reader as in the head slot.
+         * In case of success the new record makes it into the heap and the
+         * heap gets reheapified. If next() returns RS_INACTIVE try to reopen
+         * reader and retry. If there are no more records in the reader then
+         * current head is removed from the heap and heap gets reheapified.
+         */
+        while (true) {
+            ReadStatus status = readers[head.reader_id]->next(head.slot);
+
+            switch(status)
+            {
+                case RS_SUCCESS:
+                    ExecStoreVirtualTuple(head.slot);
+                    PG_TRY_INLINE({ slots.heapify_head(); }, "heapify failed");
+                    return true;
+
+                case RS_INACTIVE:
+                    /* Reactivate reader and retry */
+                    activate_reader(readers[head.reader_id]);
+                    break;
+
+                case RS_EOF:
+#if PG_VERSION_NUM < 110000
+                    /* Release slot resources */
+                    PG_TRY_INLINE(
+                        {
+                            ExecDropSingleTupleTableSlot(head.slot);
+                        }, "failed to drop a tuple slot"
+                    );
+#endif
+                    slots.pop();
+                    return true;
+            }
+        }
+
+        // return true;
+    }
+
+    void rescan(void)
+    {
+        /* TODO: clean binheap */
+        for (auto reader: readers)
+            reader->rescan();
+        slots.clear();
+        slots_initialized = false;
+    }
+
+    void add_file(const char *filename, List *rowgroups)
+    {
+        ParquetReader      *r;
+        ListCell           *lc;
+        std::vector<int>    rg;
+        int32_t             reader_id = readers.size();
+
+        foreach (lc, rowgroups)
+            rg.push_back(lfirst_int(lc));
+
+        r = parquet_reader_create(filename, cxt, reader_id);
+        r->set_rowgroups_list(rg);
+        r->set_options(use_threads, use_mmap);
+        readers.push_back(r);
+    }
+
+    void set_coordinator(ParallelCoordinator * /* coord */)
+    {
+        Assert(true);   /* not supported, should never happen */
+    }
+};
 
 ParquetFdwExecutionState *create_parquet_execution_state(ReaderType reader_type,
                                                          MemoryContext reader_cxt,
@@ -470,10 +692,16 @@ ParquetFdwExecutionState *create_parquet_execution_state(ReaderType reader_type,
             return new MultifileExecutionState(reader_cxt, tuple_desc,
                                                attrs_used, use_threads,
                                                use_mmap);
+#if 0
         case RT_MULTI_MERGE:
             return new MultifileMergeExecutionState(reader_cxt, tuple_desc,
                                                     attrs_used, sort_keys, 
                                                     use_threads, use_mmap);
+#endif
+        case RT_MULTI_MERGE:
+            return new CachingMultifileMergeExecutionState(reader_cxt, tuple_desc,
+                                                           attrs_used, sort_keys, 
+                                                           use_threads, use_mmap);
         default:
             throw std::runtime_error("unknown reader type");
     }

@@ -29,6 +29,13 @@ struct ParallelCoordinator
 
 class FastAllocator;
 
+enum ReadStatus
+{
+    RS_SUCCESS = 0,
+    RS_INACTIVE = 1,
+    RS_EOF = 2
+};
+
 class ParquetReader
 {
 protected:
@@ -61,7 +68,7 @@ protected:
     std::string                     filename;
 
     /* The reader identifier needed for parallel execution */
-    int32                           reader_id;
+    int32_t                         reader_id;
 
     std::unique_ptr<parquet::arrow::FileReader> reader;
 
@@ -121,10 +128,12 @@ protected:
 
 public:
     virtual ~ParquetReader() = 0;
-    virtual bool next(TupleTableSlot *slot, bool fake=false) = 0;
+    virtual ReadStatus next(TupleTableSlot *slot, bool fake=false) = 0;
     virtual void rescan() = 0;
     virtual void open() = 0;
+    virtual void close() = 0;
 
+    int32_t id();
     void create_column_mapping(TupleDesc tupleDesc, std::set<int> &attrs_used);
     void set_rowgroups_list(const std::vector<int> &rowgroups);
     void set_options(bool use_threads, bool use_mmap);

@@ -71,6 +71,10 @@ public:
         this->segment_cur_ptr = NULL;
         this->segment_last_ptr = NULL;
     }
+    ~FastAllocator()
+    {
+        this->recycle();
+    }
 
     /*
      * fast_alloc
@@ -149,6 +153,11 @@ public:
     }
 };
 
+
+int32_t ParquetReader::id()
+{
+    return reader_id;
+}
 
 /*
  * create_column_mapping
@@ -688,6 +697,11 @@ public:
         this->reader->set_use_threads(this->use_threads && parquet_fdw_use_threads);
     }
 
+    void close()
+    {
+        throw std::runtime_error("DefaultParquetReader::close() not implemented");
+    }
+
     bool read_next_rowgroup(TupleDesc tupleDesc)
     {
         arrow::Status               status;
@@ -777,7 +791,7 @@ public:
         return true;
     }
 
-    bool next(TupleTableSlot *slot, bool fake=false)
+    ReadStatus next(TupleTableSlot *slot, bool fake=false)
     {
         allocator->recycle();
 
@@ -785,7 +799,7 @@ public:
         {
             /* Read next row group */
             if (!this->read_next_rowgroup(slot->tts_tupleDescriptor))
-                return false;
+                return RS_EOF;
 
             /* Lookup cast funcs */
             if (!this->initialized)
@@ -795,7 +809,7 @@ public:
         this->populate_slot(slot, fake);
         this->row++;
 
-        return true;
+        return RS_SUCCESS;
     }
 
     /*
@@ -906,19 +920,21 @@ public:
     }
 };
 
-class CachedParquetReader : public ParquetReader
+class CachingParquetReader : public ParquetReader
 {
 private:
     std::vector<void *>             column_data;
     std::vector<std::vector<bool> > column_nulls;
+
+    bool            is_active;          /* weather reader is active */
 
     int             row_group;          /* current row group index */
     uint32_t        row;                /* current row within row group */
     uint32_t        num_rows;           /* total rows in row group */
 
 public:
-    CachedParquetReader(const char* filename, MemoryContext cxt, int reader_id = -1)
-        : row_group(-1), row(0), num_rows(0)
+    CachingParquetReader(const char* filename, MemoryContext cxt, int reader_id = -1)
+        : is_active(false), row_group(-1), row(0), num_rows(0)
     {
         this->filename = filename;
         this->reader_id = reader_id;
@@ -927,7 +943,7 @@ public:
         this->allocator = new FastAllocator(cxt);
     }
 
-    ~CachedParquetReader()
+    ~CachingParquetReader()
     {
         if (allocator)
             delete allocator;
@@ -949,6 +965,14 @@ public:
 
         /* Enable parallel columns decoding/decompression if needed */
         this->reader->set_use_threads(this->use_threads && parquet_fdw_use_threads);
+
+        is_active = true;
+    }
+
+    void close()
+    {
+        this->reader = nullptr;  /* destroy the reader */
+        is_active = false;
     }
 
     bool read_next_rowgroup(TupleDesc)
@@ -1133,7 +1157,7 @@ public:
         this->column_data[col] = data;
     }
 
-    bool next(TupleTableSlot *slot, bool fake=false)
+    ReadStatus next(TupleTableSlot *slot, bool fake=false)
     {
         if (this->row >= this->num_rows)
         {
@@ -1141,15 +1165,18 @@ public:
             if (!this->initialized)
                 this->initialize_castfuncs(slot->tts_tupleDescriptor);
 
+            if (!is_active)
+                return RS_INACTIVE;
+
             /* Read next row group */
             if (!this->read_next_rowgroup(slot->tts_tupleDescriptor))
-                return false;
+                return RS_EOF;
         }
 
         if (!fake)
             this->populate_slot(slot, false);
 
-        return true;
+        return RS_SUCCESS;
     }
 
     void populate_slot(TupleTableSlot *slot, bool fake=false)
@@ -1216,7 +1243,7 @@ ParquetReader *parquet_reader_create(const char *filename,
                                      MemoryContext cxt,
                                      int reader_id)
 {
-    return new CachedParquetReader(filename, cxt, reader_id);
+    return new CachingParquetReader(filename, cxt, reader_id);
 }
 
 
