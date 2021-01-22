@@ -38,6 +38,7 @@ ParquetFdwExecutionState *create_parquet_execution_state(ReaderType reader_type,
                                                          std::set<int> &attrs_used,
                                                          std::list<SortSupportData> sort_keys,
                                                          bool use_threads,
-                                                         bool use_mmap);
+                                                         bool use_mmap,
+                                                         int32_t max_open_files);
 
 #endif

@@ -108,6 +108,7 @@ struct ParquetFdwPlanState
     Bitmapset  *attrs_used;     /* attributes actually used in query */
     bool        use_mmap;
     bool        use_threads;
+    int32       max_open_files;
     List       *rowgroups;      /* List of Lists (per filename) */
     uint64      ntuples;
     ReaderType  type;
@@ -875,6 +876,11 @@ get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
                          errmsg("invalid value for boolean option \"%s\": %s",
                                 def->defname, defGetString(def))));
         }
+        else if (strcmp(def->defname, "max_open_files") == 0)
+        {
+            /* check that int value is valid */
+            fdw_private->max_open_files = pg_strtoint32(defGetString(def));
+        }
         else
             elog(ERROR, "unknown option '%s'", def->defname);
     }
@@ -1208,6 +1214,7 @@ parquetGetForeignPlan(PlannerInfo * /* root */,
     params = lappend(params, makeInteger(fdw_private->use_mmap));
     params = lappend(params, makeInteger(fdw_private->use_threads));
     params = lappend(params, makeInteger(fdw_private->type));
+    params = lappend(params, makeInteger(fdw_private->max_open_files));
     params = lappend(params, fdw_private->rowgroups);
 
 	/* Create the ForeignScan node */
@@ -1240,6 +1247,7 @@ parquetBeginForeignScan(ForeignScanState *node, int /* eflags */)
     bool            use_threads = false;
     int             i = 0;
     ReaderType      reader_type = RT_SINGLE;
+    int             max_open_files = 0;
     std::string     error;
 
     /* Unwrap fdw_private */
@@ -1268,6 +1276,9 @@ parquetBeginForeignScan(ForeignScanState *node, int /* eflags */)
                 reader_type = (ReaderType) intVal((Value *) lfirst(lc));
                 break;
             case 6:
+                max_open_files = intVal((Value *) lfirst(lc));
+                break;
+            case 7:
                 rowgroups_list = (List *) lfirst(lc);
                 break;
         }
@@ -1323,7 +1334,8 @@ parquetBeginForeignScan(ForeignScanState *node, int /* eflags */)
     {
         festate = create_parquet_execution_state(reader_type, reader_cxt, tupleDesc,
                                                  attrs_used, sort_keys,
-                                                 use_threads, use_mmap);
+                                                 use_threads, use_mmap,
+                                                 max_open_files);
 
         if (!filenames)
             throw std::runtime_error("parquet_fdw: got an empty filenames list");
@@ -1442,7 +1454,7 @@ parquetAcquireSampleRowsFunc(Relation relation, int /* elevel */,
     festate = create_parquet_execution_state(RT_MULTI, reader_cxt, tupleDesc,
                                              attrs_used, std::list<SortSupportData>(),
                                              fdw_private.use_threads,
-                                             false);
+                                             false, 0);
 
     foreach (lc, fdw_private.filenames)
     {
@@ -1832,9 +1844,6 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
         }
         else if (strcmp(def->defname, "sorted") == 0)
             ;  /* do nothing */
-        else if (strcmp(def->defname, "batch_size") == 0)
-            /* check that int value is valid */
-            strtol(defGetString(def), NULL, 10);
         else if (strcmp(def->defname, "use_mmap") == 0)
         {
             /* Check that bool value is valid */
@@ -1856,6 +1865,11 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
                         (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                          errmsg("invalid value for boolean option \"%s\": %s",
                                 def->defname, defGetString(def))));
+        }
+        else if (strcmp(def->defname, "max_open_files") == 0)
+        {
+            /* check that int value is valid */
+            pg_strtoint32(defGetString(def));
         }
         else
         {

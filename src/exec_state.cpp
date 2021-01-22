@@ -463,9 +463,11 @@ class CachingMultifileMergeExecutionState : public MultifileMergeExecutionStateB
 {
 private:
     /* Per-reader activation timestamps */
-    std::vector<uint64_t>  ts_active;
+    std::vector<uint64_t>   ts_active;
 
-    unsigned int            num_active_readers;
+    int                     num_active_readers;
+
+    int                     max_open_files;
 
 private:
     /*
@@ -527,8 +529,7 @@ private:
             return reader;
 
         /* Does the number of active readers exceeds limit? */
-        /* TODO */
-        if (num_active_readers >= 1)
+        if (max_open_files > 0 && num_active_readers >= max_open_files)
         {
             uint64_t    ts_min = -1;  /* initialize with max uint64_t */
             int         idx_min = -1;
@@ -563,8 +564,9 @@ public:
                                         std::set<int> attrs_used,
                                         std::list<SortSupportData> sort_keys,
                                         bool use_threads,
-                                        bool use_mmap)
-        : num_active_readers(0)
+                                        bool use_mmap,
+                                        int max_open_files)
+        : num_active_readers(0), max_open_files(max_open_files)
     {
         this->cxt = cxt;
         this->tuple_desc = tuple_desc;
@@ -639,8 +641,6 @@ public:
                     return true;
             }
         }
-
-        // return true;
     }
 
     void rescan(void)
@@ -680,7 +680,8 @@ ParquetFdwExecutionState *create_parquet_execution_state(ReaderType reader_type,
                                                          std::set<int> &attrs_used,
                                                          std::list<SortSupportData> sort_keys,
                                                          bool use_threads,
-                                                         bool use_mmap)
+                                                         bool use_mmap,
+                                                         int32_t max_open_files)
 {
     switch (reader_type)
     {
@@ -701,7 +702,8 @@ ParquetFdwExecutionState *create_parquet_execution_state(ReaderType reader_type,
         case RT_MULTI_MERGE:
             return new CachingMultifileMergeExecutionState(reader_cxt, tuple_desc,
                                                            attrs_used, sort_keys, 
-                                                           use_threads, use_mmap);
+                                                           use_threads, use_mmap,
+                                                           max_open_files);
         default:
             throw std::runtime_error("unknown reader type");
     }
