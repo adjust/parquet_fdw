@@ -879,7 +879,7 @@ get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
         else if (strcmp(def->defname, "max_open_files") == 0)
         {
             /* check that int value is valid */
-            fdw_private->max_open_files = pg_strtoint32(defGetString(def));
+            fdw_private->max_open_files = pg_atoi(defGetString(def), sizeof(int32), '\0');
         }
         else
             elog(ERROR, "unknown option '%s'", def->defname);
@@ -1869,7 +1869,7 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
         else if (strcmp(def->defname, "max_open_files") == 0)
         {
             /* check that int value is valid */
-            pg_strtoint32(defGetString(def));
+            pg_atoi(defGetString(def), sizeof(int32), '\0');
         }
         else
         {

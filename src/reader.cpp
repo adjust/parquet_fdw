@@ -1028,7 +1028,6 @@ public:
         for (std::vector<int>::size_type col = 0; col < indices.size(); ++col)
         {
             int             arrow_col = indices[col];
-            int             row = 0;
             bool            has_nulls;
             std::shared_ptr<parquet::Statistics>  stats;
 
