@@ -6,7 +6,7 @@ Parquet foreign data wrapper for PostgreSQL.
 
 ## Installation
 
-`parquet_fdw` requires `libarrow` and `libparquet` installed in your system (requires version 0.15+, for previous versions use branch [arrow-0.14](https://github.com/adjust/parquet_fdw/tree/arrow-0.14)). Please refer to [libarrow installation page](https://arrow.apache.org/install/) or [building guide](https://github.com/apache/arrow/blob/master/cpp/README.md).
+`parquet_fdw` requires `libarrow` and `libparquet` installed in your system (requires version 0.15+, for previous versions use branch [arrow-0.14](https://github.com/adjust/parquet_fdw/tree/arrow-0.14)). Please refer to [libarrow installation page](https://arrow.apache.org/install/) or [building guide](https://github.com/apache/arrow/blob/master/docs/source/developers/cpp/building.rst).
 To build `parquet_fdw` run:
 ```sh
 make install
@@ -49,7 +49,9 @@ Following options are supported:
 * **filename** - space separated list of paths to Parquet files to read;
 * **sorted** - space separated list of columns that Parquet files are presorted by; that would help postgres to avoid redundant sorting when running query with `ORDER BY` clause or in other cases when having a presorted set is beneficial (Group Aggregate, Merge Join);
 * **use_mmap** - whether memory map operations will be used instead of file read operations (default `false`);
-* **use_threads** - enables `arrow`'s parallel columns decoding/decompression (default `false`).
+* **use_threads** - enables `arrow`'s parallel columns decoding/decompression (default `false`);
+* **files_func** - user defined function that is used by parquet_fdw to retrieve the list of parquet files on each query; function must take one `JSONB` argument and return text array of full paths to parquet files;
+* **files_func_arg** - argument for the function, specified by **files_func**.
 
 GUC variables:
 * **parquet_fdw.use_threads** - global switch that allow user to enable or disable threads (default `true`).

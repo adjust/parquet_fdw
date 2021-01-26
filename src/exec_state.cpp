@@ -80,7 +80,7 @@ public:
         foreach (lc, rowgroups)
             rg.push_back(lfirst_int(lc));
 
-        reader = parquet_reader_create(filename, cxt);
+        reader = create_parquet_reader(filename, cxt);
         reader->set_options(use_threads, use_mmap);
         reader->set_rowgroups_list(rg);
         reader->open();
@@ -147,7 +147,7 @@ private:
         if (cur_reader >= files.size())
             return NULL;
 
-        r = parquet_reader_create(files[cur_reader].filename.c_str(), cxt, cur_reader);
+        r = create_parquet_reader(files[cur_reader].filename.c_str(), cxt, cur_reader);
         r->set_rowgroups_list(files[cur_reader].rowgroups);
         r->set_options(use_threads, use_mmap);
         r->set_coordinator(coord);
@@ -400,7 +400,7 @@ public:
          * reader then current head is removed from the heap and heap gets
          * reheapified.
          */
-        if (readers[head.reader_id]->next(head.slot))
+        if (readers[head.reader_id]->next(head.slot) == RS_SUCCESS)
         {
             ExecStoreVirtualTuple(head.slot);
             PG_TRY_INLINE({ slots.heapify_head(); }, "heapify failed");
@@ -438,7 +438,7 @@ public:
         foreach (lc, rowgroups)
             rg.push_back(lfirst_int(lc));
 
-        r = parquet_reader_create(filename, cxt);
+        r = create_parquet_reader(filename, cxt);
         r->set_rowgroups_list(rg);
         r->set_options(use_threads, use_mmap);
         r->open();
@@ -662,7 +662,7 @@ public:
         foreach (lc, rowgroups)
             rg.push_back(lfirst_int(lc));
 
-        r = parquet_reader_create(filename, cxt, reader_id);
+        r = create_parquet_reader(filename, cxt, reader_id, true);
         r->set_rowgroups_list(rg);
         r->set_options(use_threads, use_mmap);
         readers.push_back(r);
@@ -693,13 +693,11 @@ ParquetFdwExecutionState *create_parquet_execution_state(ReaderType reader_type,
             return new MultifileExecutionState(reader_cxt, tuple_desc,
                                                attrs_used, use_threads,
                                                use_mmap);
-#if 0
         case RT_MULTI_MERGE:
             return new MultifileMergeExecutionState(reader_cxt, tuple_desc,
                                                     attrs_used, sort_keys, 
                                                     use_threads, use_mmap);
-#endif
-        case RT_MULTI_MERGE:
+        case RT_CACHING_MULTI_MERGE:
             return new CachingMultifileMergeExecutionState(reader_cxt, tuple_desc,
                                                            attrs_used, sort_keys, 
                                                            use_threads, use_mmap,

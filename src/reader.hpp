@@ -140,8 +140,9 @@ public:
     void set_coordinator(ParallelCoordinator *coord);
 };
 
-ParquetReader *parquet_reader_create(const char *filename,
+ParquetReader *create_parquet_reader(const char *filename,
                                      MemoryContext cxt,
-                                     int reader_id = -1);
+                                     int reader_id = -1,
+                                     bool caching = false);
 
 #endif

@@ -837,6 +837,7 @@ get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
 
     fdw_private->use_mmap = false;
     fdw_private->use_threads = false;
+    fdw_private->max_open_files = 0;
     table = GetForeignTable(relid);
 
     foreach(lc, table->options)
@@ -1110,7 +1111,8 @@ parquetGetForeignPaths(PlannerInfo *root,
         /* For multifile case calculate the cost of merging files */
         if (is_multi)
         {
-            private_sort->type = RT_MULTI_MERGE;
+            private_sort->type = private_sort->max_open_files > 0 ?
+                RT_CACHING_MULTI_MERGE : RT_MULTI_MERGE;
 
             cost_merge((Path *) path, list_length(private_sort->filenames),
                        startup_cost, total_cost, baserel->rows);
@@ -1584,6 +1586,9 @@ parquetExplainForeignScan(ForeignScanState *node, ExplainState *es)
             break;
         case RT_MULTI_MERGE:
             ExplainPropertyText("Reader", "Multifile Merge", es);
+            break;
+        case RT_CACHING_MULTI_MERGE:
+            ExplainPropertyText("Reader", "Caching Multifile Merge", es);
             break;
     }
 

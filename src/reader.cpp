@@ -763,7 +763,8 @@ public:
             ->ReadTable(this->indices, &this->table);
 
         if (!status.ok())
-            throw std::runtime_error(status.message().c_str());
+            throw Error("failed to read rowgroup #%i: %s",
+                        rowgroup, status.message().c_str());
 
         if (!this->table)
             throw std::runtime_error("got empty table");
@@ -1020,6 +1021,9 @@ public:
         status = this->reader
             ->RowGroup(rowgroup)
             ->ReadTable(this->indices, &table);
+        if (!status.ok())
+            throw Error("failed to read rowgroup #%i: %s",
+                        rowgroup, status.message().c_str());
 
         /* Release resources acquired in the previous iteration */
         allocator->recycle();
@@ -1238,11 +1242,15 @@ public:
     }
 };
 
-ParquetReader *parquet_reader_create(const char *filename,
+ParquetReader *create_parquet_reader(const char *filename,
                                      MemoryContext cxt,
-                                     int reader_id)
+                                     int reader_id,
+                                     bool caching)
 {
-    return new CachingParquetReader(filename, cxt, reader_id);
+    if (!caching)
+        return new DefaultParquetReader(filename, cxt, reader_id);
+    else
+        return new CachingParquetReader(filename, cxt, reader_id);
 }
 
 

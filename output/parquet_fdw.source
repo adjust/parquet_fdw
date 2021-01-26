@@ -340,6 +340,43 @@ SELECT * FROM example_sorted ORDER BY one;
    9 | {27,28}    | fünf  | 2018-01-09 00:00:00 | 2018-01-09 | t   |      
 (11 rows)
 
+-- caching multifile merge reader
+CREATE FOREIGN TABLE example_sorted_caching (
+    one     INT8,
+    two     INT8[],
+    three   TEXT,
+    four    TIMESTAMP,
+    five    DATE,
+    six     BOOL,
+    seven   FLOAT8)
+SERVER parquet_srv
+OPTIONS (filename '@abs_srcdir@/data/example1.parquet @abs_srcdir@/data/example2.parquet', sorted 'one', max_open_files '1');
+EXPLAIN (COSTS OFF) SELECT * FROM example_sorted_caching ORDER BY one;
+               QUERY PLAN               
+----------------------------------------
+ Foreign Scan on example_sorted_caching
+   Reader: Caching Multifile Merge
+   Row groups: 
+     example1.parquet: 1, 2
+     example2.parquet: 1
+(5 rows)
+
+SELECT * FROM example_sorted ORDER BY one;
+ one |    two     | three |        four         |    five    | six | seven 
+-----+------------+-------+---------------------+------------+-----+-------
+   1 | {1,2,3}    | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t   |   0.5
+   1 | {19,20}    | eins  | 2018-01-01 00:00:00 | 2018-01-01 | t   |      
+   2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00 | 2018-01-02 | f   |      
+   3 | {7,8,9}    | baz   | 2018-01-03 00:00:00 | 2018-01-03 | t   |     1
+   3 | {21,22}    | zwei  | 2018-01-03 00:00:00 | 2018-01-03 | f   |      
+   4 | {10,11,12} | uno   | 2018-01-04 00:00:00 | 2018-01-04 | f   |   1.5
+   5 | {13,14,15} | dos   | 2018-01-05 00:00:00 | 2018-01-05 | f   |      
+   5 | {23,24}    | drei  | 2018-01-05 00:00:00 | 2018-01-05 | t   |      
+   6 | {16,17,18} | tres  | 2018-01-06 00:00:00 | 2018-01-06 | f   |     2
+   7 | {25,26}    | vier  | 2018-01-07 00:00:00 | 2018-01-07 | f   |      
+   9 | {27,28}    | fünf  | 2018-01-09 00:00:00 | 2018-01-09 | t   |      
+(11 rows)
+
 -- parallel execution
 SET parallel_setup_cost = 0;
 SET parallel_tuple_cost = 0.001;
