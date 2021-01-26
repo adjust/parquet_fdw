@@ -2,7 +2,7 @@
 
 # parquet_fdw
 
-Parquet foreign data wrapper for PostgreSQL.
+Read-only Apache Parquet foreign data wrapper for PostgreSQL.
 
 ## Installation
 
@@ -23,16 +23,33 @@ After extension was successfully installed run in `psql`:
 create extension parquet_fdw;
 ```
 
-## Using
-To start using `parquet_fdw` you should first create server and user mapping. For example:
+## Basic usage
+
+To start using `parquet_fdw` one should first create a server and user mapping. For example:
 ```sql
 create server parquet_srv foreign data wrapper parquet_fdw;
 create user mapping for postgres server parquet_srv options (user 'postgres');
 ```
-Now you should be able to create foreign table from Parquet files. Currently `parquet_fdw` supports the following column [types](https://github.com/apache/arrow/blob/master/cpp/src/arrow/type.h) (to be extended shortly):
+
+Now you should be able to create foreign table for Parquet files.
+```sql
+create foreign table userdata (
+    id           int,
+    first_name   text,
+    last_name    text
+)
+server parquet_srv
+options (
+    filename '/mnt/userdata1.parquet',
+);
+```
+
+## Advanced
+
+Currently `parquet_fdw` supports the following column [types](https://github.com/apache/arrow/blob/master/cpp/src/arrow/type.h):
 
 | Parquet type |  SQL type |
-|--------------|-----------|
+|-------------:|----------:|
 |        INT32 |      INT4 |
 |        INT64 |      INT8 |
 |        FLOAT |    FLOAT4 |
@@ -45,33 +62,30 @@ Now you should be able to create foreign table from Parquet files. Currently `pa
 
 Currently `parquet_fdw` doesn't support structs and nested lists.
 
-Following options are supported:
+Foreign table may be created for a single Parquet file and for a set of files. It is also possible to specify a user defined function, which would return a list of file paths. Depending on the number of files and table options `parquet_fdw` may use one of the following execution strategies:
+
+| Strategy                | Description              |
+|-------------------------|--------------------------|
+| **Single File**         | Basic single file reader
+| **Multifile**           | Reader which process Parquet files one by one in sequential manner |
+| **Multifile Merge**     | Reader which merges presorted Parquet files so that the produced result is also ordered; used when `sorted` option is specified and the query plan implies ordering (e.g. contains `ORDER BY` clause) |
+| **Caching Multifile Merge** | Same as `Multifile Merge`, but keeps the number of simultaneously open files limited; used when the number of specified Parquet files exceeds `max_open_files` |
+
+Following table options are supported:
 * **filename** - space separated list of paths to Parquet files to read;
 * **sorted** - space separated list of columns that Parquet files are presorted by; that would help postgres to avoid redundant sorting when running query with `ORDER BY` clause or in other cases when having a presorted set is beneficial (Group Aggregate, Merge Join);
 * **use_mmap** - whether memory map operations will be used instead of file read operations (default `false`);
-* **use_threads** - enables `arrow`'s parallel columns decoding/decompression (default `false`);
+* **use_threads** - enables Apache Arrow's parallel columns decoding/decompression (default `false`);
 * **files_func** - user defined function that is used by parquet_fdw to retrieve the list of parquet files on each query; function must take one `JSONB` argument and return text array of full paths to parquet files;
-* **files_func_arg** - argument for the function, specified by **files_func**.
+* **files_func_arg** - argument for the function, specified by **files_func**;
+* **max_open_files** - the limit for the number of Parquet files open simultaneously.
 
 GUC variables:
 * **parquet_fdw.use_threads** - global switch that allow user to enable or disable threads (default `true`).
 
-Example:
-```sql
-create foreign table userdata (
-    id           int,
-    first_name   text,
-    last_name    text
-)
-server parquet_srv
-options (
-    filename '/mnt/userdata1.parquet',
-    sorted 'id'
-);
-```
-
 ### Parallel queries
-`parquet_fdw` also supports [parallel query execution](https://www.postgresql.org/docs/current/parallel-query.html) (not to confuse with multi-threaded decoding feature of `arrow`). It is disabled by default; to enable it run `ANALYZE` command on the table. The reason behind this is that without statistics postgres may end up choosing a terrible parallel plan for certain queries which would be much worse than a serial one (e.g. grouping by a column with large number of distinct values).
+
+`parquet_fdw` also supports [parallel query execution](https://www.postgresql.org/docs/current/parallel-query.html) (not to confuse with multi-threaded decoding feature of Apache Arrow). It is disabled by default; to enable it run `ANALYZE` command on the table. The reason behind this is that without statistics postgres may end up choosing a terrible parallel plan for certain queries which would be much worse than a serial one (e.g. grouping by a column with large number of distinct values).
 
 ### Import
 

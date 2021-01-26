@@ -10,6 +10,7 @@
 |   four |   TIMESTAMP |
 |   five |      DATE32 |
 |    six |        BOOL |
+|  seven |      DOUBLE |
 
 ## Generator
 
