@@ -53,15 +53,19 @@ protected:
     struct ArrowTypeInfo
     {
         arrow::Type::type   type_id;
+        FmgrInfo           *castfunc;
 
-        /* For lists: elem_type_id == arrow::Type::NA means type is not a list */
-        arrow::Type::type   elem_type_id;
+        /* Underlying types for complex types like list and map */
+        std::vector<ArrowTypeInfo> children;
 
-        /*
-         * Textual representation of the type corresponding to type_id (if it's
-         * not a list) or elem_type_id (otherwise).
-         */
         std::string         type_name;
+
+        ArrowTypeInfo()
+            : type_id(arrow::Type::NA), castfunc(nullptr)
+        {}
+        ArrowTypeInfo(std::shared_ptr<arrow::DataType> type, FmgrInfo *castfunc)
+            : type_id(type->id()), type_name(type->name()), castfunc(castfunc)
+        {}
     };
 
 protected:
@@ -71,8 +75,6 @@ protected:
     int32_t                         reader_id;
 
     std::unique_ptr<parquet::arrow::FileReader> reader;
-
-    std::shared_ptr<arrow::Schema>  schema;
 
     /* Arrow column indices that are used in query */
     std::vector<int>                indices;
@@ -116,11 +118,13 @@ protected:
     bool     initialized;
 
 protected:
-    Datum read_primitive_type(arrow::Array *array, int type_id,
-                              int64_t i, FmgrInfo *castfunc);
-    Datum nested_list_get_datum(arrow::Array *array, int arrow_type,
-                                PgTypeInfo *pg_type, FmgrInfo *castfunc);
-    void initialize_castfuncs(TupleDesc tupleDesc);
+    Datum read_primitive_type(arrow::Array *array, const ArrowTypeInfo &typinfo,
+                              int64_t i);
+    Datum nested_list_get_datum(arrow::Array *array,
+                                const ArrowTypeInfo &arrow_type,
+                                const PgTypeInfo &pg_type);
+    FmgrInfo *find_castfunc(arrow::Type::type src_type, Oid dst_type,
+                            const char *attname);
     template<typename T> inline void copy_to_c_array(T *values,
                                                      const arrow::Array *array,
                                                      int elem_size);
@@ -134,7 +138,7 @@ public:
     virtual void close() = 0;
 
     int32_t id();
-    void create_column_mapping(TupleDesc tupleDesc, std::set<int> &attrs_used);
+    void create_column_mapping(TupleDesc tupleDesc, const std::set<int> &attrs_used);
     void set_rowgroups_list(const std::vector<int> &rowgroups);
     void set_options(bool use_threads, bool use_mmap);
     void set_coordinator(ParallelCoordinator *coord);

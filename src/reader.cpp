@@ -163,19 +163,22 @@ int32_t ParquetReader::id()
  * create_column_mapping
  *      Create mapping between tuple descriptor and parquet columns.
  */
-void ParquetReader::create_column_mapping(TupleDesc tupleDesc, std::set<int> &attrs_used)
+void ParquetReader::create_column_mapping(TupleDesc tupleDesc, const std::set<int> &attrs_used)
 {
-    parquet::ArrowReaderProperties props;
-    auto    schema = this->reader->parquet_reader()->metadata()->schema();
+    parquet::ArrowReaderProperties  props;
+    std::shared_ptr<arrow::Schema>  a_schema;
+    parquet::arrow::SchemaManifest  manifest;
+    auto    p_schema = this->reader->parquet_reader()->metadata()->schema();
 
-    if (!parquet::arrow::FromParquetSchema(schema, props, &this->schema).ok())
-        throw Error("error reading parquet schema");
+    if (!parquet::arrow::SchemaManifest::Make(p_schema, nullptr, props, &manifest).ok())
+        throw Error("error creating arrow schema");
 
     this->map.resize(tupleDesc->natts);
     for (int i = 0; i < tupleDesc->natts; i++)
     {
         AttrNumber  attnum = i + 1 - FirstLowInvalidHeapAttributeNumber;
         char        pg_colname[255];
+        const char *attname = NameStr(TupleDescAttr(tupleDesc, i)->attname);
 
         this->map[i] = -1;
 
@@ -185,20 +188,10 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, std::set<int> &at
 
         tolowercase(NameStr(TupleDescAttr(tupleDesc, i)->attname), pg_colname);
 
-        for (int k = 0; k < schema->num_columns(); k++)
+        for (auto &schema_field : manifest.schema_fields)
         {
-            parquet::schema::NodePtr node = schema->Column(k)->schema_node();
-            std::vector<std::string> path = node->path()->ToDotVector();
-            char    parquet_colname[NAMEDATALEN];
-
-            /* 
-             * Postgres names are NAMEDATALEN bytes long at most (including
-             * terminal zero)
-             */
-            if (path[0].length() > NAMEDATALEN - 1)
-                continue;
-
-            tolowercase(path[0].c_str(), parquet_colname);
+            auto arrow_type = schema_field.field->type();
+            auto arrow_colname = schema_field.field->name();
 
             /*
              * Compare postgres attribute name to the top level column name in
@@ -207,35 +200,18 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, std::set<int> &at
              * XXX If we will ever want to support structs then this should be
              * changed.
              */
-            if (strcmp(pg_colname, parquet_colname) == 0)
+            if (strcmp(pg_colname, arrow_colname.c_str()) == 0)
             {
-                PgTypeInfo      pg_typinfo;
-                ArrowTypeInfo   arrow_typinfo;
+                PgTypeInfo      pg_typinfo = {};
+                ArrowTypeInfo   arrow_typinfo = {};
                 bool            error = false;
-                arrow::DataType *arrow_type = this->schema->field(k)->type().get();
 
                 /* Found mapping! */
-                this->indices.push_back(k);
 
-                this->column_names.push_back(path[0]);
+                this->column_names.push_back(std::move(arrow_colname));
 
                 /* index of last element */
-                this->map[i] = this->indices.size() - 1;
-
-                arrow_typinfo.type_id = arrow_type->id();
-                if (arrow_typinfo.type_id == arrow::Type::LIST) {
-                    auto children = arrow_type->children();
-
-                    Assert(children.size() == 1);
-                    auto child_type = children[0]->type();
-
-                    arrow_typinfo.elem_type_id = child_type->id();
-                    arrow_typinfo.type_name = child_type->name();
-                } else {
-                    arrow_typinfo.elem_type_id = arrow::Type::NA;
-                    arrow_typinfo.type_name = arrow_type->name();
-                }
-                this->arrow_types.push_back(arrow_typinfo);
+                this->map[i] = this->column_names.size() - 1;
 
                 /* Find the element type in case the column type is array */
                 PG_TRY();
@@ -256,10 +232,66 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, std::set<int> &at
                     error = true;
                 }
                 PG_END_TRY();
-
                 if (error)
                     throw Error("failed to get the element type of '%s' column", pg_colname);
-                this->pg_types.push_back(pg_typinfo);
+                this->pg_types.push_back(pg_typinfo);                
+
+                arrow_typinfo.type_id = arrow_type->id();
+                switch (arrow_typinfo.type_id)
+                {
+                    case arrow::Type::LIST:
+                    {
+                        Assert(schema_field.children.size() == 1);
+
+                        auto       &child = schema_field.children[0];
+                        FmgrInfo   *castfunc = find_castfunc(child.field->type()->id(),
+                                                             pg_typinfo.elem_type,
+                                                             attname);
+
+                        arrow_typinfo.type_name = "list";
+                        arrow_typinfo.children.emplace_back(child.field->type(),
+                                                            castfunc);
+                        this->indices.push_back(child.column_index);
+                        break;
+                    }
+                    case arrow::Type::MAP:
+                    {
+                        /* 
+                         * Map has the following structure:
+                         *
+                         * Type::MAP
+                         * └─ Type::STRUCT
+                         *    ├─  key type
+                         *    └─  item type
+                         */
+
+                        Assert(schema_field.children.size() == 1);
+                        auto &strct = schema_field.children[0];
+
+                        Assert(strct.children.size() == 2);
+                        auto &key = strct.children[0];
+                        auto &item = strct.children[1];
+
+                        arrow_typinfo.children.emplace_back(key.field->type(), nullptr);
+                        arrow_typinfo.children.emplace_back(item.field->type(), nullptr);
+                        /* TODO */
+                        arrow_typinfo.type_name = "map";
+
+                        /* TODO: find castfuncs */
+
+                        this->indices.push_back(key.column_index);
+                        this->indices.push_back(item.column_index);
+                        break;
+                    }
+                    default:
+                        arrow_typinfo.type_name = arrow_type->name();
+                        arrow_typinfo.castfunc = find_castfunc(arrow_typinfo.type_id,
+                                                               pg_typinfo.oid,
+                                                               attname);
+                        this->indices.push_back(schema_field.column_index);
+                }
+                this->arrow_types.push_back(arrow_typinfo);
+
                 break;
             }
         }
@@ -272,13 +304,14 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, std::set<int> &at
  * read_primitive_type
  *      Returns primitive type value from arrow array
  */
-Datum ParquetReader::read_primitive_type(arrow::Array *array, int type_id,
-                                         int64_t i, FmgrInfo *castfunc)
+Datum ParquetReader::read_primitive_type(arrow::Array *array,
+                                         const ArrowTypeInfo &typinfo,
+                                         int64_t i)
 {
     Datum   res;
 
     /* Get datum depending on the column type */
-    switch (type_id)
+    switch (typinfo.type_id)
     {
         case arrow::Type::BOOL:
         {
@@ -362,11 +395,12 @@ Datum ParquetReader::read_primitive_type(arrow::Array *array, int type_id,
         }
         /* TODO: add other types */
         default:
-            throw Error("parquet_fdw: unsupported column type: %d", type_id);
+            throw Error("parquet_fdw: unsupported column type: %s",
+                        typinfo.type_name.c_str());
     }
 
     /* Call cast function if needed */
-    if (castfunc != NULL)
+    if (typinfo.castfunc != NULL)
     {
         MemoryContext   ccxt = CurrentMemoryContext;
         bool            error = false;
@@ -374,7 +408,7 @@ Datum ParquetReader::read_primitive_type(arrow::Array *array, int type_id,
 
         PG_TRY();
         {
-            res = FunctionCall1(castfunc, res);
+            res = FunctionCall1(typinfo.castfunc, res);
         }
         PG_CATCH();
         {
@@ -401,8 +435,9 @@ Datum ParquetReader::read_primitive_type(arrow::Array *array, int type_id,
  *      Returns postgres array build from elements of array. Only one
  *      dimensional arrays are supported.
  */
-Datum ParquetReader::nested_list_get_datum(arrow::Array *array, int arrow_type,
-                                           PgTypeInfo *pg_type, FmgrInfo *castfunc)
+Datum ParquetReader::nested_list_get_datum(arrow::Array *array,
+                                           const ArrowTypeInfo &arrow_type,
+                                           const PgTypeInfo &pg_type)
 {
     MemoryContext oldcxt;
     ArrayType  *res;
@@ -416,7 +451,7 @@ Datum ParquetReader::nested_list_get_datum(arrow::Array *array, int arrow_type,
 
 #if SIZEOF_DATUM == 8
     /* Fill values and nulls arrays */
-    if (array->null_count() == 0 && arrow_type == arrow::Type::INT64)
+    if (array->null_count() == 0 && arrow_type.type_id == arrow::Type::INT64)
     {
         /*
          * Ok, there are no nulls, so probably we could just memcpy the
@@ -426,14 +461,14 @@ Datum ParquetReader::nested_list_get_datum(arrow::Array *array, int arrow_type,
          * 8 bytes long, which is true for most contemporary systems but this
          * will not work on some exotic or really old systems.
          */
-        copy_to_c_array<int64_t>((int64_t *) values, array, pg_type->elem_len);
+        copy_to_c_array<int64_t>((int64_t *) values, array, pg_type.elem_len);
         goto construct_array;
     }
 #endif
     for (int64_t i = 0; i < array->length(); ++i)
     {
         if (!array->IsNull(i))
-            values[i] = this->read_primitive_type(array, arrow_type, i, castfunc);
+            values[i] = this->read_primitive_type(array, arrow_type, i);
         else
         {
             if (!nulls)
@@ -459,8 +494,8 @@ construct_array:
     {
         oldcxt = MemoryContextSwitchTo(allocator->context());
         res = construct_md_array(values, nulls, 1, dims, lbs,
-                                 pg_type->elem_type, pg_type->elem_len,
-                                 pg_type->elem_byval, pg_type->elem_align);
+                                 pg_type.elem_type, pg_type.elem_len,
+                                 pg_type.elem_byval, pg_type.elem_align);
         MemoryContextSwitchTo(oldcxt);
     }
     PG_CATCH();
@@ -475,120 +510,77 @@ construct_array:
 }
 
 /*
- * initialize_castfuncs
+ * find_castfunc
  *      Check wether implicit cast will be required and prepare cast function
- *      call. For arrays find cast functions for its elements.
+ *      call.
  */
-void ParquetReader::initialize_castfuncs(TupleDesc tupleDesc)
+FmgrInfo *ParquetReader::find_castfunc(arrow::Type::type src_type,
+                                       Oid dst_type, const char *attname)
 {
-    this->castfuncs.resize(this->map.size());
+    MemoryContext ccxt = CurrentMemoryContext;
+    FmgrInfo   *castfunc;
+    Oid         src_oid = to_postgres_type(src_type);
+    Oid         dst_oid = dst_type;
+    bool        error = false;
+    char        errstr[ERROR_STR_LEN];
 
-    for (uint i = 0; i < this->map.size(); ++i)
+    PG_TRY();
     {
-        MemoryContext ccxt = CurrentMemoryContext;
-        int     arrow_col = this->map[i];
-        bool    error = false;
-        char    errstr[ERROR_STR_LEN];
 
-        if (this->map[i] < 0)
+        if (IsBinaryCoercible(src_oid, dst_oid))
         {
-            /* Null column */
-            this->castfuncs[i] = NULL;
-            continue;
+            castfunc = nullptr;
         }
-
-        ArrowTypeInfo &arrow_typinfo = this->arrow_types[arrow_col];
-        int     src_type,
-                dst_type;
-        bool    src_is_list,
-                dst_is_array;
-        Oid     funcid;
-        CoercionPathType ct;
-
-        /* Find underlying type of list */
-        src_is_list = (arrow_typinfo.type_id == arrow::Type::LIST);
-        src_type = src_is_list ?
-            to_postgres_type(arrow_typinfo.elem_type_id) :
-            to_postgres_type(arrow_typinfo.type_id);
-
-        dst_type = TupleDescAttr(tupleDesc, i)->atttypid;
-
-        if (!OidIsValid(src_type))
-            throw Error("unsupported column type: %s", arrow_typinfo.type_name.c_str());
-
-        /* Find underlying type of array */
-        dst_is_array = type_is_array(dst_type);
-        if (dst_is_array)
-            dst_type = get_element_type(dst_type);
-
-        /* Make sure both types are compatible */
-        if (src_is_list != dst_is_array)
+        else
         {
-            throw Error("incompatible types in column \"%s\"; %s",
-                        this->column_names[arrow_col].c_str(),
-                        src_is_list ?
-                            "parquet column is of type list while postgres type is scalar" :
-                            "parquet column is of scalar type while postgres type is array");
-        }
+            Oid funcid;
+            CoercionPathType ct;
 
-        PG_TRY();
-        {
-            FmgrInfo *castfunc;
-
-            if (IsBinaryCoercible(src_type, dst_type))
+            ct = find_coercion_pathway(dst_oid, src_oid,
+                                       COERCION_EXPLICIT,
+                                       &funcid);
+            switch (ct)
             {
-                castfunc = NULL;
-            }
-            else
-            {
-                ct = find_coercion_pathway(dst_type,
-                                           src_type,
-                                           COERCION_EXPLICIT,
-                                           &funcid);
-                switch (ct)
-                {
-                    case COERCION_PATH_FUNC:
-                        {
-                            MemoryContext   oldctx;
+                case COERCION_PATH_FUNC:
+                    {
+                        MemoryContext   oldctx;
 
-                            oldctx = MemoryContextSwitchTo(CurTransactionContext);
-                            castfunc = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
-                            fmgr_info(funcid, castfunc);
-                            MemoryContextSwitchTo(oldctx);
-                            break;
-                        }
-                    case COERCION_PATH_RELABELTYPE:
-                    case COERCION_PATH_COERCEVIAIO:  /* TODO: double check that we
-                                                      * shouldn't do anything here*/
-                        /* Cast is not needed */
-                        castfunc = NULL;
+                        oldctx = MemoryContextSwitchTo(CurTransactionContext);
+                        castfunc = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
+                        fmgr_info(funcid, castfunc);
+                        MemoryContextSwitchTo(oldctx);
                         break;
-                    default:
-                        elog(ERROR, "cast function to %s ('%s' column) is not found",
-                             format_type_be(dst_type),
-                             NameStr(TupleDescAttr(tupleDesc, i)->attname));
-                }
+                    }
+                case COERCION_PATH_RELABELTYPE:
+                case COERCION_PATH_COERCEVIAIO:  /* TODO: double check that we
+                                                  * shouldn't do anything here*/
+                    /* Cast is not needed */
+                    castfunc = nullptr;
+                    break;
+                default:
+                    elog(ERROR, "cast function to %s ('%s' column) is not found",
+                         format_type_be(dst_type), attname);
             }
-
-            this->castfuncs.push_back(castfunc);
         }
-        PG_CATCH();
-        {
-            ErrorData *errdata;
-
-            MemoryContextSwitchTo(ccxt);
-            error = true;
-            errdata = CopyErrorData();
-            FlushErrorState();
-
-            strncpy(errstr, errdata->message, ERROR_STR_LEN - 1);
-            FreeErrorData(errdata);
-        }
-        PG_END_TRY();
-        if (error)
-            throw std::runtime_error(errstr);
     }
-    this->initialized = true;
+    PG_CATCH();
+    {
+        ErrorData *errdata;
+
+        ccxt = MemoryContextSwitchTo(ccxt);
+        error = true;
+        errdata = CopyErrorData();
+        FlushErrorState();
+
+        strncpy(errstr, errdata->message, ERROR_STR_LEN - 1);
+        FreeErrorData(errdata);
+        MemoryContextSwitchTo(ccxt);
+    }
+    PG_END_TRY();
+    if (error)
+        throw std::runtime_error(errstr);
+
+    return castfunc;
 }
 
 /*
@@ -801,10 +793,6 @@ public:
             /* Read next row group */
             if (!this->read_next_rowgroup(slot->tts_tupleDescriptor))
                 return RS_EOF;
-
-            /* Lookup cast funcs */
-            if (!this->initialized)
-                this->initialize_castfuncs(slot->tts_tupleDescriptor);
         }
 
         this->populate_slot(slot, fake);
@@ -868,10 +856,7 @@ public:
                     else
                     {
                         slot->tts_values[attr] = 
-                            this->read_primitive_type(array,
-                                                      arrow_type.type_id,
-                                                      chunkInfo.pos,
-                                                      this->castfuncs[arrow_col]);
+                            this->read_primitive_type(array, arrow_type, chunkInfo.pos);
                         slot->tts_isnull[attr] = false;
                     }
                 }
@@ -897,9 +882,8 @@ public:
 
                         slot->tts_values[attr] =
                             this->nested_list_get_datum(slice.get(),
-                                                        arrow_type.elem_type_id,
-                                                        &pg_type,
-                                                        this->castfuncs[arrow_col]);
+                                                        arrow_type.children[0],
+                                                        pg_type);
                         slot->tts_isnull[attr] = false;
                     }
                 }
@@ -1134,9 +1118,8 @@ public:
                                                         larray->value_length(j));
                             ((Datum *) data)[row] =
                                 this->nested_list_get_datum(slice.get(),
-                                                            arrow_type.elem_type_id,
-                                                            &pg_type,
-                                                            this->castfuncs[col]);
+                                                            arrow_type.children[0],
+                                                            pg_type);
                             break;
                         }
 
@@ -1146,10 +1129,7 @@ public:
                          * Datum values.
                          */
                         ((Datum *) data)[row] =
-                            this->read_primitive_type(array,
-                                                      arrow_type.type_id,
-                                                      j,
-                                                      this->castfuncs[col]);
+                            this->read_primitive_type(array, arrow_type, j);
                 }
                 this->column_nulls[col][row] = false;
 
@@ -1164,10 +1144,6 @@ public:
     {
         if (this->row >= this->num_rows)
         {
-            /* Lookup cast funcs */
-            if (!this->initialized)
-                this->initialize_castfuncs(slot->tts_tupleDescriptor);
-
             if (!is_active)
                 return RS_INACTIVE;
 
