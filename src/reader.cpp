@@ -194,17 +194,13 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, const std::set<in
             auto arrow_colname = schema_field.field->name();
 
             /*
-             * Compare postgres attribute name to the top level column name in
-             * parquet.
-             *
-             * XXX If we will ever want to support structs then this should be
-             * changed.
+             * Compare postgres attribute name to the column name in arrow
+             * schema.
              */
             if (strcmp(pg_colname, arrow_colname.c_str()) == 0)
             {
-                PgTypeInfo      pg_typinfo = {};
-                ArrowTypeInfo   arrow_typinfo = {};
-                bool            error = false;
+                TypeInfo        typinfo(arrow_type);
+                bool            error(false);
 
                 /* Found mapping! */
 
@@ -213,44 +209,50 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, const std::set<in
                 /* index of last element */
                 this->map[i] = this->column_names.size() - 1;
 
-                /* Find the element type in case the column type is array */
-                PG_TRY();
-                {
-                    pg_typinfo.oid = TupleDescAttr(tupleDesc, i)->atttypid;
-                    pg_typinfo.elem_type = get_element_type(pg_typinfo.oid);
-
-                    if (OidIsValid(pg_typinfo.elem_type))
-                    {
-                        get_typlenbyvalalign(pg_typinfo.elem_type,
-                                             &pg_typinfo.elem_len,
-                                             &pg_typinfo.elem_byval,
-                                             &pg_typinfo.elem_align);
-                    }
-                }
-                PG_CATCH();
-                {
-                    error = true;
-                }
-                PG_END_TRY();
-                if (error)
-                    throw Error("failed to get the element type of '%s' column", pg_colname);
-                this->pg_types.push_back(pg_typinfo);                
-
-                arrow_typinfo.type_id = arrow_type->id();
-                switch (arrow_typinfo.type_id)
+                typinfo.pg.oid = TupleDescAttr(tupleDesc, i)->atttypid;
+                switch (arrow_type->id())
                 {
                     case arrow::Type::LIST:
                     {
                         Assert(schema_field.children.size() == 1);
 
-                        auto       &child = schema_field.children[0];
-                        FmgrInfo   *castfunc = find_castfunc(child.field->type()->id(),
-                                                             pg_typinfo.elem_type,
-                                                             attname);
+                        Oid     elem_type;
+                        int16   elem_len;
+                        bool    elem_byval;
+                        char    elem_align;
 
-                        arrow_typinfo.type_name = "list";
-                        arrow_typinfo.children.emplace_back(child.field->type(),
-                                                            castfunc);
+                        PG_TRY();
+                        {
+                            elem_type = get_element_type(typinfo.pg.oid);
+                            if (OidIsValid(elem_type)) {
+                                get_typlenbyvalalign(elem_type, &elem_len,
+                                                     &elem_byval, &elem_align);
+                            }
+                        }
+                        PG_CATCH();
+                        {
+                            error = true;
+                        }
+                        PG_END_TRY();
+                        if (error)
+                            throw Error("failed to get type length (column '%s')",
+                                        pg_colname);
+
+                        if (!OidIsValid(elem_type))
+                            throw Error("parquet_fdw: cannot convert parquet "
+                                        "column of type LIST to scalar type of "
+                                        " postgres column '%s'", pg_colname);
+
+                        auto     &child = schema_field.children[0];
+                        FmgrInfo *castfunc = find_castfunc(child.field->type()->id(),
+                                                           elem_type, attname);
+                        typinfo.children.emplace_back(child.field->type(),
+                                                      elem_type, castfunc);
+                        TypeInfo &elem = typinfo.children[0];
+                        elem.pg.len = elem_len;
+                        elem.pg.byval = elem_byval;
+                        elem.pg.align = elem_align;
+
                         this->indices.push_back(child.column_index);
                         break;
                     }
@@ -272,10 +274,8 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, const std::set<in
                         auto &key = strct.children[0];
                         auto &item = strct.children[1];
 
-                        arrow_typinfo.children.emplace_back(key.field->type(), nullptr);
-                        arrow_typinfo.children.emplace_back(item.field->type(), nullptr);
-                        /* TODO */
-                        arrow_typinfo.type_name = "map";
+                        typinfo.children.emplace_back(key.field->type());
+                        typinfo.children.emplace_back(item.field->type());
 
                         /* TODO: find castfuncs */
 
@@ -284,13 +284,12 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, const std::set<in
                         break;
                     }
                     default:
-                        arrow_typinfo.type_name = arrow_type->name();
-                        arrow_typinfo.castfunc = find_castfunc(arrow_typinfo.type_id,
-                                                               pg_typinfo.oid,
-                                                               attname);
+                        typinfo.castfunc = find_castfunc(typinfo.arrow.type_id,
+                                                         typinfo.pg.oid,
+                                                         attname);
                         this->indices.push_back(schema_field.column_index);
                 }
-                this->arrow_types.push_back(arrow_typinfo);
+                this->types.push_back(std::move(typinfo));
 
                 break;
             }
@@ -305,13 +304,13 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, const std::set<in
  *      Returns primitive type value from arrow array
  */
 Datum ParquetReader::read_primitive_type(arrow::Array *array,
-                                         const ArrowTypeInfo &typinfo,
+                                         const TypeInfo &typinfo,
                                          int64_t i)
 {
     Datum   res;
 
     /* Get datum depending on the column type */
-    switch (typinfo.type_id)
+    switch (typinfo.arrow.type_id)
     {
         case arrow::Type::BOOL:
         {
@@ -396,7 +395,7 @@ Datum ParquetReader::read_primitive_type(arrow::Array *array,
         /* TODO: add other types */
         default:
             throw Error("parquet_fdw: unsupported column type: %s",
-                        typinfo.type_name.c_str());
+                        typinfo.arrow.type_name.c_str());
     }
 
     /* Call cast function if needed */
@@ -436,8 +435,7 @@ Datum ParquetReader::read_primitive_type(arrow::Array *array,
  *      dimensional arrays are supported.
  */
 Datum ParquetReader::nested_list_get_datum(arrow::Array *array,
-                                           const ArrowTypeInfo &arrow_type,
-                                           const PgTypeInfo &pg_type)
+                                           const TypeInfo &typinfo)
 {
     MemoryContext oldcxt;
     ArrayType  *res;
@@ -451,7 +449,7 @@ Datum ParquetReader::nested_list_get_datum(arrow::Array *array,
 
 #if SIZEOF_DATUM == 8
     /* Fill values and nulls arrays */
-    if (array->null_count() == 0 && arrow_type.type_id == arrow::Type::INT64)
+    if (array->null_count() == 0 && typinfo.arrow.type_id == arrow::Type::INT64)
     {
         /*
          * Ok, there are no nulls, so probably we could just memcpy the
@@ -461,14 +459,14 @@ Datum ParquetReader::nested_list_get_datum(arrow::Array *array,
          * 8 bytes long, which is true for most contemporary systems but this
          * will not work on some exotic or really old systems.
          */
-        copy_to_c_array<int64_t>((int64_t *) values, array, pg_type.elem_len);
+        copy_to_c_array<int64_t>((int64_t *) values, array, typinfo.pg.len);
         goto construct_array;
     }
 #endif
     for (int64_t i = 0; i < array->length(); ++i)
     {
         if (!array->IsNull(i))
-            values[i] = this->read_primitive_type(array, arrow_type, i);
+            values[i] = this->read_primitive_type(array, typinfo, i);
         else
         {
             if (!nulls)
@@ -494,8 +492,8 @@ construct_array:
     {
         oldcxt = MemoryContextSwitchTo(allocator->context());
         res = construct_md_array(values, nulls, 1, dims, lbs,
-                                 pg_type.elem_type, pg_type.elem_len,
-                                 pg_type.elem_byval, pg_type.elem_align);
+                                 typinfo.pg.oid, typinfo.pg.len,
+                                 typinfo.pg.byval, typinfo.pg.align);
         MemoryContextSwitchTo(oldcxt);
     }
     PG_CATCH();
@@ -821,10 +819,9 @@ public:
              * */
             if (arrow_col >= 0)
             {
-                ChunkInfo &chunkInfo = this->chunk_info[arrow_col];
-                arrow::Array       *array = this->chunks[arrow_col];
-                ArrowTypeInfo      &arrow_type = this->arrow_types[arrow_col];
-                PgTypeInfo         &pg_type = this->pg_types[arrow_col];
+                ChunkInfo   &chunkInfo = this->chunk_info[arrow_col];
+                arrow::Array *array = this->chunks[arrow_col];
+                TypeInfo    &typinfo = this->types[arrow_col];
 
                 chunkInfo.len = array->length();
 
@@ -846,46 +843,32 @@ public:
                 if (fake)
                     continue;
 
-                /* Currently only primitive types and lists are supported */
-                if (arrow_type.type_id != arrow::Type::LIST)
+                if (this->has_nulls[arrow_col] && array->IsNull(chunkInfo.pos))
                 {
-                    if (this->has_nulls[arrow_col] && array->IsNull(chunkInfo.pos))
-                    {
-                        slot->tts_isnull[attr] = true;
-                    }
-                    else
-                    {
-                        slot->tts_values[attr] = 
-                            this->read_primitive_type(array, arrow_type, chunkInfo.pos);
-                        slot->tts_isnull[attr] = false;
-                    }
+                    slot->tts_isnull[attr] = true;
+                    chunkInfo.pos++;
+                    continue;
+                }
+                slot->tts_isnull[attr] = false;
+
+                /* Currently only primitive types and lists are supported */
+                if (typinfo.arrow.type_id != arrow::Type::LIST)
+                {
+                    slot->tts_values[attr] = 
+                        this->read_primitive_type(array, typinfo, chunkInfo.pos);
                 }
                 else
                 {
-                    if (!OidIsValid(pg_type.elem_type))
-                    {
-                        throw std::runtime_error("parquet_fdw: cannot convert parquet column of type "
-                                                 "LIST to postgres column of scalar type");
-                    }
                     int64 pos = chunkInfo.pos;
                     arrow::ListArray   *larray = (arrow::ListArray *) array;
 
-                    if (this->has_nulls[arrow_col] && array->IsNull(pos))
-                    {
-                        slot->tts_isnull[attr] = true;
-                    }
-                    else
-                    {
-                        std::shared_ptr<arrow::Array> slice =
-                            larray->values()->Slice(larray->value_offset(pos),
-                                                    larray->value_length(pos));
+                    std::shared_ptr<arrow::Array> slice =
+                        larray->values()->Slice(larray->value_offset(pos),
+                                                larray->value_length(pos));
 
-                        slot->tts_values[attr] =
-                            this->nested_list_get_datum(slice.get(),
-                                                        arrow_type.children[0],
-                                                        pg_type);
-                        slot->tts_isnull[attr] = false;
-                    }
+                    slot->tts_values[attr] =
+                        this->nested_list_get_datum(slice.get(),
+                                                    typinfo.children[0]);
                 }
 
                 chunkInfo.pos++;
@@ -1044,13 +1027,12 @@ public:
                      bool has_nulls)
     {
         std::shared_ptr<arrow::ChunkedArray> column = table->column(col);
-        ArrowTypeInfo  &arrow_type = this->arrow_types[col];
-        PgTypeInfo     &pg_type = this->pg_types[col];
+        TypeInfo &typinfo = this->types[col];
         void   *data;
         size_t  sz;
         int     row = 0;
 
-        switch(arrow_type.type_id) {
+        switch(typinfo.arrow.type_id) {
             case arrow::Type::BOOL:
                 sz = sizeof(bool);
                 break;
@@ -1077,7 +1059,7 @@ public:
                     this->column_nulls[col][row++] = true;
                     continue;
                 }
-                switch (arrow_type.type_id)
+                switch (typinfo.arrow.type_id)
                 {
                     /*
                      * For types smaller than Datum (assuming 8 bytes) we
@@ -1118,10 +1100,13 @@ public:
                                                         larray->value_length(j));
                             ((Datum *) data)[row] =
                                 this->nested_list_get_datum(slice.get(),
-                                                            arrow_type.children[0],
-                                                            pg_type);
+                                                            typinfo.children[0]);
                             break;
                         }
+                    case arrow::Type::MAP:
+                        /* TODO */
+                        throw std::runtime_error("Not implemented");
+                        break;
 
                     default:
                         /*
@@ -1129,7 +1114,7 @@ public:
                          * Datum values.
                          */
                         ((Datum *) data)[row] =
-                            this->read_primitive_type(array, arrow_type, j);
+                            this->read_primitive_type(array, typinfo, j);
                 }
                 this->column_nulls[col][row] = false;
 
@@ -1170,10 +1155,10 @@ public:
              * */
             if (arrow_col >= 0)
             {
-                ArrowTypeInfo &arrow_type = this->arrow_types[arrow_col];
+                TypeInfo &typinfo = this->types[arrow_col];
                 void *data = this->column_data[arrow_col];
 
-                switch(arrow_type.type_id)
+                switch(typinfo.arrow.type_id)
                 {
                     case arrow::Type::BOOL:
                         slot->tts_values[attr] = BoolGetDatum(((bool *) data)[this->row]);

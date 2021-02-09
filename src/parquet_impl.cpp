@@ -1515,8 +1515,14 @@ parquetAcquireSampleRowsFunc(Relation relation, int /* elevel */,
 
             bool fake = (row % ratio) != 0;
             ExecClearTuple(slot);
-            if (!festate->next(slot, fake))
-                break;
+            try {
+                if (!festate->next(slot, fake))
+                    break;
+            } catch(std::exception &e) {
+                error = e.what();
+            }
+            if (!error.empty())
+                elog(ERROR, "parquet_fdw: %s", error.c_str());
 
             if (!fake)
             {

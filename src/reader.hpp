@@ -39,32 +39,49 @@ enum ReadStatus
 class ParquetReader
 {
 protected:
-    struct PgTypeInfo
-    {
-        Oid     oid;
 
-        /* For array types. elem_type == InvalidOid means type is not an array */
-        Oid     elem_type;
-        int16   elem_len;
-        bool    elem_byval;
-        char    elem_align;
-    };
-
-    struct ArrowTypeInfo
+    struct TypeInfo
     {
-        arrow::Type::type   type_id;
-        FmgrInfo           *castfunc;
+        struct
+        {
+            arrow::Type::type   type_id;
+            std::string         type_name;
+        } arrow;
+
+        struct
+        {
+            Oid         oid;
+            int16       len;    /*                         */
+            bool        byval;  /* Only for array elements */
+            char        align;  /*                         */
+        } pg;
+
+        /*
+         * Cast functions from dafult postgres type defined in `to_postgres_type`
+         * to actual table column type.
+         */
+        FmgrInfo       *castfunc;
 
         /* Underlying types for complex types like list and map */
-        std::vector<ArrowTypeInfo> children;
+        std::vector<TypeInfo> children;
 
-        std::string         type_name;
-
-        ArrowTypeInfo()
-            : type_id(arrow::Type::NA), castfunc(nullptr)
+        TypeInfo()
+            : arrow{}, pg{}, castfunc(nullptr)
         {}
-        ArrowTypeInfo(std::shared_ptr<arrow::DataType> type, FmgrInfo *castfunc)
-            : type_id(type->id()), type_name(type->name()), castfunc(castfunc)
+
+        TypeInfo(TypeInfo &&ti)
+            : arrow(std::move(ti.arrow)), pg(ti.pg),
+              castfunc(nullptr), children(std::move(ti.children))
+        {}
+
+        TypeInfo(std::shared_ptr<arrow::DataType> arrow_type)
+            : arrow{arrow_type->id(), arrow_type->name()}, pg{}, castfunc(nullptr)
+        {}
+
+        TypeInfo(std::shared_ptr<arrow::DataType> arrow_type, Oid typid,
+                 FmgrInfo *castfunc)
+            : arrow{arrow_type->id(), arrow_type->name()}, pg{typid, 0, false, 0},
+              castfunc(castfunc)
         {}
     };
 
@@ -91,10 +108,8 @@ protected:
      */
     std::vector<FmgrInfo *>         castfuncs;
 
-    /* TODO: probably unite those things into single object */
     std::vector<std::string>        column_names;
-    std::vector<PgTypeInfo>         pg_types;
-    std::vector<ArrowTypeInfo>      arrow_types;
+    std::vector<TypeInfo>           types;
 
     bool           *has_nulls;          /* per-column info on nulls */
 
@@ -118,11 +133,9 @@ protected:
     bool     initialized;
 
 protected:
-    Datum read_primitive_type(arrow::Array *array, const ArrowTypeInfo &typinfo,
+    Datum read_primitive_type(arrow::Array *array, const TypeInfo &typinfo,
                               int64_t i);
-    Datum nested_list_get_datum(arrow::Array *array,
-                                const ArrowTypeInfo &arrow_type,
-                                const PgTypeInfo &pg_type);
+    Datum nested_list_get_datum(arrow::Array *array, const TypeInfo &typinfo);
     FmgrInfo *find_castfunc(arrow::Type::type src_type, Oid dst_type,
                             const char *attname);
     template<typename T> inline void copy_to_c_array(T *values,
