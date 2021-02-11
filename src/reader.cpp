@@ -273,11 +273,13 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, const std::set<in
                         Assert(strct.children.size() == 2);
                         auto &key = strct.children[0];
                         auto &item = strct.children[1];
+                        Oid pg_key_type = to_postgres_type(key.field->type()->id());
+                        Oid pg_item_type = to_postgres_type(item.field->type()->id());
 
-                        typinfo.children.emplace_back(key.field->type());
-                        typinfo.children.emplace_back(item.field->type());
-
-                        /* TODO: find castfuncs */
+                        typinfo.children.emplace_back(key.field->type(),
+                                                      pg_key_type, nullptr);
+                        typinfo.children.emplace_back(item.field->type(),
+                                                      pg_item_type, nullptr);
 
                         this->indices.push_back(key.column_index);
                         this->indices.push_back(item.column_index);
@@ -506,6 +508,46 @@ construct_array:
 
     return PointerGetDatum(res);
 }
+
+Datum
+ParquetReader::map_to_jsonb(arrow::Array *keys, arrow::Array *values,
+                            const TypeInfo &typinfo)
+{
+	JsonbParseState *parseState = NULL;
+    JsonbValue *res;
+
+    Assert(keys->length() == values->length());
+    Assert(typinfo.children.size() == 2);
+
+	res = pushJsonbValue(&parseState, WJB_BEGIN_OBJECT, NULL);
+
+    for (int i = 0; i < keys->length(); ++i)
+    {
+        Datum   key, value;
+        bool    isnull;
+        const TypeInfo &key_typinfo = typinfo.children[0];
+        const TypeInfo &val_typinfo = typinfo.children[1];
+
+        if (keys->IsNull(i))
+            throw std::runtime_error("key is null");
+        
+        if (!values->IsNull(i))
+        {
+            key = this->read_primitive_type(keys, key_typinfo, i);
+            value = this->read_primitive_type(values, val_typinfo, i);
+        } else
+            isnull = false;
+
+        /* TODO: adding cstring would be cheaper than adding text */
+        datum_to_jsonb(key, key_typinfo.pg.oid, false, parseState, true);
+        datum_to_jsonb(value, val_typinfo.pg.oid, isnull, parseState, false);
+    }
+
+	res = pushJsonbValue(&parseState, WJB_END_OBJECT, NULL);
+
+    return JsonbPGetDatum(JsonbValueToJsonb(res));
+}
+
 
 /*
  * find_castfunc
@@ -852,23 +894,37 @@ public:
                 slot->tts_isnull[attr] = false;
 
                 /* Currently only primitive types and lists are supported */
-                if (typinfo.arrow.type_id != arrow::Type::LIST)
+                switch (typinfo.arrow.type_id)
                 {
-                    slot->tts_values[attr] = 
-                        this->read_primitive_type(array, typinfo, chunkInfo.pos);
-                }
-                else
-                {
-                    int64 pos = chunkInfo.pos;
-                    arrow::ListArray   *larray = (arrow::ListArray *) array;
+                    case arrow::Type::LIST:
+                    {
+                        int64 pos = chunkInfo.pos;
+                        arrow::ListArray   *larray = (arrow::ListArray *) array;
 
-                    std::shared_ptr<arrow::Array> slice =
-                        larray->values()->Slice(larray->value_offset(pos),
-                                                larray->value_length(pos));
+                        std::shared_ptr<arrow::Array> slice =
+                            larray->values()->Slice(larray->value_offset(pos),
+                                                    larray->value_length(pos));
 
-                    slot->tts_values[attr] =
-                        this->nested_list_get_datum(slice.get(),
-                                                    typinfo.children[0]);
+                        slot->tts_values[attr] =
+                            this->nested_list_get_datum(slice.get(),
+                                                        typinfo.children[0]);
+                        break;
+                    }
+                    case arrow::Type::MAP:
+                    {
+                        int64 pos = chunkInfo.pos;
+                        arrow::MapArray* maparray = (arrow::MapArray*) array;
+                        auto ks = maparray->keys()->Slice(maparray->value_offset(pos),
+                                                          maparray->value_length(pos));
+                        auto vs = maparray->items()->Slice(maparray->value_offset(pos),
+                                                            maparray->value_length(pos));
+
+                        slot->tts_values[attr] = this->map_to_jsonb(ks.get(), vs.get(), typinfo);
+                        break;
+                    }
+                    default:
+                        slot->tts_values[attr] = 
+                            this->read_primitive_type(array, typinfo, chunkInfo.pos);
                 }
 
                 chunkInfo.pos++;
@@ -1105,7 +1161,7 @@ public:
                         }
                     case arrow::Type::MAP:
                         /* TODO */
-                        throw std::runtime_error("Not implemented");
+                        throw std::runtime_error("not implemented");
                         break;
 
                     default:

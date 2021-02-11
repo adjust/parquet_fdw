@@ -792,13 +792,7 @@ get_filenames_from_userfunc(const char *funcname, const char *funcarg)
     ArrayType  *arr;
 
     if (funcarg)
-    {
-#if PG_VERSION_NUM < 110000
-        j = DatumGetJsonb(DirectFunctionCall1(jsonb_in, CStringGetDatum(funcarg)));
-#else
         j = DatumGetJsonbP(DirectFunctionCall1(jsonb_in, CStringGetDatum(funcarg)));
-#endif
-    }
 
     funcid = LookupFuncName(f, 1, &jsonboid, false);
     filenames = OidFunctionCall1NullableArg(funcid, (Datum) j, funcarg == NULL);

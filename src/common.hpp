@@ -9,9 +9,15 @@
 extern "C"
 {
 #include "postgres.h"
+#include "utils/jsonb.h"
 }
 
 #define ERROR_STR_LEN 512
+
+#if PG_VERSION_NUM < 110000
+#define DatumGetJsonbP DatumGetJsonb
+#define JsonbPGetDatum JsonbGetDatum
+#endif
 
 #define to_postgres_timestamp(tstype, i, ts)                    \
     switch ((tstype)->unit()) {                                 \
@@ -48,5 +54,7 @@ void *exc_palloc(std::size_t size);
 Oid to_postgres_type(int arrow_type);
 Datum bytes_to_postgres_type(const char *bytes, arrow::DataType *arrow_type);
 arrow::Type::type get_arrow_list_elem_type(arrow::DataType *type);
+void datum_to_jsonb(Datum value, Oid typoid, bool isnull,
+                    JsonbParseState *result, bool iskey);
 
 #endif

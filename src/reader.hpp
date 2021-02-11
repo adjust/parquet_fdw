@@ -136,6 +136,8 @@ protected:
     Datum read_primitive_type(arrow::Array *array, const TypeInfo &typinfo,
                               int64_t i);
     Datum nested_list_get_datum(arrow::Array *array, const TypeInfo &typinfo);
+    Datum map_to_jsonb(arrow::Array *keys, arrow::Array *values,
+                       const TypeInfo &typinfo);
     FmgrInfo *find_castfunc(arrow::Type::type src_type, Oid dst_type,
                             const char *attname);
     template<typename T> inline void copy_to_c_array(T *values,
