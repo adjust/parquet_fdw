@@ -50,6 +50,8 @@ to_postgres_type(int arrow_type)
     {
         case arrow::Type::BOOL:
             return BOOLOID;
+        case arrow::Type::INT16:
+            return INT2OID;
         case arrow::Type::INT32:
             return INT4OID;
         case arrow::Type::INT64:
@@ -83,6 +85,8 @@ bytes_to_postgres_type(const char *bytes, arrow::DataType *arrow_type)
     {
         case arrow::Type::BOOL:
             return BoolGetDatum(*(bool *) bytes);
+        case arrow::Type::INT16:
+            return Int16GetDatum(*(int16 *) bytes);
         case arrow::Type::INT32:
             return Int32GetDatum(*(int32 *) bytes);
         case arrow::Type::INT64:
@@ -120,7 +124,7 @@ get_arrow_list_elem_type(arrow::DataType *type)
     return children[0]->type()->id();
 }
 
-void datum_to_jsonb(Datum value, Oid typoid, bool isnull,
+void datum_to_jsonb(Datum value, Oid typoid, bool isnull, FmgrInfo *outfunc,
                     JsonbParseState *parseState, bool iskey)
 {
     JsonbValue  jb;
@@ -137,50 +141,43 @@ void datum_to_jsonb(Datum value, Oid typoid, bool isnull,
         case INT2OID:
         case INT4OID:
         case INT8OID:
+        case FLOAT4OID:
+        case FLOAT8OID:
         {
             /* If key is integer, we must convert it to text, not numeric */
             if (iskey) {
-                char    buf[MAXINT8LEN + 1];
-                char   *strval;
+                char    *strval;
 
-                switch (typoid)
-                {
-                    case INT2OID:
-                        pg_lltoa((int64) DatumGetInt16(value), buf);
-                        break;
-                    case INT4OID:
-                        pg_lltoa((int64) DatumGetInt32(value), buf);
-                        break;
-                    case INT8OID:
-                        pg_lltoa(DatumGetInt64(value), buf);
-                        break;
-                    default:
-                        Assert(false && "should never happen");
-                }
-                strval = pstrdup(buf);
+                strval = DatumGetCString(FunctionCall1(outfunc, value));
 
                 jb.type = jbvString;
                 jb.val.string.len = strlen(strval);
                 jb.val.string.val = strval;
             }
             else {
-                Datum num_datum;
+                Datum numeric;
 
                 switch (typoid)
                 {
                     case INT2OID:
                     case INT4OID:
-                        num_datum = DirectFunctionCall1(int4_numeric, value);
+                        numeric = DirectFunctionCall1(int4_numeric, value);
                         break;
                     case INT8OID:
-                        num_datum = DirectFunctionCall1(int8_numeric, value);
+                        numeric = DirectFunctionCall1(int8_numeric, value);
+                        break;
+                    case FLOAT4OID:
+                        numeric = DirectFunctionCall1(float4_numeric, value);
+                        break;
+                    case FLOAT8OID:
+                        numeric = DirectFunctionCall1(float8_numeric, value);
                         break;
                     default:
                         Assert(false && "should never happen");
                 }
 
                 jb.type = jbvNumeric;
-                jb.val.numeric = DatumGetNumeric(num_datum);
+                jb.val.numeric = DatumGetNumeric(numeric);
             }
             break;
         }
@@ -194,7 +191,15 @@ void datum_to_jsonb(Datum value, Oid typoid, bool isnull,
             break;
         }
         default:
-            throw std::runtime_error("not implemented");
+        {
+            char    *strval;
+
+            strval = DatumGetCString(FunctionCall1(outfunc, value));
+
+            jb.type = jbvString;
+            jb.val.string.len = strlen(strval);
+            jb.val.string.val = strval;
+        }
     }
 
     pushJsonbValue(&parseState, iskey ? WJB_KEY : WJB_VALUE, &jb);

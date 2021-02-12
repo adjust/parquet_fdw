@@ -281,6 +281,9 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, const std::set<in
                         typinfo.children.emplace_back(item.field->type(),
                                                       pg_item_type, nullptr);
 
+                        typinfo.children[0].outfunc = find_outfunc(pg_key_type);
+                        typinfo.children[1].outfunc = find_outfunc(pg_item_type);
+
                         this->indices.push_back(key.column_index);
                         this->indices.push_back(item.column_index);
                         break;
@@ -319,6 +322,14 @@ Datum ParquetReader::read_primitive_type(arrow::Array *array,
             arrow::BooleanArray *boolarray = (arrow::BooleanArray *) array;
 
             res = BoolGetDatum(boolarray->Value(i));
+            break;
+        }
+        case arrow::Type::INT16:
+        {
+            arrow::Int16Array *intarray = (arrow::Int16Array *) array;
+            int value = intarray->Value(i);
+
+            res = Int16GetDatum(value);
             break;
         }
         case arrow::Type::INT32:
@@ -432,11 +443,11 @@ Datum ParquetReader::read_primitive_type(arrow::Array *array,
 }
 
 /*
- * nested_list_get_datum
+ * nested_list_to_datum
  *      Returns postgres array build from elements of array. Only one
  *      dimensional arrays are supported.
  */
-Datum ParquetReader::nested_list_get_datum(arrow::Array *array,
+Datum ParquetReader::nested_list_to_datum(arrow::ListArray *larray, int pos,
                                            const TypeInfo &typinfo)
 {
     MemoryContext oldcxt;
@@ -446,6 +457,12 @@ Datum ParquetReader::nested_list_get_datum(arrow::Array *array,
     int         dims[1];
     int         lbs[1];
     bool        error = false;
+
+    std::shared_ptr<arrow::Array> array =
+        larray->values()->Slice(larray->value_offset(pos),
+                                larray->value_length(pos));
+
+    const TypeInfo &elemtypinfo = typinfo.children[0];
 
     values = (Datum *) this->allocator->fast_alloc(sizeof(Datum) * array->length());
 
@@ -461,14 +478,14 @@ Datum ParquetReader::nested_list_get_datum(arrow::Array *array,
          * 8 bytes long, which is true for most contemporary systems but this
          * will not work on some exotic or really old systems.
          */
-        copy_to_c_array<int64_t>((int64_t *) values, array, typinfo.pg.len);
+        copy_to_c_array<int64_t>((int64_t *) values, array.get(), elemtypinfo.pg.len);
         goto construct_array;
     }
 #endif
     for (int64_t i = 0; i < array->length(); ++i)
     {
         if (!array->IsNull(i))
-            values[i] = this->read_primitive_type(array, typinfo, i);
+            values[i] = this->read_primitive_type(array.get(), elemtypinfo, i);
         else
         {
             if (!nulls)
@@ -494,8 +511,8 @@ construct_array:
     {
         oldcxt = MemoryContextSwitchTo(allocator->context());
         res = construct_md_array(values, nulls, 1, dims, lbs,
-                                 typinfo.pg.oid, typinfo.pg.len,
-                                 typinfo.pg.byval, typinfo.pg.align);
+                                 elemtypinfo.pg.oid, elemtypinfo.pg.len,
+                                 elemtypinfo.pg.byval, elemtypinfo.pg.align);
         MemoryContextSwitchTo(oldcxt);
     }
     PG_CATCH();
@@ -510,11 +527,16 @@ construct_array:
 }
 
 Datum
-ParquetReader::map_to_jsonb(arrow::Array *keys, arrow::Array *values,
+ParquetReader::map_to_datum(arrow::MapArray *maparray, int pos,
                             const TypeInfo &typinfo)
 {
 	JsonbParseState *parseState = NULL;
     JsonbValue *res;
+
+    auto keys = maparray->keys()->Slice(maparray->value_offset(pos),
+                                        maparray->value_length(pos));
+    auto values = maparray->items()->Slice(maparray->value_offset(pos),
+                                           maparray->value_length(pos));
 
     Assert(keys->length() == values->length());
     Assert(typinfo.children.size() == 2);
@@ -524,7 +546,7 @@ ParquetReader::map_to_jsonb(arrow::Array *keys, arrow::Array *values,
     for (int i = 0; i < keys->length(); ++i)
     {
         Datum   key, value;
-        bool    isnull;
+        bool    isnull = false;
         const TypeInfo &key_typinfo = typinfo.children[0];
         const TypeInfo &val_typinfo = typinfo.children[1];
 
@@ -533,14 +555,16 @@ ParquetReader::map_to_jsonb(arrow::Array *keys, arrow::Array *values,
         
         if (!values->IsNull(i))
         {
-            key = this->read_primitive_type(keys, key_typinfo, i);
-            value = this->read_primitive_type(values, val_typinfo, i);
+            key = this->read_primitive_type(keys.get(), key_typinfo, i);
+            value = this->read_primitive_type(values.get(), val_typinfo, i);
         } else
-            isnull = false;
+            isnull = true;
 
         /* TODO: adding cstring would be cheaper than adding text */
-        datum_to_jsonb(key, key_typinfo.pg.oid, false, parseState, true);
-        datum_to_jsonb(value, val_typinfo.pg.oid, isnull, parseState, false);
+        datum_to_jsonb(key, key_typinfo.pg.oid, false, key_typinfo.outfunc,
+                       parseState, true);
+        datum_to_jsonb(value, val_typinfo.pg.oid, isnull, val_typinfo.outfunc,
+                       parseState, false);
     }
 
 	res = pushJsonbValue(&parseState, WJB_END_OBJECT, NULL);
@@ -621,6 +645,35 @@ FmgrInfo *ParquetReader::find_castfunc(arrow::Type::type src_type,
         throw std::runtime_error(errstr);
 
     return castfunc;
+}
+
+FmgrInfo *ParquetReader::find_outfunc(Oid typoid)
+{
+    Oid     funcoid;
+    bool    isvarlena;
+    FmgrInfo *outfunc;
+    bool    error(false);
+
+    PG_TRY();
+    {
+        MemoryContext   oldctx;
+
+        getTypeOutputInfo(typoid, &funcoid, &isvarlena);
+
+        oldctx = MemoryContextSwitchTo(CurTransactionContext);
+        outfunc = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
+        fmgr_info(funcoid, outfunc);
+        MemoryContextSwitchTo(oldctx);
+    }
+    PG_CATCH();
+    {
+        error = true;
+    }
+    PG_END_TRY();
+    if (error)
+        throw std::runtime_error("failed to find output function");
+
+    return outfunc;
 }
 
 /*
@@ -898,28 +951,19 @@ public:
                 {
                     case arrow::Type::LIST:
                     {
-                        int64 pos = chunkInfo.pos;
                         arrow::ListArray   *larray = (arrow::ListArray *) array;
 
-                        std::shared_ptr<arrow::Array> slice =
-                            larray->values()->Slice(larray->value_offset(pos),
-                                                    larray->value_length(pos));
-
                         slot->tts_values[attr] =
-                            this->nested_list_get_datum(slice.get(),
-                                                        typinfo.children[0]);
+                            this->nested_list_to_datum(larray, chunkInfo.pos,
+                                                       typinfo);
                         break;
                     }
                     case arrow::Type::MAP:
                     {
-                        int64 pos = chunkInfo.pos;
                         arrow::MapArray* maparray = (arrow::MapArray*) array;
-                        auto ks = maparray->keys()->Slice(maparray->value_offset(pos),
-                                                          maparray->value_length(pos));
-                        auto vs = maparray->items()->Slice(maparray->value_offset(pos),
-                                                            maparray->value_length(pos));
 
-                        slot->tts_values[attr] = this->map_to_jsonb(ks.get(), vs.get(), typinfo);
+                        slot->tts_values[attr] =
+                            this->map_to_datum(maparray, chunkInfo.pos, typinfo);
                         break;
                     }
                     default:
@@ -1092,6 +1136,9 @@ public:
             case arrow::Type::BOOL:
                 sz = sizeof(bool);
                 break;
+            case arrow::Type::INT16:
+                sz = sizeof(int16);
+                break;
             case arrow::Type::INT32:
                 sz = sizeof(int32);
                 break;
@@ -1128,16 +1175,22 @@ public:
                             ((bool *) data)[row] = boolarray->Value(row);
                             break;
                         }
+                    case arrow::Type::INT16:
+                        {
+                            arrow::Int16Array *intarray = (arrow::Int16Array *) array;
+                            ((int16 *) data)[row] = intarray->Value(row);
+                            break;
+                        }
                     case arrow::Type::INT32:
                         {
                             arrow::Int32Array *intarray = (arrow::Int32Array *) array;
-                            ((int *) data)[row] = intarray->Value(row);
+                            ((int32 *) data)[row] = intarray->Value(row);
                             break;
                         }
                     case arrow::Type::FLOAT:
                         {
                             arrow::FloatArray *farray = (arrow::FloatArray *) array;
-                            ((int *) data)[row] = farray->Value(row);
+                            ((float *) data)[row] = farray->Value(row);
                             break;
                         }
                     case arrow::Type::DATE32:
@@ -1148,22 +1201,21 @@ public:
                         }
 
                     case arrow::Type::LIST:
-                        /* Special case for lists */
                         {
                             auto larray = (arrow::ListArray *) array;
-                            auto slice =
-                                larray->values()->Slice(larray->value_offset(j),
-                                                        larray->value_length(j));
+
                             ((Datum *) data)[row] =
-                                this->nested_list_get_datum(slice.get(),
-                                                            typinfo.children[0]);
+                                this->nested_list_to_datum(larray, j, typinfo);
                             break;
                         }
                     case arrow::Type::MAP:
-                        /* TODO */
-                        throw std::runtime_error("not implemented");
-                        break;
+                        {
+                            arrow::MapArray* maparray = (arrow::MapArray*) array;
 
+                            ((Datum *) data)[row] =
+                                this->map_to_datum(maparray, j, typinfo);
+                            break;
+                        }
                     default:
                         /*
                          * For larger types we copy already converted into
@@ -1219,8 +1271,11 @@ public:
                     case arrow::Type::BOOL:
                         slot->tts_values[attr] = BoolGetDatum(((bool *) data)[this->row]);
                         break;
+                    case arrow::Type::INT16:
+                        slot->tts_values[attr] = Int16GetDatum(((int16 *) data)[this->row]);
+                        break;
                     case arrow::Type::INT32:
-                        slot->tts_values[attr] = Int32GetDatum(((int *) data)[this->row]);
+                        slot->tts_values[attr] = Int32GetDatum(((int32 *) data)[this->row]);
                         break;
                     case arrow::Type::FLOAT:
                         slot->tts_values[attr] = Float4GetDatum(((float *) data)[this->row]);

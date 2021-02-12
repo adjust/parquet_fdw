@@ -48,8 +48,9 @@ options (
 
 Currently `parquet_fdw` supports the following column [types](https://github.com/apache/arrow/blob/master/cpp/src/arrow/type.h):
 
-| Parquet type |  SQL type |
+|   Arrow type |  SQL type |
 |-------------:|----------:|
+|        INT16 |      INT2 |
 |        INT32 |      INT4 |
 |        INT64 |      INT8 |
 |        FLOAT |    FLOAT4 |
@@ -59,6 +60,7 @@ Currently `parquet_fdw` supports the following column [types](https://github.com
 |       STRING |      TEXT |
 |       BINARY |     BYTEA |
 |         LIST |     ARRAY |
+|          MAP |     JSONB |
 
 Currently `parquet_fdw` doesn't support structs and nested lists.
 

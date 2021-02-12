@@ -61,6 +61,7 @@ protected:
          * to actual table column type.
          */
         FmgrInfo       *castfunc;
+        FmgrInfo       *outfunc;
 
         /* Underlying types for complex types like list and map */
         std::vector<TypeInfo> children;
@@ -135,11 +136,11 @@ protected:
 protected:
     Datum read_primitive_type(arrow::Array *array, const TypeInfo &typinfo,
                               int64_t i);
-    Datum nested_list_get_datum(arrow::Array *array, const TypeInfo &typinfo);
-    Datum map_to_jsonb(arrow::Array *keys, arrow::Array *values,
-                       const TypeInfo &typinfo);
+    Datum nested_list_to_datum(arrow::ListArray *larray, int pos, const TypeInfo &typinfo);
+    Datum map_to_datum(arrow::MapArray *maparray, int pos, const TypeInfo &typinfo);
     FmgrInfo *find_castfunc(arrow::Type::type src_type, Oid dst_type,
                             const char *attname);
+    FmgrInfo *find_outfunc(Oid typoid);
     template<typename T> inline void copy_to_c_array(T *values,
                                                      const arrow::Array *array,
                                                      int elem_size);
