@@ -66,23 +66,31 @@ protected:
         /* Underlying types for complex types like list and map */
         std::vector<TypeInfo> children;
 
+        /*
+         * Column index in parquet schema. For complex types and children
+         * index is equal -1. Currently only used for checking column
+         * statistics.
+         */
+        int             index;
+
         TypeInfo()
-            : arrow{}, pg{}, castfunc(nullptr)
+            : arrow{}, pg{}, castfunc(nullptr), index(-1)
         {}
 
         TypeInfo(TypeInfo &&ti)
-            : arrow(std::move(ti.arrow)), pg(ti.pg),
-              castfunc(nullptr), children(std::move(ti.children))
+            : arrow(ti.arrow), pg(ti.pg), castfunc(nullptr),
+              children(std::move(ti.children)), index(-1)
         {}
 
         TypeInfo(std::shared_ptr<arrow::DataType> arrow_type)
-            : arrow{arrow_type->id(), arrow_type->name()}, pg{}, castfunc(nullptr)
+            : arrow{arrow_type->id(), arrow_type->name()}, pg{},
+              castfunc(nullptr), index(-1)
         {}
 
         TypeInfo(std::shared_ptr<arrow::DataType> arrow_type, Oid typid,
                  FmgrInfo *castfunc)
             : arrow{arrow_type->id(), arrow_type->name()}, pg{typid, 0, false, 0},
-              castfunc(castfunc)
+              castfunc(castfunc), index(-1)
         {}
     };
 
@@ -112,8 +120,6 @@ protected:
     std::vector<std::string>        column_names;
     std::vector<TypeInfo>           types;
 
-    bool           *has_nulls;          /* per-column info on nulls */
-
     /* Coordinator for parallel query execution */
     ParallelCoordinator            *coordinator;
 
@@ -122,16 +128,16 @@ protected:
      */
     std::vector<int>                rowgroups;
 
-    FastAllocator                  *allocator;
+    std::unique_ptr<FastAllocator>  allocator;
 
     /*
      * libparquet options
      */
-     bool    use_threads;
-     bool    use_mmap;
+    bool    use_threads;
+    bool    use_mmap;
 
     /* Wether object is properly initialized */
-    bool     initialized;
+    bool    initialized;
 
 protected:
     Datum read_primitive_type(arrow::Array *array, const TypeInfo &typinfo,
@@ -147,6 +153,7 @@ protected:
     template <typename T> inline const T* GetPrimitiveValues(const arrow::Array& arr);
 
 public:
+    ParquetReader(MemoryContext cxt);
     virtual ~ParquetReader() = 0;
     virtual ReadStatus next(TupleTableSlot *slot, bool fake=false) = 0;
     virtual void rescan() = 0;

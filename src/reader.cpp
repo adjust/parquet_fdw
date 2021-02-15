@@ -62,15 +62,13 @@ private:
     char               *segment_cur_ptr;
     char               *segment_last_ptr;
     std::list<char *>   garbage_segments;
+
 public:
     FastAllocator(MemoryContext cxt)
-        : garbage_segments()
-    {
-        this->segments_cxt = cxt;
-        this->segment_start_ptr = NULL;
-        this->segment_cur_ptr = NULL;
-        this->segment_last_ptr = NULL;
-    }
+        : segments_cxt(cxt), segment_start_ptr(nullptr), segment_cur_ptr(nullptr),
+          segment_last_ptr(nullptr), garbage_segments()
+    {}
+
     ~FastAllocator()
     {
         this->recycle();
@@ -153,6 +151,10 @@ public:
     }
 };
 
+
+ParquetReader::ParquetReader(MemoryContext cxt)
+    : allocator(new FastAllocator(cxt))
+{}
 
 int32_t ParquetReader::id()
 {
@@ -292,6 +294,7 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, const std::set<in
                         typinfo.castfunc = find_castfunc(typinfo.arrow.type_id,
                                                          typinfo.pg.oid,
                                                          attname);
+                        typinfo.index = schema_field.column_index;
                         this->indices.push_back(schema_field.column_index);
                 }
                 this->types.push_back(std::move(typinfo));
@@ -300,8 +303,6 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, const std::set<in
             }
         }
     }
-
-    this->has_nulls = (bool *) exc_palloc(sizeof(bool) * this->map.size());
 }
 
 /*
@@ -737,6 +738,9 @@ private:
      */
     std::vector<arrow::Array *>     chunks;
 
+    /* Per-column info on nulls */
+    std::vector<bool>               has_nulls;
+
     int             row_group;          /* current row group index */
     uint32_t        row;                /* current row within row group */
     uint32_t        num_rows;           /* total rows in row group */
@@ -749,20 +753,16 @@ public:
      * MultifileExecutionState.
      */
     DefaultParquetReader(const char* filename, MemoryContext cxt, int reader_id = -1)
-        : row_group(-1), row(0), num_rows(0)
+        : ParquetReader(cxt), row_group(-1), row(0), num_rows(0)
     {
         this->filename = filename;
         this->reader_id = reader_id;
         this->coordinator = NULL;
         this->initialized = false;
-        this->allocator = new FastAllocator(cxt);
     }
 
     ~DefaultParquetReader()
-    {
-        if (allocator)
-            delete allocator;
-    }
+    {}
 
     void open()
     {
@@ -825,22 +825,14 @@ public:
                                 ->RowGroup(rowgroup);
 
         /* Determine which columns have null values */
-        for (uint i = 0; i < this->map.size(); i++)
+        for (auto &t : this->types)
         {
             std::shared_ptr<parquet::Statistics>  stats;
-            int arrow_col = this->map[i];
 
-            if (arrow_col < 0)
-                continue;
+            if (t.index >= 0)
+                stats = rowgroup_meta->ColumnChunk(t.index)->statistics();
 
-            stats = rowgroup_meta
-                ->ColumnChunk(this->indices[arrow_col])
-                ->statistics();
-
-            if (stats)
-                this->has_nulls[arrow_col] = (stats->null_count() > 0);
-            else
-                this->has_nulls[arrow_col] = true;
+            this->has_nulls.push_back(stats ? (stats->null_count() > 0) : true); 
         }
 
         status = this->reader
@@ -1002,20 +994,16 @@ private:
 
 public:
     CachingParquetReader(const char* filename, MemoryContext cxt, int reader_id = -1)
-        : is_active(false), row_group(-1), row(0), num_rows(0)
+        : ParquetReader(cxt), is_active(false), row_group(-1), row(0), num_rows(0)
     {
         this->filename = filename;
         this->reader_id = reader_id;
         this->coordinator = NULL;
         this->initialized = false;
-        this->allocator = new FastAllocator(cxt);
     }
 
     ~CachingParquetReader()
-    {
-        if (allocator)
-            delete allocator;
-    }
+    {}
 
     void open()
     {
