@@ -421,17 +421,16 @@ extract_rowgroups_list(const char *filename,
                 &reader);
 
         if (!status.ok())
-            throw Error("failed to open Parquet file %s",
-                             status.message().c_str());
-
+            throw Error("failed to open Parquet file %s", status.message().c_str());
 
         auto meta = reader->parquet_reader()->metadata();
         parquet::ArrowReaderProperties  props;
-        std::shared_ptr<arrow::Schema>  schema;
+        parquet::arrow::SchemaManifest  manifest;
 
-        status = parquet::arrow::FromParquetSchema(meta->schema(), props, &schema);
+        status = parquet::arrow::SchemaManifest::Make(meta->schema(), nullptr,
+                                                      props, &manifest);
         if (!status.ok())
-            throw Error("failed to convert from parquet schema: %s", status.message().c_str());
+            throw Error("error creating arrow schema");
 
         /* Check each row group whether it matches the filters */
         for (int r = 0; r < reader->num_row_groups(); r++)
@@ -439,9 +438,8 @@ extract_rowgroups_list(const char *filename,
             bool match = true;
             auto rowgroup = meta->RowGroup(r);
 
-            for (auto it = filters.begin(); it != filters.end(); it++)
+            for (auto &filter : filters)
             {
-                RowGroupFilter &filter = *it;
                 AttrNumber      attnum;
                 const char     *attname;
 
@@ -451,57 +449,55 @@ extract_rowgroups_list(const char *filename,
                 /*
                  * Search for the column with the same name as filtered attribute
                  */
-                for (int k = 0; k < rowgroup->num_columns(); k++)
+                for (auto &schema_field : manifest.schema_fields)
                 {
-                    auto    column = rowgroup->ColumnChunk(k);
-                    std::vector<std::string> path = column->path_in_schema()->ToDotVector();
+                    MemoryContext   ccxt = CurrentMemoryContext;
+                    bool            error = false;
+                    char            errstr[ERROR_STR_LEN];
+                    auto           &field = schema_field.field;
 
-                    if (strcmp(attname, path[0].c_str()) == 0)
+                    /* Skip complex objects (lists, maps) */
+                    if (schema_field.column_index == -1)
+                        continue;
+
+                    if (strcmp(attname, schema_field.field->name().c_str()) != 0)
+                        continue;
+
+                    /* Found it! */
+                    std::shared_ptr<parquet::Statistics>  stats;
+                    auto column = rowgroup->ColumnChunk(schema_field.column_index);
+                    stats = column->statistics();
+
+                    PG_TRY();
                     {
-                        /* Found it! */
-                        std::shared_ptr<parquet::Statistics>  stats;
-                        std::shared_ptr<arrow::Field>       field;
-                        std::shared_ptr<arrow::DataType>    type;
-                        MemoryContext   ccxt = CurrentMemoryContext;
-                        bool            error = false;
-                        char            errstr[ERROR_STR_LEN];
-
-                        stats = column->statistics();
-
-                        /* Convert to arrow field to get appropriate type */
-                        field = schema->field(k);
-                        type = field->type();
-
-                        PG_TRY();
+                        /*
+                         * If at least one filter doesn't match rowgroup exclude
+                         * the current row group and proceed with the next one.
+                         */
+                        if (stats && !row_group_matches_filter(stats.get(),
+                                                               field->type().get(),
+                                                               &filter))
                         {
-                            /*
-                             * If at least one filter doesn't match rowgroup exclude
-                             * the current row group and proceed with the next one.
-                             */
-                            if (stats &&
-                                !row_group_matches_filter(stats.get(), type.get(), &filter))
-                            {
-                                match = false;
-                                elog(DEBUG1, "parquet_fdw: skip rowgroup %d", r + 1);
-                            }
+                            match = false;
+                            elog(DEBUG1, "parquet_fdw: skip rowgroup %d", r + 1);
                         }
-                        PG_CATCH();
-                        {
-                            ErrorData *errdata;
-
-                            MemoryContextSwitchTo(ccxt);
-                            error = true;
-                            errdata = CopyErrorData();
-                            FlushErrorState();
-
-                            strncpy(errstr, errdata->message, ERROR_STR_LEN - 1);
-                            FreeErrorData(errdata);
-                        }
-                        PG_END_TRY();
-                        if (error)
-                            throw Error("row group filter match failed: %s", errstr);
-                        break;
                     }
+                    PG_CATCH();
+                    {
+                        ErrorData *errdata;
+
+                        MemoryContextSwitchTo(ccxt);
+                        error = true;
+                        errdata = CopyErrorData();
+                        FlushErrorState();
+
+                        strncpy(errstr, errdata->message, ERROR_STR_LEN - 1);
+                        FreeErrorData(errdata);
+                    }
+                    PG_END_TRY();
+                    if (error)
+                        throw Error("row group filter match failed: %s", errstr);
+                    break;
                 }  /* loop over columns */
 
                 if (!match)
