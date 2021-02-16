@@ -17,7 +17,7 @@ CREATE FOREIGN TABLE example1 (
     six     BOOL,
     seven   FLOAT8)
 SERVER parquet_srv
-OPTIONS (filename '@abs_srcdir@/data/example1.parquet', sorted 'one');
+OPTIONS (filename '@abs_srcdir@/data/simple/example1.parquet', sorted 'one');
 SELECT * FROM example1;
  one |    two     | three |        four         |    five    | six | seven 
 -----+------------+-------+---------------------+------------+-----+-------
@@ -201,12 +201,12 @@ OPTIONS (filename 'nonexistent.parquet', some_option '123');
 ERROR:  parquet_fdw: No such file or directory
 CREATE FOREIGN TABLE example_fail (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv
-OPTIONS (filename '@abs_srcdir@/data/example1.parquet', some_option '123');
+OPTIONS (filename '@abs_srcdir@/data/simple/example1.parquet', some_option '123');
 ERROR:  parquet_fdw: invalid option "some_option"
 -- type mismatch
 CREATE FOREIGN TABLE example_fail (one INT8[], two INT8, three TEXT)
 SERVER parquet_srv
-OPTIONS (filename '@abs_srcdir@/data/example1.parquet', sorted 'one');
+OPTIONS (filename '@abs_srcdir@/data/simple/example1.parquet', sorted 'one');
 SELECT one FROM example_fail;
 ERROR:  parquet_fdw: cast function to bigint[] ('one' column) is not found
 SELECT two FROM example_fail;
@@ -222,7 +222,7 @@ CREATE FOREIGN TABLE example_func (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv
 OPTIONS (
     files_func 'list_parquet_files',
-    files_func_arg '{"dir": "@abs_srcdir@/data"}',
+    files_func_arg '{"dir": "@abs_srcdir@/data/simple"}',
     sorted 'one');
 SELECT * FROM example_func;
  one |    two     | three 
@@ -247,7 +247,7 @@ $$ SELECT ARRAY[1,2,3]::INT[]; $$
 LANGUAGE SQL;
 CREATE FUNCTION no_args_func()
 RETURNS TEXT[] AS
-$$ SELECT ARRAY['@abs_srcdir@/data/example1.parquet']::TEXT[]; $$
+$$ SELECT ARRAY['@abs_srcdir@/data/simple/example1.parquet']::TEXT[]; $$
 LANGUAGE SQL;
 CREATE FOREIGN TABLE example_inv_func (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv
@@ -276,7 +276,7 @@ CREATE FOREIGN TABLE example_seq (
     six     BOOL,
     seven   FLOAT8)
 SERVER parquet_srv
-OPTIONS (filename '@abs_srcdir@/data/example1.parquet @abs_srcdir@/data/example2.parquet');
+OPTIONS (filename '@abs_srcdir@/data/simple/example1.parquet @abs_srcdir@/data/simple/example2.parquet');
 EXPLAIN (COSTS OFF) SELECT * FROM example_seq;
          QUERY PLAN          
 -----------------------------
@@ -313,7 +313,7 @@ CREATE FOREIGN TABLE example_sorted (
     six     BOOL,
     seven   FLOAT8)
 SERVER parquet_srv
-OPTIONS (filename '@abs_srcdir@/data/example1.parquet @abs_srcdir@/data/example2.parquet', sorted 'one');
+OPTIONS (filename '@abs_srcdir@/data/simple/example1.parquet @abs_srcdir@/data/simple/example2.parquet', sorted 'one');
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY one;
            QUERY PLAN           
 --------------------------------
@@ -350,7 +350,7 @@ CREATE FOREIGN TABLE example_sorted_caching (
     six     BOOL,
     seven   FLOAT8)
 SERVER parquet_srv
-OPTIONS (filename '@abs_srcdir@/data/example1.parquet @abs_srcdir@/data/example2.parquet', sorted 'one', max_open_files '1');
+OPTIONS (filename '@abs_srcdir@/data/simple/example1.parquet @abs_srcdir@/data/simple/example2.parquet', sorted 'one', max_open_files '1');
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted_caching ORDER BY one;
                QUERY PLAN               
 ----------------------------------------
@@ -487,7 +487,7 @@ CREATE FOREIGN TABLE example_multisort (
     five    DATE,
     six     BOOL)
 SERVER parquet_srv
-OPTIONS (filename '@abs_srcdir@/data/example1.parquet', sorted 'one five');
+OPTIONS (filename '@abs_srcdir@/data/simple/example1.parquet', sorted 'one five');
 EXPLAIN (COSTS OFF) SELECT * FROM example_multisort ORDER BY one, five;
             QUERY PLAN             
 -----------------------------------
@@ -507,4 +507,26 @@ SELECT * FROM example_multisort ORDER BY one, five;
    6 | {16,17,18} | tres  | 2018-01-06 00:00:00 | 2018-01-06 | f
 (6 rows)
 
+-- maps
+SET client_min_messages = DEBUG1;
+CREATE FOREIGN TABLE example3 (
+    one     JSONB,
+    two     JSONB,
+    three   INT2)
+SERVER parquet_srv
+OPTIONS (filename '@abs_srcdir@/data/complex/example3.parquet', sorted 'one');
+SELECT * FROM example3;
+                 one                  |                 two                  | three 
+--------------------------------------+--------------------------------------+-------
+ {"1": "foo", "2": "bar", "3": "baz"} | {"2018-01-01": 10, "2018-01-02": 15} |     1
+ {"4": "test1", "5": "test2"}         | {"2018-01-03": 20, "2018-01-04": 25} |     2
+(2 rows)
+
+SELECT * FROM example3 WHERE three = 3;
+DEBUG:  parquet_fdw: skip rowgroup 1
+ one | two | three 
+-----+-----+-------
+(0 rows)
+
+SET client_min_messages = WARNING;
 DROP EXTENSION parquet_fdw CASCADE;

@@ -1,6 +1,6 @@
 # Sample Parquet data
 
-`example.parquet` schema:
+`simple/example1.parquet` and `simple/example2.parquet` schema:
 
 | column |        type |
 |--------|-------------|
@@ -11,6 +11,14 @@
 |   five |      DATE32 |
 |    six |        BOOL |
 |  seven |      DOUBLE |
+
+`complex/example3.parquet`  schema:
+
+| column |               type |
+|--------|--------------------|
+|    one | MAP<INT32, STRING> |
+|    two | MAP<DATE32, INT16> |
+|  three |             STRING |
 
 ## Generator
 
