@@ -546,7 +546,8 @@ ParquetReader::map_to_datum(arrow::MapArray *maparray, int pos,
 
     for (int i = 0; i < keys->length(); ++i)
     {
-        Datum   key, value;
+        Datum   key = (Datum) 0,
+                value = (Datum) 0;
         bool    isnull = false;
         const TypeInfo &key_typinfo = typinfo.children[0];
         const TypeInfo &val_typinfo = typinfo.children[1];
@@ -727,6 +728,8 @@ private:
         int     chunk;      /* current chunk number */
         int64   pos;        /* current pos within chunk */
         int64   len;        /* current chunk length */
+
+        ChunkInfo (int64 len) : chunk(0), pos(0), len(len) {}
     };
 
     /* Current row group */
@@ -737,9 +740,6 @@ private:
      * prevent excessive shared_ptr management.
      */
     std::vector<arrow::Array *>     chunks;
-
-    /* Per-column info on nulls */
-    std::vector<bool>               has_nulls;
 
     int             row_group;          /* current row group index */
     uint32_t        row;                /* current row within row group */
@@ -787,7 +787,7 @@ public:
         throw std::runtime_error("DefaultParquetReader::close() not implemented");
     }
 
-    bool read_next_rowgroup(TupleDesc tupleDesc)
+    bool read_next_rowgroup()
     {
         arrow::Status               status;
 
@@ -824,17 +824,6 @@ public:
                                 ->metadata()
                                 ->RowGroup(rowgroup);
 
-        /* Determine which columns have null values */
-        for (auto &t : this->types)
-        {
-            std::shared_ptr<parquet::Statistics>  stats;
-
-            if (t.index >= 0)
-                stats = rowgroup_meta->ColumnChunk(t.index)->statistics();
-
-            this->has_nulls.push_back(stats ? (stats->null_count() > 0) : true); 
-        }
-
         status = this->reader
             ->RowGroup(rowgroup)
             ->ReadTable(this->indices, &this->table);
@@ -850,17 +839,13 @@ public:
         this->chunk_info.clear();
         this->chunks.clear();
 
-        /* TODO: don't need tupleDesc in this function at all */
-        for (int i = 0; i < tupleDesc->natts; i++)
+        for (uint64_t i = 0; i < types.size(); ++i)
         {
-            if (this->map[i] >= 0)
-            {
-                ChunkInfo chunkInfo = { .chunk = 0, .pos = 0, .len = 0 };
-                auto column = this->table->column(this->map[i]);
+            const auto &column = this->table->column(i);
 
-                this->chunk_info.push_back(chunkInfo);
-                this->chunks.push_back(column->chunk(0).get());
-            }
+            int64 len = column->chunk(0)->length();
+            this->chunk_info.emplace_back(len);
+            this->chunks.push_back(column->chunk(0).get());
         }
 
         this->row = 0;
@@ -876,7 +861,7 @@ public:
         if (this->row >= this->num_rows)
         {
             /* Read next row group */
-            if (!this->read_next_rowgroup(slot->tts_tupleDescriptor))
+            if (!this->read_next_rowgroup())
                 return RS_EOF;
         }
 
@@ -910,11 +895,9 @@ public:
                 arrow::Array *array = this->chunks[arrow_col];
                 TypeInfo    &typinfo = this->types[arrow_col];
 
-                chunkInfo.len = array->length();
-
                 if (chunkInfo.pos >= chunkInfo.len)
                 {
-                    auto column = this->table->column(arrow_col);
+                    const auto &column = this->table->column(arrow_col);
 
                     /* There are no more chunks */
                     if (++chunkInfo.chunk >= column->num_chunks())
@@ -930,7 +913,7 @@ public:
                 if (fake)
                     continue;
 
-                if (this->has_nulls[arrow_col] && array->IsNull(chunkInfo.pos))
+                if (array->IsNull(chunkInfo.pos))
                 {
                     slot->tts_isnull[attr] = true;
                     chunkInfo.pos++;
@@ -1031,14 +1014,14 @@ public:
         is_active = false;
     }
 
-    bool read_next_rowgroup(TupleDesc)
+    bool read_next_rowgroup()
     {
         arrow::Status                   status;
         std::shared_ptr<arrow::Table>   table;
 
         /* TODO: release previously stored data */
-        this->column_data.resize(this->indices.size(), nullptr);
-        this->column_nulls.resize(this->indices.size());
+        this->column_data.resize(this->types.size(), nullptr);
+        this->column_nulls.resize(this->types.size());
 
         /*
          * In case of parallel query get the row group index from the
@@ -1084,14 +1067,13 @@ public:
         allocator->recycle();
 
         /* Read columns data and store it into column_data vector */
-        for (std::vector<int>::size_type col = 0; col < indices.size(); ++col)
+        for (std::vector<TypeInfo>::size_type col = 0; col < types.size(); ++col)
         {
-            int             arrow_col = indices[col];
             bool            has_nulls;
             std::shared_ptr<parquet::Statistics>  stats;
 
-            stats = rowgroup_meta->ColumnChunk(arrow_col)->statistics();
-
+            if (types[col].index >= 0)
+                stats = rowgroup_meta->ColumnChunk(types[col].index)->statistics();
             has_nulls = stats ? stats->null_count() > 0 : true;
 
             if (this->column_data[col])
@@ -1200,8 +1182,19 @@ public:
                         {
                             arrow::MapArray* maparray = (arrow::MapArray*) array;
 
-                            ((Datum *) data)[row] =
+                            Datum jsonb =
                                 this->map_to_datum(maparray, j, typinfo);
+
+                            /*
+                             * Copy jsonb into memory block allocated by
+                             * FastAllocator to prevent its destruction though
+                             * to be able to recycle it once it fulfilled its
+                             * purpose.
+                             */
+                            void *res = allocator->fast_alloc(VARSIZE_ANY(jsonb));
+                            memcpy(res, (Jsonb *) jsonb, VARSIZE_ANY(jsonb));
+                            ((Datum *) data)[row] = (Datum) res;
+                            pfree((Jsonb *) jsonb);
                             break;
                         }
                     default:
@@ -1229,7 +1222,7 @@ public:
                 return RS_INACTIVE;
 
             /* Read next row group */
-            if (!this->read_next_rowgroup(slot->tts_tupleDescriptor))
+            if (!this->read_next_rowgroup())
                 return RS_EOF;
         }
 
@@ -1307,6 +1300,11 @@ ParquetReader *create_parquet_reader(const char *filename,
                                      int reader_id,
                                      bool caching)
 {
+#ifdef CACHING_TEST
+    /* For testing purposes only */
+    caching = true;
+#endif
+
     if (!caching)
         return new DefaultParquetReader(filename, cxt, reader_id);
     else
