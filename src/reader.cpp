@@ -89,7 +89,14 @@ public:
 
         /* If allocation is bigger than segment then just palloc */
         if (size > SEGMENT_SIZE)
-            return palloc(size);
+        {
+            MemoryContext oldcxt = MemoryContextSwitchTo(this->segments_cxt);
+            void *block = exc_palloc(size);
+            this->garbage_segments.push_back((char *) block);
+            MemoryContextSwitchTo(oldcxt);
+
+            return block;
+        }
 
         size = MAXALIGN(size);
 
@@ -1076,12 +1083,6 @@ public:
                 stats = rowgroup_meta->ColumnChunk(types[col].index)->statistics();
             has_nulls = stats ? stats->null_count() > 0 : true;
 
-            if (this->column_data[col])
-                pfree(this->column_data[col]);
-            this->column_data[col] = (Datum *)
-                MemoryContextAlloc(allocator->context(),
-                                   sizeof(Datum) * table->num_rows());
-
             this->num_rows = table->num_rows();
             this->column_nulls[col].resize(this->num_rows);
 
@@ -1122,10 +1123,15 @@ public:
                 sz = sizeof(Datum);
         }
 
-        data = MemoryContextAlloc(allocator->context(), sz * num_rows);
+        data = allocator->fast_alloc(sz * num_rows);
 
         for (int i = 0; i < column->num_chunks(); ++i) {
             arrow::Array *array = column->chunk(i).get();
+
+            /*
+             * XXX We could probably optimize here by copying the entire array
+             * by using copy_to_c_array when has_nulls = false.
+             */
 
             for (int j = 0; j < array->length(); ++j) {
                 if (has_nulls && array->IsNull(j)) {
