@@ -12,6 +12,10 @@ jobs:
       fail-fast: false
       matrix:
         pg: [13, 12, 11, 10]
+        ccflags: ['']
+        include:
+          - pg: 13
+            ccflags: '-DCACHING_TEST'
     name: PostgreSQL ${{ matrix.pg }}
     runs-on: ubuntu-latest
     container: zilder/pg-ext-check
@@ -20,3 +24,5 @@ jobs:
       - uses: actions/checkout@v2
       - run: ./install_arrow.sh
       - run: build-check
+        env:
+          CCFLAGS: ${{ matrix.ccflags }}
