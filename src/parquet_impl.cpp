@@ -539,14 +539,17 @@ struct FieldInfo
 static List *
 extract_parquet_fields(const char *path) noexcept
 {
-    std::unique_ptr<parquet::arrow::FileReader> reader;
-    std::shared_ptr<arrow::Schema>              schema;
-    arrow::Status   status;
     List           *res = NIL;
     std::string     error;
 
     try
     {
+        std::unique_ptr<parquet::arrow::FileReader> reader;
+        parquet::ArrowReaderProperties props;
+        parquet::arrow::SchemaManifest manifest;
+        arrow::Status   status;
+        FieldInfo      *fields;
+
         status = parquet::arrow::FileReader::Make(
                     arrow::default_memory_pool(),
                     parquet::ParquetFileReader::OpenFile(path, false),
@@ -555,54 +558,53 @@ extract_parquet_fields(const char *path) noexcept
             throw Error("failed to open Parquet file %s",
                                  status.message().c_str());
 
-        auto        meta = reader->parquet_reader()->metadata();
-        parquet::ArrowReaderProperties props;
-        FieldInfo  *fields;
+        auto p_schema = reader->parquet_reader()->metadata()->schema();
+        if (!parquet::arrow::SchemaManifest::Make(p_schema, nullptr, props, &manifest).ok())
+            throw std::runtime_error("error creating arrow schema");
 
-        if (!parquet::arrow::FromParquetSchema(meta->schema(), props, &schema).ok())
-            throw std::runtime_error("error reading parquet schema");
+        fields = (FieldInfo *) exc_palloc(
+                sizeof(FieldInfo) * manifest.schema_fields.size());
 
-        fields = (FieldInfo *) exc_palloc(sizeof(FieldInfo) * schema->num_fields());
-
-        for (int k = 0; k < schema->num_fields(); ++k)
+        for (auto &schema_field : manifest.schema_fields)
         {
-            std::shared_ptr<arrow::Field>       field;
-            std::shared_ptr<arrow::DataType>    type;
+            auto   &field = schema_field.field;
+            auto   &type = field->type();
             Oid     pg_type;
 
-            /* Convert to arrow field to get appropriate type */
-            field = schema->field(k);
-            type = field->type();
-
-            if (type->id() == arrow::Type::LIST)
+            switch (type->id())
             {
-                int     subtype_id;
-                Oid     pg_subtype;
-                bool    error = false;
-
-                if (type->children().size() != 1)
-                    throw std::runtime_error("lists of structs are not supported");
-
-                subtype_id = get_arrow_list_elem_type(type.get());
-                pg_subtype = to_postgres_type(subtype_id);
-
-                /* That sucks I know... */
-                PG_TRY();
+                case arrow::Type::LIST:
                 {
-                    pg_type = get_array_type(pg_subtype);
-                }
-                PG_CATCH();
-                {
-                    error = true;
-                }
-                PG_END_TRY();
+                    arrow::Type::type subtype_id;
+                    Oid     pg_subtype;
+                    bool    error = false;
 
-                if (error)
-                    throw std::runtime_error("failed to get the type of array elements");
-            }
-            else
-            {
-                pg_type = to_postgres_type(type->id());
+                    if (type->children().size() != 1)
+                        throw std::runtime_error("lists of structs are not supported");
+
+                    subtype_id = get_arrow_list_elem_type(type.get());
+                    pg_subtype = to_postgres_type(subtype_id);
+
+                    /* This sucks I know... */
+                    PG_TRY();
+                    {
+                        pg_type = get_array_type(pg_subtype);
+                    }
+                    PG_CATCH();
+                    {
+                        error = true;
+                    }
+                    PG_END_TRY();
+
+                    if (error)
+                        throw std::runtime_error("failed to get the type of array elements");
+                    break;
+                }
+                case arrow::Type::MAP:
+                    pg_type = JSONBOID;
+                    break;
+                default:
+                    pg_type = to_postgres_type(type->id());
             }
 
             if (pg_type != InvalidOid)
@@ -624,8 +626,6 @@ extract_parquet_fields(const char *path) noexcept
     }
     catch (std::exception &e)
     {
-        /* Destroy the reader on error */
-        reader.reset();
         error = e.what();
     }
     if (!error.empty())

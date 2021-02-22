@@ -31,13 +31,25 @@ SELECT * FROM example2;
 (5 rows)
 
 -- import_parquet
-create function list_parquet_files(args jsonb)
-returns text[] as
+CREATE FUNCTION list_parquet_files(args jsonb)
+RETURNS text[] as
 $$
-    select array[args->>'dir' || '/example1.parquet', args->>'dir' || '/example2.parquet']::text[];
+    SELECT array_agg(args->>'dir' || filename)
+    FROM (VALUES
+        ('/example1.parquet', 'simple'),
+        ('/example2.parquet', 'simple'),
+        ('/example3.parquet', 'complex')
+    ) AS files(filename, filetype)
+    WHERE filetype = args->>'type';
 $$
-language sql;
-select import_parquet('example_import', 'public', 'parquet_srv', 'list_parquet_files', '{"dir": "@abs_srcdir@/data/simple"}', '{"sorted": "one"}');
+LANGUAGE SQL;
+SELECT import_parquet(
+    'example_import',
+    'public',
+    'parquet_srv',
+    'list_parquet_files',
+    '{"dir": "@abs_srcdir@/data/simple", "type": "simple"}',
+    '{"sorted": "one"}');
  import_parquet 
 ----------------
  
@@ -59,7 +71,15 @@ SELECT * FROM example_import ORDER BY one, three;
    9 | {27,28}    | fünf  | 2018-01-09 00:00:00 | 2018-01-09 | t   |      
 (11 rows)
 
-select import_parquet_explicit('example_import2', 'public', 'parquet_srv', array['one', 'three', 'six'], array['int8', 'text', 'bool']::regtype[], 'list_parquet_files', '{"dir": "@abs_srcdir@/data/simple"}', '{"sorted": "one"}');
+SELECT import_parquet_explicit(
+    'example_import2',
+    'public',
+    'parquet_srv',
+    array['one', 'three', 'six'],
+    array['int8', 'text', 'bool']::regtype[],
+    'list_parquet_files',
+    '{"dir": "@abs_srcdir@/data/simple", "type": "simple"}',
+    '{"sorted": "one"}');
  import_parquet_explicit 
 -------------------------
  
@@ -80,5 +100,23 @@ SELECT * FROM example_import2;
    7 | vier  | f
    9 | fünf  | t
 (11 rows)
+
+SELECT import_parquet(
+    'example_import3',
+    'public',
+    'parquet_srv',
+    'list_parquet_files',
+    '{"dir": "@abs_srcdir@/data/complex", "type": "complex"}');
+ import_parquet 
+----------------
+ 
+(1 row)
+
+SELECT * FROM example_import3;
+                 one                  |                 two                  | three 
+--------------------------------------+--------------------------------------+-------
+ {"1": "foo", "2": "bar", "3": "baz"} | {"2018-01-01": 10, "2018-01-02": 15} |     1
+ {"4": "test1", "5": "test2"}         | {"2018-01-03": 20, "2018-01-04": 25} |     2
+(2 rows)
 
 DROP EXTENSION parquet_fdw CASCADE;

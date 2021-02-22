@@ -180,7 +180,7 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, const std::set<in
     auto    p_schema = this->reader->parquet_reader()->metadata()->schema();
 
     if (!parquet::arrow::SchemaManifest::Make(p_schema, nullptr, props, &manifest).ok())
-        throw Error("error creating arrow schema");
+        throw std::runtime_error("error creating arrow schema");
 
     this->map.resize(tupleDesc->natts);
     for (int i = 0; i < tupleDesc->natts; i++)
