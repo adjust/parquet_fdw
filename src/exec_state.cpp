@@ -59,12 +59,12 @@ public:
 
     bool next(TupleTableSlot *slot, bool fake)
     {
-        bool res;
+        ReadStatus res;
 
         if ((res = reader->next(slot, fake)) == RS_SUCCESS)
             ExecStoreVirtualTuple(slot);
 
-        return res;
+        return res == RS_SUCCESS;
     }
 
     void rescan(void)

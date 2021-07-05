@@ -867,9 +867,16 @@ public:
 
         if (this->row >= this->num_rows)
         {
-            /* Read next row group */
-            if (!this->read_next_rowgroup())
-                return RS_EOF;
+            /*
+             * Read next row group. We do it in a loop to skip possibly empty
+             * row groups.
+             */
+            do
+            {
+                if (!this->read_next_rowgroup())
+                    return RS_EOF;
+            }
+            while (!this->num_rows);
         }
 
         this->populate_slot(slot, fake);
@@ -1227,9 +1234,16 @@ public:
             if (!is_active)
                 return RS_INACTIVE;
 
-            /* Read next row group */
-            if (!this->read_next_rowgroup())
-                return RS_EOF;
+            /*
+             * Read next row group. We do it in a loop to skip possibly empty
+             * row groups.
+             */
+            do
+            {
+                if (!this->read_next_rowgroup())
+                    return RS_EOF;
+            }
+            while (!this->num_rows);
         }
 
         if (!fake)
