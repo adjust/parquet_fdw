@@ -55,8 +55,13 @@ df3 = pd.DataFrame({'one': [1, 3, 5, 7, 9],
                     'six': [True, False, True, False, True]})
 table3 = pa.Table.from_pandas(df3)
 
+# an empty data frame to test corner case
+df4 = df3.drop([0, 1, 2, 3, 4])
+table4 = pa.Table.from_pandas(df4, schema=table3.schema)
+
 with pq.ParquetWriter('simple/example2.parquet', table3.schema) as writer:
     writer.write_table(table3)
+    writer.write_table(table4)
 
 # example3.parquet file
 mdt1 = pa.map_(pa.int32(), pa.string())

@@ -438,6 +438,10 @@ extract_rowgroups_list(const char *filename,
             bool match = true;
             auto rowgroup = meta->RowGroup(r);
 
+            /* Skip empty rowgroups */
+            if (!rowgroup->num_rows())
+                continue;
+
             for (auto &filter : filters)
             {
                 AttrNumber      attnum;
