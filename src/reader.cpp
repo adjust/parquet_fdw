@@ -199,14 +199,20 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, const std::set<in
 
         for (auto &schema_field : manifest.schema_fields)
         {
+            auto field_name = schema_field.field->name();
             auto arrow_type = schema_field.field->type();
-            auto arrow_colname = schema_field.field->name();
+            char arrow_colname[255];
+
+            if (field_name.length() > NAMEDATALEN)
+                throw Error("parquet column name '%s' is too long (max: %d)",
+                            field_name.c_str(), NAMEDATALEN - 1);
+            tolowercase(schema_field.field->name().c_str(), arrow_colname);
 
             /*
              * Compare postgres attribute name to the column name in arrow
              * schema.
              */
-            if (strcmp(pg_colname, arrow_colname.c_str()) == 0)
+            if (strcmp(pg_colname, arrow_colname) == 0)
             {
                 TypeInfo        typinfo(arrow_type);
                 bool            error(false);
