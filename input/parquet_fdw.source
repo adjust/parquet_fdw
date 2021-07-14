@@ -164,6 +164,8 @@ EXPLAIN (COSTS OFF) SELECT * FROM example_seq ORDER BY two;
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted;
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY one;
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY two;
+ALTER FOREIGN TABLE example_sorted OPTIONS (ADD files_in_order 'true');
+EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY one;
 EXPLAIN (COSTS OFF) SELECT * FROM example1;
 SELECT SUM(one) FROM example1;
 

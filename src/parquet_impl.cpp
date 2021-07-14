@@ -109,6 +109,7 @@ struct ParquetFdwPlanState
     bool        use_mmap;
     bool        use_threads;
     int32       max_open_files;
+    bool        files_in_order;
     List       *rowgroups;      /* List of Lists (per filename) */
     uint64      ntuples;
     ReaderType  type;
@@ -832,6 +833,7 @@ get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
     fdw_private->use_mmap = false;
     fdw_private->use_threads = false;
     fdw_private->max_open_files = 0;
+    fdw_private->files_in_order = false;
     table = GetForeignTable(relid);
 
     foreach(lc, table->options)
@@ -857,24 +859,20 @@ get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
         }
         else if (strcmp(def->defname, "use_mmap") == 0)
         {
-            if (!parse_bool(defGetString(def), &fdw_private->use_mmap))
-                ereport(ERROR,
-                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                         errmsg("invalid value for boolean option \"%s\": %s",
-                                def->defname, defGetString(def))));
+            fdw_private->use_mmap = defGetBoolean(def);
         }
         else if (strcmp(def->defname, "use_threads") == 0)
         {
-            if (!parse_bool(defGetString(def), &fdw_private->use_threads))
-                ereport(ERROR,
-                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                         errmsg("invalid value for boolean option \"%s\": %s",
-                                def->defname, defGetString(def))));
+            fdw_private->use_threads = defGetBoolean(def);
         }
         else if (strcmp(def->defname, "max_open_files") == 0)
         {
             /* check that int value is valid */
             fdw_private->max_open_files = pg_atoi(defGetString(def), sizeof(int32), '\0');
+        }
+        else if (strcmp(def->defname, "files_in_order") == 0)
+        {
+            fdw_private->files_in_order = defGetBoolean(def);
         }
         else
             elog(ERROR, "unknown option '%s'", def->defname);
@@ -1128,10 +1126,14 @@ parquetGetForeignPaths(PlannerInfo *root,
     if (baserel->consider_parallel > 0)
     {
         ParquetFdwPlanState *private_parallel;
+        bool use_pathkeys = false;
 
         private_parallel = (ParquetFdwPlanState *) palloc(sizeof(ParquetFdwPlanState));
         memcpy(private_parallel, fdw_private, sizeof(ParquetFdwPlanState));
         private_parallel->type = is_multi ? RT_MULTI : RT_SINGLE;
+
+        /* For mutifile reader only use pathkeys when files are in order */
+        use_pathkeys = is_sorted && (!is_multi || (is_multi && fdw_private->files_in_order));
 
         Path *parallel_path = (Path *)
                  create_foreignscan_path(root, baserel,
@@ -1139,7 +1141,7 @@ parquetGetForeignPaths(PlannerInfo *root,
                                          baserel->rows,
                                          startup_cost,
                                          total_cost,
-                                         pathkeys,
+                                         use_pathkeys ? pathkeys : NULL,
                                          NULL,	/* no outer rel either */
                                          NULL,	/* no extra plan */
                                          (List *) private_parallel);
@@ -1152,14 +1154,6 @@ parquetGetForeignPaths(PlannerInfo *root,
         parallel_path->parallel_aware   = true;
         parallel_path->parallel_safe    = true;
 
-        /* Create GatherMerge path for sorted parquet files */
-        if (is_sorted)
-        {
-            GatherMergePath *gather_merge =
-                create_gather_merge_path(root, baserel, parallel_path, NULL,
-                                         pathkeys, NULL, NULL);
-            add_path(baserel, (Path *) gather_merge);
-        }
         add_partial_path(baserel, parallel_path);
     }
 }
@@ -1852,29 +1846,22 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
         else if (strcmp(def->defname, "use_mmap") == 0)
         {
             /* Check that bool value is valid */
-            bool    use_mmap;
-
-            if (!parse_bool(defGetString(def), &use_mmap))
-                ereport(ERROR,
-                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                         errmsg("invalid value for boolean option \"%s\": %s",
-                                def->defname, defGetString(def))));
+            (void) defGetBoolean(def);
         }
         else if (strcmp(def->defname, "use_threads") == 0)
         {
             /* Check that bool value is valid */
-            bool    use_threads;
-
-            if (!parse_bool(defGetString(def), &use_threads))
-                ereport(ERROR,
-                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                         errmsg("invalid value for boolean option \"%s\": %s",
-                                def->defname, defGetString(def))));
+            (void) defGetBoolean(def);
         }
         else if (strcmp(def->defname, "max_open_files") == 0)
         {
             /* check that int value is valid */
             pg_atoi(defGetString(def), sizeof(int32), '\0');
+        }
+        else if (strcmp(def->defname, "files_in_order") == 0)
+        {
+            /* Check that bool value is valid */
+			(void) defGetBoolean(def);
         }
         else
         {

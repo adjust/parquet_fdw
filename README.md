@@ -76,6 +76,7 @@ Foreign table may be created for a single Parquet file and for a set of files. I
 Following table options are supported:
 * **filename** - space separated list of paths to Parquet files to read;
 * **sorted** - space separated list of columns that Parquet files are presorted by; that would help postgres to avoid redundant sorting when running query with `ORDER BY` clause or in other cases when having a presorted set is beneficial (Group Aggregate, Merge Join);
+* **files_in_order** - specifies that files specified by `filename` or returned by `files_func` are ordered according to `sorted` option and have no intersection rangewise; this allows to use `Gather Merge` node on top of parallel Multifile scan (default `false`);
 * **use_mmap** - whether memory map operations will be used instead of file read operations (default `false`);
 * **use_threads** - enables Apache Arrow's parallel columns decoding/decompression (default `false`);
 * **files_func** - user defined function that is used by parquet_fdw to retrieve the list of parquet files on each query; function must take one `JSONB` argument and return text array of full paths to parquet files;
