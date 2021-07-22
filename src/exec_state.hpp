@@ -31,6 +31,8 @@ public:
     virtual void rescan(void) = 0;
     virtual void add_file(const char *filename, List *rowgroups) = 0;
     virtual void set_coordinator(ParallelCoordinator *coord) = 0;
+    virtual Size estimate_coord_size() = 0;
+    virtual void init_coord() = 0;
 };
 
 ParquetFdwExecutionState *create_parquet_execution_state(ReaderType reader_type,

@@ -34,6 +34,7 @@ class SingleFileExecutionState : public ParquetFdwExecutionState
 private:
     ParquetReader      *reader;
     MemoryContext       cxt;
+    ParallelCoordinator *coord;
     TupleDesc           tuple_desc;
     std::set<int>       attrs_used;
     bool                use_mmap;
@@ -89,11 +90,33 @@ public:
 
     void set_coordinator(ParallelCoordinator *coord)
     {
+        this->coord = coord;
+
         if (reader)
             reader->set_coordinator(coord);
     }
+
+    Size estimate_coord_size()
+    {
+        return sizeof(ParallelCoordinator);
+    }
+
+    void init_coord()
+    {
+        // SingleReaderCoordinator *sr_coord =
+        //     static_cast<SingleReaderCoordinator *>(this->coord);
+#if 0
+        SingleReaderCoordinator *sr_coord = (SingleReaderCoordinator *) this->coord;
+
+        sr_coord = new(sr_coord) SingleReaderCoordinator();
+        sr_coord->init(NULL, 0);
+#endif
+        coord->init_single(NULL, 0);
+    }
 };
 
+// #include <unistd.h>
+// #include "miscadmin.h"
 class MultifileExecutionState : public ParquetFdwExecutionState
 {
 private:
@@ -123,6 +146,10 @@ private:
 
         if (coord)
         {
+            // SingleReaderCoordinator *sr_coord =
+            //     static_cast<SingleReaderCoordinator *>(coord);
+            // SingleReaderCoordinator *sr_coord = (SingleReaderCoordinator *) coord;
+#if 0
             int32 reader_id;
 
             SpinLockAcquire(&coord->lock);
@@ -131,20 +158,24 @@ private:
              * First let's check if the file other workers are reading has more
              * rowgroups to read
              */
-            reader_id = coord->next_reader - 1;
+            reader_id = coord->i.s.next_reader - 1;
             if (reader_id >= 0 && reader_id < (int) files.size()
-                && (int) files[reader_id].rowgroups.size() > coord->next_rowgroup) {
+                && (int) files[reader_id].rowgroups.size() > coord->i.s.next_rowgroup) {
                 /* yep */;
             } else {
                 /* If that's not the case then open the next file */
-                reader_id = coord->next_reader++;
-                coord->next_rowgroup = 0;
+                reader_id = coord->i.s.next_reader++;
+                coord->i.s.next_rowgroup = 0;
             }
             this->cur_reader = reader_id;
             SpinLockRelease(&coord->lock);
+#endif
+            coord->lock();
+            cur_reader = coord->next_reader();
+            coord->unlock();
         }
 
-        if (cur_reader >= files.size())
+        if (cur_reader >= files.size() || cur_reader < 0)
             return NULL;
 
         r = create_parquet_reader(files[cur_reader].filename.c_str(), cxt, cur_reader);
@@ -182,6 +213,8 @@ public:
 
         if (unlikely(reader == NULL))
         {
+            // elog(NOTICE, "pid: %d", MyProcPid);
+            // sleep(20);
             if ((reader = this->get_next_reader()) == NULL)
                 return false;
         }
@@ -237,6 +270,40 @@ public:
     {
         this->coord = coord;
     }
+
+    Size estimate_coord_size()
+    {
+        return sizeof(ParallelCoordinator) + sizeof(int32) * files.size();
+    }
+
+    void init_coord()
+    {
+#if 0
+        // SingleReaderCoordinator *sr_coord =
+        //    dynamic_cast<SingleReaderCoordinator *>(this->coord);
+        // SingleReaderCoordinator *sr_coord =
+        //    static_cast<SingleReaderCoordinator *>(this->coord);
+        SingleReaderCoordinator *sr_coord = (SingleReaderCoordinator *) this->coord;
+        int32  *nrowgroups;
+        int     i = 0;
+
+        // sr_coord = new(sr_coord) SingleReaderCoordinator();
+        nrowgroups = (int32 *) palloc(sizeof(int32) * files.size());
+        for (auto &file : files)
+            nrowgroups[i++] = file.rowgroups.size();
+        sr_coord->init(nrowgroups, files.size());
+        pfree(nrowgroups);
+#endif
+        ParallelCoordinator *coord = (ParallelCoordinator *) this->coord;
+        int32  *nrowgroups;
+        int     i = 0;
+
+        nrowgroups = (int32 *) palloc(sizeof(int32) * files.size());
+        for (auto &file : files)
+            nrowgroups[i++] = file.rowgroups.size();
+        coord->init_single(nrowgroups, files.size());
+        pfree(nrowgroups);
+    }
 };
 
 class MultifileMergeExecutionStateBase : public ParquetFdwExecutionState
@@ -257,6 +324,7 @@ protected:
     std::list<SortSupportData> sort_keys;
     bool                use_threads;
     bool                use_mmap;
+    ParallelCoordinator *coord;
 
     /*
      * Heap is used to store tuples in prioritized manner along with file
@@ -304,6 +372,25 @@ protected:
         }
 
         return false;
+    }
+
+    void set_coordinator(ParallelCoordinator *coord)
+    {
+        this->coord = coord;
+        for (auto reader : readers)
+            reader->set_coordinator(coord);
+    }
+
+    Size estimate_coord_size()
+    {
+        return sizeof(ParallelCoordinator) + readers.size() * sizeof(int32);
+    }
+
+    void init_coord()
+    {
+        // for (int i = 0; i < readers.length(); ++i)
+        //     this->coord.i.m.next_rowgroup[i] = 0;
+        coord->init_multi();
     }
 };
 
@@ -444,11 +531,6 @@ public:
         r->open();
         r->create_column_mapping(tuple_desc, attrs_used);
         readers.push_back(r);
-    }
-
-    void set_coordinator(ParallelCoordinator * /* coord */)
-    {
-        Assert(true);   /* not supported, should never happen */
     }
 };
 

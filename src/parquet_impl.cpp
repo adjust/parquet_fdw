@@ -1638,35 +1638,46 @@ parquetIsForeignScanParallelSafe(PlannerInfo * /* root */,
 }
 
 extern "C" Size
-parquetEstimateDSMForeignScan(ForeignScanState * /* node */,
+parquetEstimateDSMForeignScan(ForeignScanState *node,
                               ParallelContext * /* pcxt */)
 {
-    return sizeof(ParallelCoordinator);
+    ParquetFdwExecutionState   *festate;
+
+    festate = (ParquetFdwExecutionState *) node->fdw_state;
+    return festate->estimate_coord_size();
 }
 
 extern "C" void
 parquetInitializeDSMForeignScan(ForeignScanState *node,
-                                ParallelContext * /* pcxt */,
+                                ParallelContext * pcxt,
                                 void *coordinate)
 {
     ParallelCoordinator        *coord = (ParallelCoordinator *) coordinate;
     ParquetFdwExecutionState   *festate;
 
-    coord->next_rowgroup = 0;
-    coord->next_reader = 0;
+    /*
+    coord->i.s.next_rowgroup = 0;
+    coord->i.s.next_reader = 0;
     SpinLockInit(&coord->lock);
+    */
     festate = (ParquetFdwExecutionState *) node->fdw_state;
     festate->set_coordinator(coord);
+    festate->init_coord();
 }
 
 extern "C" void
-parquetReInitializeDSMForeignScan(ForeignScanState * /* node */,
+parquetReInitializeDSMForeignScan(ForeignScanState *node,
                                   ParallelContext * /* pcxt */,
-                                  void *coordinate)
+                                  void * /* coordinate */)
 {
-    ParallelCoordinator    *coord = (ParallelCoordinator *) coordinate;
+    // ParallelCoordinator    *coord = (ParallelCoordinator *) coordinate;
 
-    coord->next_rowgroup = 0;
+    // coord->i.s.next_rowgroup = 0;
+    // coord->init_coord();
+    ParquetFdwExecutionState   *festate;
+
+    festate = (ParquetFdwExecutionState *) node->fdw_state;
+    festate->init_coord();
 }
 
 extern "C" void
