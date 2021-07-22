@@ -808,18 +808,38 @@ public:
          * In case of parallel query get the row group index from the
          * coordinator. Otherwise just increment it.
          */
-        if (this->coordinator)
+        if (coordinator)
         {
-            SpinLockAcquire(&this->coordinator->lock);
-
-            /* Did we finish reading from this reader? */
-            if (this->reader_id != (this->coordinator->next_reader - 1)) {
-                SpinLockRelease(&this->coordinator->lock);
+            coordinator->lock();
+            if ((this->row_group = coordinator->next_rowgroup(reader_id)) == -1)
+            {
+                coordinator->unlock();
                 return false;
             }
-            this->row_group = this->coordinator->next_rowgroup++;
+            coordinator->unlock();
+#if 0
+            SpinLockAcquire(&this->coordinator->lock);
+
+            switch (this->coordinator->type)
+            {
+                case RT_SINGLE:
+                case RT_MULTI:
+                    /* Did we finish reading from this reader? */
+                    if (this->reader_id != (this->coordinator->i.s.next_reader - 1)) {
+                        SpinLockRelease(&this->coordinator->lock);
+                        return false;
+                    }
+                    this->row_group = this->coordinator->i.s.next_rowgroup++;
+                    break;
+
+                case RT_MULTI_MERGE:
+                case RT_CACHING_MULTI_MERGE:
+                    this->row_group = this->coordinator->i.m.next_rowgroup[this->reader_id]++;
+                    break;
+            }
 
             SpinLockRelease(&this->coordinator->lock);
+#endif
         }
         else
             this->row_group++;
@@ -1049,16 +1069,21 @@ public:
          */
         if (this->coordinator)
         {
+#if 0
             SpinLockAcquire(&this->coordinator->lock);
 
             /* Did we finish reading from this reader? */
-            if (this->reader_id != (this->coordinator->next_reader - 1)) {
+            if (this->reader_id != (this->coordinator->i.s.next_reader - 1)) {
                 SpinLockRelease(&this->coordinator->lock);
                 return false;
             }
-            this->row_group = this->coordinator->next_rowgroup++;
+            this->row_group = this->coordinator->i.s.next_rowgroup++;
 
             SpinLockRelease(&this->coordinator->lock);
+#endif
+            this->coordinator->lock();
+            this->row_group = this->coordinator->next_rowgroup(this->reader_id);
+            this->coordinator->unlock();
         }
         else
             this->row_group++;
