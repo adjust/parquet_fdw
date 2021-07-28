@@ -103,20 +103,10 @@ public:
 
     void init_coord()
     {
-        // SingleReaderCoordinator *sr_coord =
-        //     static_cast<SingleReaderCoordinator *>(this->coord);
-#if 0
-        SingleReaderCoordinator *sr_coord = (SingleReaderCoordinator *) this->coord;
-
-        sr_coord = new(sr_coord) SingleReaderCoordinator();
-        sr_coord->init(NULL, 0);
-#endif
         coord->init_single(NULL, 0);
     }
 };
 
-// #include <unistd.h>
-// #include "miscadmin.h"
 class MultifileExecutionState : public ParquetFdwExecutionState
 {
 private:
@@ -146,30 +136,6 @@ private:
 
         if (coord)
         {
-            // SingleReaderCoordinator *sr_coord =
-            //     static_cast<SingleReaderCoordinator *>(coord);
-            // SingleReaderCoordinator *sr_coord = (SingleReaderCoordinator *) coord;
-#if 0
-            int32 reader_id;
-
-            SpinLockAcquire(&coord->lock);
-
-            /*
-             * First let's check if the file other workers are reading has more
-             * rowgroups to read
-             */
-            reader_id = coord->i.s.next_reader - 1;
-            if (reader_id >= 0 && reader_id < (int) files.size()
-                && (int) files[reader_id].rowgroups.size() > coord->i.s.next_rowgroup) {
-                /* yep */;
-            } else {
-                /* If that's not the case then open the next file */
-                reader_id = coord->i.s.next_reader++;
-                coord->i.s.next_rowgroup = 0;
-            }
-            this->cur_reader = reader_id;
-            SpinLockRelease(&coord->lock);
-#endif
             coord->lock();
             cur_reader = coord->next_reader();
             coord->unlock();
@@ -213,8 +179,6 @@ public:
 
         if (unlikely(reader == NULL))
         {
-            // elog(NOTICE, "pid: %d", MyProcPid);
-            // sleep(20);
             if ((reader = this->get_next_reader()) == NULL)
                 return false;
         }
@@ -278,22 +242,6 @@ public:
 
     void init_coord()
     {
-#if 0
-        // SingleReaderCoordinator *sr_coord =
-        //    dynamic_cast<SingleReaderCoordinator *>(this->coord);
-        // SingleReaderCoordinator *sr_coord =
-        //    static_cast<SingleReaderCoordinator *>(this->coord);
-        SingleReaderCoordinator *sr_coord = (SingleReaderCoordinator *) this->coord;
-        int32  *nrowgroups;
-        int     i = 0;
-
-        // sr_coord = new(sr_coord) SingleReaderCoordinator();
-        nrowgroups = (int32 *) palloc(sizeof(int32) * files.size());
-        for (auto &file : files)
-            nrowgroups[i++] = file.rowgroups.size();
-        sr_coord->init(nrowgroups, files.size());
-        pfree(nrowgroups);
-#endif
         ParallelCoordinator *coord = (ParallelCoordinator *) this->coord;
         int32  *nrowgroups;
         int     i = 0;
@@ -388,9 +336,7 @@ protected:
 
     void init_coord()
     {
-        // for (int i = 0; i < readers.length(); ++i)
-        //     this->coord.i.m.next_rowgroup[i] = 0;
-        coord->init_multi();
+        coord->init_multi(readers.size());
     }
 };
 
@@ -521,11 +467,12 @@ public:
         ParquetReader      *r;
         ListCell           *lc;
         std::vector<int>    rg;
+        int32_t             reader_id = readers.size();
 
         foreach (lc, rowgroups)
             rg.push_back(lfirst_int(lc));
 
-        r = create_parquet_reader(filename, cxt);
+        r = create_parquet_reader(filename, cxt, reader_id);
         r->set_rowgroups_list(rg);
         r->set_options(use_threads, use_mmap);
         r->open();

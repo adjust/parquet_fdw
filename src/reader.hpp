@@ -47,58 +47,60 @@ private:
         PC_MULTI
     };
 
-    Type        _type;
-    slock_t     _lock;
+    Type        type;
+    slock_t     latch;
     union
     {
         struct
         {
-            int32   _reader;    /* current reader */
-            int32   _rowgroup;  /* current rowgroup */
-            int32   _nfiles;    /* number of parquet files to read */
-            int32   _nrowgroups[FLEXIBLE_ARRAY_MEMBER]; /* per-file rowgroups numbers */
+            int32   reader;     /* current reader */
+            int32   rowgroup;   /* current rowgroup */
+            int32   nfiles;     /* number of parquet files to read */
+            int32   nrowgroups[FLEXIBLE_ARRAY_MEMBER]; /* per-file rowgroups numbers */
         } single;               /* single file and simple multifile case */
         struct
         {
             int32   next_rowgroup[FLEXIBLE_ARRAY_MEMBER]; /* per-reader counters */
         } multi;   /* multimerge case */
-    } _data;
+    } data;
 
 public:
-    void lock() { SpinLockAcquire(&_lock); }
-    void unlock() { SpinLockRelease(&_lock); }
+    void lock() { SpinLockAcquire(&latch); }
+    void unlock() { SpinLockRelease(&latch); }
 
     void init_single(int32 *nrowgroups, int32 nfiles)
     {
-        _type = PC_SINGLE;
-        _data.single._reader = -1;
-        _data.single._rowgroup =-1;
-        _data.single._nfiles = nfiles;
+        type = PC_SINGLE;
+        data.single.reader = -1;
+        data.single.rowgroup =-1;
+        data.single.nfiles = nfiles;
 
-        SpinLockInit(&_lock);
+        SpinLockInit(&latch);
         if (nfiles)
-            memcpy(_data.single._nrowgroups, nrowgroups, sizeof(int32) * nfiles);
+            memcpy(data.single.nrowgroups, nrowgroups, sizeof(int32) * nfiles);
     }
 
-    void init_multi()
+    void init_multi(int nfiles)
     {
-        _type = PC_MULTI;
+        type = PC_MULTI;
+        for (int i = 0; i < nfiles; ++i)
+            data.multi.next_rowgroup[i] = 0;
     }
 
     /* Get the next reader id. Caller must hold the lock. */
     int32 next_reader()
     {
-        if (_type == PC_SINGLE)
+        if (type == PC_SINGLE)
         {
             /* Return current reader if it has more rowgroups to read */
-            if (_data.single._reader >= 0 && _data.single._reader < _data.single._nfiles
-                && _data.single._nrowgroups[_data.single._reader] > _data.single._rowgroup + 1)
-                return _data.single._reader;
+            if (data.single.reader >= 0 && data.single.reader < data.single.nfiles
+                && data.single.nrowgroups[data.single.reader] > data.single.rowgroup + 1)
+                return data.single.reader;
 
-            _data.single._reader++;
-            _data.single._rowgroup = -1;
+            data.single.reader++;
+            data.single.rowgroup = -1;
 
-            return _data.single._reader;
+            return data.single.reader;
         }
 
         Assert(false && "unsupported");
@@ -108,90 +110,21 @@ public:
     /* Get the next reader id. Caller must hold the lock. */
     int32 next_rowgroup(int32 reader_id)
     {
-        if (_type == PC_SINGLE)
+        if (type == PC_SINGLE)
         {
-            if (reader_id != _data.single._reader)
+            if (reader_id != data.single.reader)
                 return -1;
-            return ++_data.single._rowgroup;
+            return ++data.single.rowgroup;
+        }
+        else
+        {
+            return data.multi.next_rowgroup[reader_id]++;
         }
 
         Assert(false && "unsupported");
         return -1;
     }
 };
-
-#if 0
-class ParallelCoordinator
-{
-protected:
-    slock_t _lock;
-public:
-    virtual int32 next_rowgroup(int32 reader_id) = 0;
-
-    void lock() { SpinLockAcquire(&_lock); }
-    void unlock() { SpinLockRelease(&_lock); }
-};
-
-class SingleReaderCoordinator : public ParallelCoordinator
-{
-private:
-    int32   _reader;    /* current reader */
-    int32   _rowgroup;  /* current rowgroup */
-
-    int32   _nfiles;    /* number of parquet files to read */
-    int32   _nrowgroups[FLEXIBLE_ARRAY_MEMBER]; /* per-file rowgroups numbers */
-
-public:
-    void init(int32 *nrowgroups, int32 nfiles)
-    {
-        _reader = -1;
-        _rowgroup =-1;
-        _nfiles = nfiles;
-
-        SpinLockInit(&_lock);
-        if (nfiles)
-            memcpy(_nrowgroups, nrowgroups, sizeof(int32) * nfiles);
-    }
-
-    /*
-     * Get the next reader id. Caller must hold the lock.
-     */
-    int32 next_reader()
-    {
-        /* Return current reader if it has more rowgroups to read */
-        if (_reader >= 0 && _reader < _nfiles
-            && _nrowgroups[_reader] > _rowgroup + 1)
-            return _reader;
-
-        _reader++;
-        _rowgroup = -1;
-
-        return _reader;
-    }
-
-    /*
-     * Get the next reader id. Caller must hold the lock.
-     */
-    virtual int32 next_rowgroup(int32 reader_id)
-    {
-        if (reader_id != _reader)
-            return -1;
-        return ++_rowgroup;
-    }
-};
-
-class MultiReaderCoordinator : public ParallelCoordinator
-{
-private:
-    int32   next_rowgroups[FLEXIBLE_ARRAY_MEMBER]; /* per-reader counters */
-public:
-    int32 next_rowgroup(int32 reader_id)
-    {
-        return next_rowgroups[reader_id];
-    }
-};
-#endif
-
 
 class FastAllocator;
 

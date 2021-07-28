@@ -154,7 +154,6 @@ SELECT * FROM example_sorted ORDER BY one;
 -- parallel execution
 SET parallel_setup_cost = 0;
 SET parallel_tuple_cost = 0.001;
-SET cpu_operator_cost = 0.000025;
 ANALYZE example_seq;
 ANALYZE example_sorted;
 ANALYZE example1;

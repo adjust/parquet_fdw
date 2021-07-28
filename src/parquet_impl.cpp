@@ -84,6 +84,10 @@ extern "C"
 #endif
 
 
+bool enable_multifile;
+bool enable_multifile_merge;
+
+
 static void find_cmp_func(FmgrInfo *finfo, Oid type1, Oid type2);
 static void destroy_parquet_state(void *arg);
 
@@ -969,29 +973,29 @@ static void
 cost_merge(Path *path, uint32 nfiles, Cost input_startup_cost,
            Cost input_total_cost, double rows)
 {
-	Cost		startup_cost = 0;
-	Cost		run_cost = 0;
-	Cost		comparison_cost;
-	double		N;
-	double		logN;
+    Cost		startup_cost = 0;
+    Cost		run_cost = 0;
+    Cost		comparison_cost;
+    double		N;
+    double		logN;
 
     N = nfiles;
     logN = LOG2(N);
 
-	/* Assumed cost per tuple comparison */
-	comparison_cost = 2.0 * cpu_operator_cost;
+    /* Assumed cost per tuple comparison */
+    comparison_cost = 2.0 * cpu_operator_cost;
 
-	/* Heap creation cost */
-	startup_cost += comparison_cost * N * logN;
+    /* Heap creation cost */
+    startup_cost += comparison_cost * N * logN;
 
-	/* Per-tuple heap maintenance cost */
-	run_cost += rows * comparison_cost * logN;
+    /* Per-tuple heap maintenance cost */
+    run_cost += rows * comparison_cost * logN;
 
-	/* small cost for heap management, like cost_merge_append */
-	run_cost += cpu_operator_cost * rows;
+    /* small cost for heap management, like cost_merge_append */
+    run_cost += cpu_operator_cost * rows;
 
-	path->startup_cost = startup_cost + input_startup_cost;
-	path->total_cost = (startup_cost + run_cost + input_total_cost);
+    path->startup_cost = startup_cost + input_startup_cost;
+    path->total_cost = (startup_cost + run_cost + input_total_cost);
 }
 
 extern "C" void
@@ -1108,6 +1112,9 @@ parquetGetForeignPaths(PlannerInfo *root,
 
             cost_merge((Path *) path, list_length(private_sort->filenames),
                        startup_cost, total_cost, baserel->rows);
+
+            if (!enable_multifile_merge)
+                path->total_cost += disable_cost;
         }
         add_path(baserel, path);
     }
@@ -1121,8 +1128,9 @@ parquetGetForeignPaths(PlannerInfo *root,
                                                     NULL,	/* no outer rel either */
                                                     NULL,	/* no extra plan */
                                                     (List *) fdw_private);
-	add_path(baserel, (Path *) foreign_path);
+	add_path(baserel, foreign_path);
 
+    /* Parallel paths */
     if (baserel->consider_parallel > 0)
     {
         ParquetFdwPlanState *private_parallel;
@@ -1135,7 +1143,7 @@ parquetGetForeignPaths(PlannerInfo *root,
         /* For mutifile reader only use pathkeys when files are in order */
         use_pathkeys = is_sorted && (!is_multi || (is_multi && fdw_private->files_in_order));
 
-        Path *parallel_path = (Path *)
+        Path *path = (Path *)
                  create_foreignscan_path(root, baserel,
                                          NULL,	/* default pathtarget */
                                          baserel->rows,
@@ -1148,13 +1156,55 @@ parquetGetForeignPaths(PlannerInfo *root,
 
         int num_workers = max_parallel_workers_per_gather;
 
-        parallel_path->rows = fdw_private->ntuples / (num_workers + 1);
-        parallel_path->total_cost       = startup_cost + run_cost / num_workers;
-        parallel_path->parallel_workers = num_workers;
-        parallel_path->parallel_aware   = true;
-        parallel_path->parallel_safe    = true;
+        path->rows = fdw_private->ntuples / (num_workers + 1);
+        path->total_cost       = startup_cost + run_cost / (num_workers + 1);
+        path->parallel_workers = num_workers;
+        path->parallel_aware   = true;
+        path->parallel_safe    = true;
 
-        add_partial_path(baserel, parallel_path);
+        if (!enable_multifile)
+            path->total_cost += disable_cost;
+
+        add_partial_path(baserel, path);
+
+        /* Multifile Merge parallel path */
+        if (is_multi && is_sorted)
+        {
+            ParquetFdwPlanState *private_parallel_merge;
+
+            private_parallel_merge = (ParquetFdwPlanState *) palloc(sizeof(ParquetFdwPlanState));
+            memcpy(private_parallel_merge, fdw_private, sizeof(ParquetFdwPlanState));
+
+            private_parallel_merge->type = private_parallel_merge->max_open_files > 0 ?
+                RT_CACHING_MULTI_MERGE : RT_MULTI_MERGE;
+
+            Path *path = (Path *)
+                     create_foreignscan_path(root, baserel,
+                                             NULL,	/* default pathtarget */
+                                             baserel->rows,
+                                             startup_cost,
+                                             total_cost,
+                                             pathkeys,
+                                             NULL,	/* no outer rel either */
+                                             NULL,	/* no extra plan */
+                                             (List *) private_parallel_merge);
+
+            int num_workers = max_parallel_workers_per_gather;
+
+            cost_merge(path, list_length(private_parallel_merge->filenames),
+                       startup_cost, total_cost, fdw_private->ntuples);
+
+            path->rows = fdw_private->ntuples / (num_workers + 1);
+            path->total_cost = path->startup_cost + path->total_cost / (num_workers + 1);
+            path->parallel_workers = num_workers;
+            path->parallel_aware   = true;
+            path->parallel_safe    = true;
+
+            if (!enable_multifile_merge)
+                path->total_cost += disable_cost;
+
+            add_partial_path(baserel, path);
+        }
     }
 }
 
@@ -1670,10 +1720,6 @@ parquetReInitializeDSMForeignScan(ForeignScanState *node,
                                   ParallelContext * /* pcxt */,
                                   void * /* coordinate */)
 {
-    // ParallelCoordinator    *coord = (ParallelCoordinator *) coordinate;
-
-    // coord->i.s.next_rowgroup = 0;
-    // coord->init_coord();
     ParquetFdwExecutionState   *festate;
 
     festate = (ParquetFdwExecutionState *) node->fdw_state;
