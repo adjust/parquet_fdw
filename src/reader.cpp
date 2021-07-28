@@ -1081,9 +1081,13 @@ public:
 
             SpinLockRelease(&this->coordinator->lock);
 #endif
-            this->coordinator->lock();
-            this->row_group = this->coordinator->next_rowgroup(this->reader_id);
-            this->coordinator->unlock();
+            coordinator->lock();
+            if ((this->row_group = coordinator->next_rowgroup(reader_id)) == -1)
+            {
+                coordinator->unlock();
+                return false;
+            }
+            coordinator->unlock();
         }
         else
             this->row_group++;
