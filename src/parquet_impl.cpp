@@ -1128,7 +1128,10 @@ parquetGetForeignPaths(PlannerInfo *root,
                                                     NULL,	/* no outer rel either */
                                                     NULL,	/* no extra plan */
                                                     (List *) fdw_private);
-	add_path(baserel, foreign_path);
+    if (!enable_multifile && is_multi)
+        foreign_path->total_cost += disable_cost;
+
+    add_path(baserel, foreign_path);
 
     /* Parallel paths */
     if (baserel->consider_parallel > 0)
