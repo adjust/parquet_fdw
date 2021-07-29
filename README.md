@@ -84,7 +84,9 @@ Following table options are supported:
 * **max_open_files** - the limit for the number of Parquet files open simultaneously.
 
 GUC variables:
-* **parquet_fdw.use_threads** - global switch that allow user to enable or disable threads (default `true`).
+* **parquet_fdw.use_threads** - global switch that allow user to enable or disable threads (default `true`);
+* **parquet_fdw.enable_multifile** - enable Multifile reader (default `true`).
+* **parquet_fdw.enable_multifile_merge** - enable Multifile Merge reader (default `true`).
 
 ### Parallel queries
 
