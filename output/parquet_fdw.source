@@ -198,7 +198,7 @@ ERROR:  parquet_fdw: filename or function is required
 CREATE FOREIGN TABLE example_fail (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv
 OPTIONS (filename 'nonexistent.parquet', some_option '123');
-ERROR:  parquet_fdw: No such file or directory
+ERROR:  parquet_fdw: No such file or directory ('nonexistent.parquet')
 CREATE FOREIGN TABLE example_fail (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/simple/example1.parquet', some_option '123');

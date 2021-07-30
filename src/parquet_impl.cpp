@@ -1867,7 +1867,7 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
 
                     ereport(ERROR,
                             (errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
-                             errmsg("parquet_fdw: %s", strerror(e))));
+                             errmsg("parquet_fdw: %s ('%s')", strerror(e), fn)));
                 }
             }
             pfree(filenames);
