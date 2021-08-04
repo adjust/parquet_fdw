@@ -1010,11 +1010,10 @@ parquetGetForeignPaths(PlannerInfo *root,
     Relation        rel;
     TupleDesc       tupleDesc;
     std::list<RowGroupFilter> filters;
+    List       *filenames_orig;
     ListCell       *lc;
 
     fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
-    is_sorted = fdw_private->attrs_sorted != NIL;
-    is_multi = list_length(fdw_private->filenames) > 1;
 
     /* Analyze query clauses and extract ones that can be of interest to us*/
     extract_rowgroup_filters(baserel->baserestrictinfo, filters);
@@ -1032,26 +1031,36 @@ parquetGetForeignPaths(PlannerInfo *root,
      * approximate number of rows in result set based on total number of tuples
      * in those row groups. It isn't very precise but it is best we got.
      */
-    foreach (lc, fdw_private->filenames)
+    filenames_orig = fdw_private->filenames;
+    fdw_private->filenames = NIL;
+    foreach (lc, filenames_orig)
     {
         char *filename = strVal((Value *) lfirst(lc));
         List *rowgroups = extract_rowgroups_list(filename, tupleDesc,
                                                  filters, &fdw_private->ntuples);
 
-        fdw_private->rowgroups = lappend(fdw_private->rowgroups, rowgroups);
+        if (rowgroups)
+        {
+            fdw_private->rowgroups = lappend(fdw_private->rowgroups, rowgroups);
+            fdw_private->filenames = lappend(fdw_private->filenames, lfirst(lc));
+        }
     }
 #if PG_VERSION_NUM < 120000
     heap_close(rel, AccessShareLock);
 #else
     table_close(rel, AccessShareLock);
 #endif
+    list_free(filenames_orig);
 
     estimate_costs(root, baserel, &startup_cost, &run_cost, &total_cost);
 
     /* Collect used attributes to reduce number of read columns during scan */
     extract_used_attributes(baserel);
 
-    fdw_private->type = is_multi ? RT_MULTI : RT_SINGLE;
+    is_sorted = fdw_private->attrs_sorted != NIL;
+    is_multi = list_length(fdw_private->filenames) > 1;
+    fdw_private->type = is_multi ? RT_MULTI :
+        (list_length(fdw_private->filenames) == 0 ? RT_TRIVIAL : RT_SINGLE);
 
     /* Build pathkeys based on attrs_sorted */
     foreach (lc, fdw_private->attrs_sorted)
@@ -1080,6 +1089,20 @@ parquetGetForeignPaths(PlannerInfo *root,
                                                 true);
         pathkeys = list_concat(pathkeys, attr_pathkey);
     }
+
+	foreign_path = (Path *) create_foreignscan_path(root, baserel,
+                                                    NULL,	/* default pathtarget */
+                                                    baserel->rows,
+                                                    startup_cost,
+                                                    total_cost,
+                                                    NULL,   /* no pathkeys */
+                                                    NULL,	/* no outer rel either */
+                                                    NULL,	/* no extra plan */
+                                                    (List *) fdw_private);
+	add_path(baserel, (Path *) foreign_path);
+
+    if (fdw_private->type == RT_TRIVIAL)
+        return;
 
     /* Create a separate path with pathkeys for sorted parquet files. */
     if (is_sorted)
@@ -1111,17 +1134,6 @@ parquetGetForeignPaths(PlannerInfo *root,
         }
         add_path(baserel, path);
     }
-
-	foreign_path = (Path *) create_foreignscan_path(root, baserel,
-                                                    NULL,	/* default pathtarget */
-                                                    baserel->rows,
-                                                    startup_cost,
-                                                    total_cost,
-                                                    NULL,   /* no pathkeys */
-                                                    NULL,	/* no outer rel either */
-                                                    NULL,	/* no extra plan */
-                                                    (List *) fdw_private);
-	add_path(baserel, (Path *) foreign_path);
 
     if (baserel->consider_parallel > 0)
     {
@@ -1326,9 +1338,6 @@ parquetBeginForeignScan(ForeignScanState *node, int /* eflags */)
                                                  attrs_used, sort_keys,
                                                  use_threads, use_mmap,
                                                  max_open_files);
-
-        if (!filenames)
-            throw std::runtime_error("parquet_fdw: got an empty filenames list");
 
         forboth (lc, filenames, lc2, rowgroups_list)
         {
@@ -1572,6 +1581,9 @@ parquetExplainForeignScan(ForeignScanState *node, ExplainState *es)
 
     switch (reader_type)
     {
+        case RT_TRIVIAL:
+            ExplainPropertyText("Reader", "Trivial", es);
+            return; /* no rowgroups list output required, just return here */
         case RT_SINGLE:
             ExplainPropertyText("Reader", "Single File", es);
             break;
