@@ -29,6 +29,30 @@
     } while(0)
 
 
+class TrivialExecutionState : public ParquetFdwExecutionState
+{
+public:
+    bool next(TupleTableSlot *, bool)
+    {
+        return false;
+    }
+    void rescan(void) {}
+    void add_file(const char *, List *)
+    {
+        Assert(false && "add_file is not supported for TrivialExecutionState");
+    }
+    void set_coordinator(ParallelCoordinator *) {}
+    Size estimate_coord_size() 
+    {
+        Assert(false && "estimate_coord_size is not supported for TrivialExecutionState");
+    }
+    void init_coord()
+    {
+        Assert(false && "init_coord is not supported for TrivialExecutionState");
+    }
+};
+
+
 class SingleFileExecutionState : public ParquetFdwExecutionState
 {
 private:
@@ -699,7 +723,7 @@ public:
 
     void set_coordinator(ParallelCoordinator * /* coord */)
     {
-        Assert(true);   /* not supported, should never happen */
+        Assert(false);  /* not supported, should never happen */
     }
 };
 
@@ -714,6 +738,8 @@ ParquetFdwExecutionState *create_parquet_execution_state(ReaderType reader_type,
 {
     switch (reader_type)
     {
+        case RT_TRIVIAL:
+            return new TrivialExecutionState();
         case RT_SINGLE:
             return new SingleFileExecutionState(reader_cxt, tuple_desc,
                                                 attrs_used, use_threads,
