@@ -17,7 +17,8 @@ extern "C"
 
 enum ReaderType
 {
-    RT_SINGLE = 0,
+    RT_TRIVIAL = 0,
+    RT_SINGLE,
     RT_MULTI,
     RT_MULTI_MERGE,
     RT_CACHING_MULTI_MERGE
