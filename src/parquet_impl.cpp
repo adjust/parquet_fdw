@@ -1207,7 +1207,7 @@ parquetGetForeignPaths(PlannerInfo *root,
             int num_workers = max_parallel_workers_per_gather;
 
             cost_merge(path, list_length(private_parallel_merge->filenames),
-                       startup_cost, total_cost, fdw_private->ntuples);
+                       startup_cost, total_cost, baserel->rows);
 
             path->rows = fdw_private->ntuples / (num_workers + 1);
             path->total_cost = path->startup_cost + path->total_cost / (num_workers + 1);
