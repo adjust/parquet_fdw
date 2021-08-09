@@ -380,9 +380,6 @@ SELECT * FROM example_sorted ORDER BY one;
 -- parallel execution
 SET parallel_setup_cost = 0;
 SET parallel_tuple_cost = 0.001;
-ANALYZE example_seq;
-ANALYZE example_sorted;
-ANALYZE example1;
 EXPLAIN (COSTS OFF) SELECT * FROM example_seq;
                  QUERY PLAN                 
 --------------------------------------------
@@ -542,5 +539,7 @@ DEBUG:  parquet_fdw: skip rowgroup 1
 -----+-----+-------
 (0 rows)
 
+-- analyze
+ANALYZE example_sorted;
 SET client_min_messages = WARNING;
 DROP EXTENSION parquet_fdw CASCADE;

@@ -115,7 +115,7 @@ struct ParquetFdwPlanState
     int32       max_open_files;
     bool        files_in_order;
     List       *rowgroups;      /* List of Lists (per filename) */
-    uint64      ntuples;
+    uint64      matched_rows;
     ReaderType  type;
 };
 
@@ -410,7 +410,8 @@ List *
 extract_rowgroups_list(const char *filename,
                        TupleDesc tupleDesc,
                        std::list<RowGroupFilter> &filters,
-                       uint64 *ntuples) noexcept
+                       uint64 *matched_rows,
+                       uint64 *total_rows) noexcept
 {
     std::unique_ptr<parquet::arrow::FileReader> reader;
     arrow::Status   status;
@@ -519,8 +520,9 @@ extract_rowgroups_list(const char *filename,
             {
                 /* TODO: PG_TRY */
                 rowgroups = lappend_int(rowgroups, r);
-                *ntuples += rowgroup->num_rows();
+                *matched_rows += rowgroup->num_rows();
             }
+            *total_rows += rowgroup->num_rows();
         }  /* loop over rowgroups */
     }
     catch(const std::exception& e) {
@@ -887,16 +889,63 @@ get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
 }
 
 extern "C" void
-parquetGetForeignRelSize(PlannerInfo * /* root */,
+parquetGetForeignRelSize(PlannerInfo *root,
                          RelOptInfo *baserel,
                          Oid foreigntableid)
 {
     ParquetFdwPlanState *fdw_private;
+    std::list<RowGroupFilter> filters;
+    RangeTblEntry  *rte;
+    Relation        rel;
+    TupleDesc       tupleDesc;
+    List           *filenames_orig;
+    ListCell       *lc;
+    uint64          matched_rows = 0;
+    uint64          total_rows = 0;
 
     fdw_private = (ParquetFdwPlanState *) palloc0(sizeof(ParquetFdwPlanState));
     get_table_options(foreigntableid, fdw_private);
-    
+
+    /* Analyze query clauses and extract ones that can be of interest to us*/
+    extract_rowgroup_filters(baserel->baserestrictinfo, filters);
+
+    rte = root->simple_rte_array[baserel->relid];
+#if PG_VERSION_NUM < 120000
+    rel = heap_open(rte->relid, AccessShareLock);
+#else
+    rel = table_open(rte->relid, AccessShareLock);
+#endif
+    tupleDesc = RelationGetDescr(rel);
+
+    /*
+     * Extract list of row groups that match query clauses. Also calculate
+     * approximate number of rows in result set based on total number of tuples
+     * in those row groups. It isn't very precise but it is best we got.
+     */
+    filenames_orig = fdw_private->filenames;
+    fdw_private->filenames = NIL;
+    foreach (lc, filenames_orig)
+    {
+        char *filename = strVal((Value *) lfirst(lc));
+        List *rowgroups = extract_rowgroups_list(filename, tupleDesc, filters,
+                                                 &matched_rows, &total_rows);
+
+        if (rowgroups)
+        {
+            fdw_private->rowgroups = lappend(fdw_private->rowgroups, rowgroups);
+            fdw_private->filenames = lappend(fdw_private->filenames, lfirst(lc));
+        }
+    }
+#if PG_VERSION_NUM < 120000
+    heap_close(rel, AccessShareLock);
+#else
+    table_close(rel, AccessShareLock);
+#endif
+    list_free(filenames_orig);
+
     baserel->fdw_private = fdw_private;
+    baserel->tuples = total_rows;
+    baserel->rows = fdw_private->matched_rows = matched_rows;
 }
 
 static void
@@ -906,32 +955,21 @@ estimate_costs(PlannerInfo *root, RelOptInfo *baserel, Cost *startup_cost,
     auto    fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
     double  ntuples;
 
-    /* Use statistics if we have it */
-    if (baserel->tuples)
-    {
-        ntuples = baserel->tuples *
-            clauselist_selectivity(root,
-                                   baserel->baserestrictinfo,
-                                   0,
-                                   JOIN_INNER,
-                                   NULL);
-
-    }
-    else
-    {
-        /*
-         * If there is no statistics then use estimate based on rows number
-         * in the selected row groups.
-         */
-        ntuples = fdw_private->ntuples;
-    }
+    ntuples = baserel->tuples *
+        clauselist_selectivity(root,
+                               baserel->baserestrictinfo,
+                               0,
+                               JOIN_INNER,
+                               NULL);
 
     /*
      * Here we assume that parquet tuple cost is the same as regular tuple cost
      * even though this is probably not true in many cases. Maybe we'll come up
-     * with a smarter idea later.
+     * with a smarter idea later. Also we use actual number of rows in selected
+     * rowgroups to calculate cost as we need to process those rows regardless
+     * of whether they're gonna be filtered out or not.
      */
-    *run_cost = ntuples * cpu_tuple_cost;
+    *run_cost = fdw_private->matched_rows * cpu_tuple_cost;
 	*startup_cost = baserel->baserestrictcost.startup;
 	*total_cost = *startup_cost + *run_cost;
 
@@ -1010,51 +1048,10 @@ parquetGetForeignPaths(PlannerInfo *root,
     Cost        run_cost;
     bool        is_sorted, is_multi;
     List       *pathkeys = NIL;
-    RangeTblEntry  *rte;
-    Relation        rel;
-    TupleDesc       tupleDesc;
     std::list<RowGroupFilter> filters;
-    List       *filenames_orig;
-    ListCell       *lc;
+    ListCell   *lc;
 
     fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
-
-    /* Analyze query clauses and extract ones that can be of interest to us*/
-    extract_rowgroup_filters(baserel->baserestrictinfo, filters);
-
-    rte = root->simple_rte_array[baserel->relid];
-#if PG_VERSION_NUM < 120000
-    rel = heap_open(rte->relid, AccessShareLock);
-#else
-    rel = table_open(rte->relid, AccessShareLock);
-#endif
-    tupleDesc = RelationGetDescr(rel);
-
-    /*
-     * Extract list of row groups that match query clauses. Also calculate
-     * approximate number of rows in result set based on total number of tuples
-     * in those row groups. It isn't very precise but it is best we got.
-     */
-    filenames_orig = fdw_private->filenames;
-    fdw_private->filenames = NIL;
-    foreach (lc, filenames_orig)
-    {
-        char *filename = strVal((Value *) lfirst(lc));
-        List *rowgroups = extract_rowgroups_list(filename, tupleDesc,
-                                                 filters, &fdw_private->ntuples);
-
-        if (rowgroups)
-        {
-            fdw_private->rowgroups = lappend(fdw_private->rowgroups, rowgroups);
-            fdw_private->filenames = lappend(fdw_private->filenames, lfirst(lc));
-        }
-    }
-#if PG_VERSION_NUM < 120000
-    heap_close(rel, AccessShareLock);
-#else
-    table_close(rel, AccessShareLock);
-#endif
-    list_free(filenames_orig);
 
     estimate_costs(root, baserel, &startup_cost, &run_cost, &total_cost);
 
@@ -1094,7 +1091,7 @@ parquetGetForeignPaths(PlannerInfo *root,
         pathkeys = list_concat(pathkeys, attr_pathkey);
     }
 
-	foreign_path = (Path *) create_foreignscan_path(root, baserel,
+    foreign_path = (Path *) create_foreignscan_path(root, baserel,
                                                     NULL,	/* default pathtarget */
                                                     baserel->rows,
                                                     startup_cost,
@@ -1137,7 +1134,7 @@ parquetGetForeignPaths(PlannerInfo *root,
                 RT_CACHING_MULTI_MERGE : RT_MULTI_MERGE;
 
             cost_merge((Path *) path, list_length(private_sort->filenames),
-                       startup_cost, total_cost, baserel->rows);
+                       startup_cost, total_cost, private_sort->matched_rows);
 
             if (!enable_multifile_merge)
                 path->total_cost += disable_cost;
@@ -1171,7 +1168,7 @@ parquetGetForeignPaths(PlannerInfo *root,
 
         int num_workers = max_parallel_workers_per_gather;
 
-        path->rows = fdw_private->ntuples / (num_workers + 1);
+        path->rows = path->rows / (num_workers + 1);
         path->total_cost       = startup_cost + run_cost / (num_workers + 1);
         path->parallel_workers = num_workers;
         path->parallel_aware   = true;
@@ -1207,9 +1204,9 @@ parquetGetForeignPaths(PlannerInfo *root,
             int num_workers = max_parallel_workers_per_gather;
 
             cost_merge(path, list_length(private_parallel_merge->filenames),
-                       startup_cost, total_cost, baserel->rows);
+                       startup_cost, total_cost, private_parallel_merge->matched_rows);
 
-            path->rows = fdw_private->ntuples / (num_workers + 1);
+            path->rows = path->rows / (num_workers + 1);
             path->total_cost = path->startup_cost + path->total_cost / (num_workers + 1);
             path->parallel_workers = num_workers;
             path->parallel_aware   = true;
@@ -1233,7 +1230,7 @@ parquetGetForeignPlan(PlannerInfo * /* root */,
                       Plan *outer_plan)
 {
     ParquetFdwPlanState *fdw_private = (ParquetFdwPlanState *) best_path->fdw_private;
-	Index		scan_relid = baserel->relid;
+    Index		scan_relid = baserel->relid;
     List       *attrs_used = NIL;
     List       *attrs_sorted = NIL;
     AttrNumber  attr;
@@ -1247,7 +1244,7 @@ parquetGetForeignPlan(PlannerInfo * /* root */,
 	 * nodes from the clauses and ignore pseudoconstants (which will be
 	 * handled elsewhere).
 	 */
-	scan_clauses = extract_actual_clauses(scan_clauses, false);
+    scan_clauses = extract_actual_clauses(scan_clauses, false);
 
     /*
      * We can't just pass arbitrary structure into make_foreignscan() because
@@ -1698,8 +1695,7 @@ parquetIsForeignScanParallelSafe(PlannerInfo * /* root */,
                                  RelOptInfo *rel,
                                  RangeTblEntry * /* rte */)
 {
-    /* Use parallel execution only when statistics are collected */
-    return (rel->tuples > 0);
+    return true;
 }
 
 extern "C" Size
