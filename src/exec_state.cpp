@@ -42,6 +42,14 @@ public:
         Assert(false && "add_file is not supported for TrivialExecutionState");
     }
     void set_coordinator(ParallelCoordinator *) {}
+    Size estimate_coord_size() 
+    {
+        Assert(false && "estimate_coord_size is not supported for TrivialExecutionState");
+    }
+    void init_coord()
+    {
+        Assert(false && "init_coord is not supported for TrivialExecutionState");
+    }
 };
 
 
@@ -715,7 +723,7 @@ public:
 
     void set_coordinator(ParallelCoordinator * /* coord */)
     {
-        Assert(true);   /* not supported, should never happen */
+        Assert(false);  /* not supported, should never happen */
     }
 };
 

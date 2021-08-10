@@ -319,7 +319,7 @@ row_group_matches_filter(parquet::Statistics *stats,
 
         default:
             /* should not happen */
-            Assert(true);
+            Assert(false);
     }
 
     return true;
@@ -1103,7 +1103,7 @@ parquetGetForeignPaths(PlannerInfo *root,
     if (!enable_multifile && is_multi)
         foreign_path->total_cost += disable_cost;
 
-	add_path(baserel, (Path *) foreign_path);
+    add_path(baserel, (Path *) foreign_path);
 
     if (fdw_private->type == RT_TRIVIAL)
         return;
