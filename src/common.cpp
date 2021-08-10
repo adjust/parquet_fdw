@@ -50,6 +50,7 @@ to_postgres_type(int arrow_type)
     {
         case arrow::Type::BOOL:
             return BOOLOID;
+        case arrow::Type::INT8:
         case arrow::Type::INT16:
             return INT2OID;
         case arrow::Type::INT32:
@@ -85,6 +86,8 @@ bytes_to_postgres_type(const char *bytes, arrow::DataType *arrow_type)
     {
         case arrow::Type::BOOL:
             return BoolGetDatum(*(bool *) bytes);
+        case arrow::Type::INT8:
+            return Int16GetDatum(*(int8 *) bytes);
         case arrow::Type::INT16:
             return Int16GetDatum(*(int16 *) bytes);
         case arrow::Type::INT32:

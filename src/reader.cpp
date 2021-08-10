@@ -338,6 +338,14 @@ Datum ParquetReader::read_primitive_type(arrow::Array *array,
             res = BoolGetDatum(boolarray->Value(i));
             break;
         }
+        case arrow::Type::INT8:
+        {
+            arrow::Int8Array *intarray = (arrow::Int8Array *) array;
+            int value = intarray->Value(i);
+
+            res = Int8GetDatum(value);
+            break;
+        }
         case arrow::Type::INT16:
         {
             arrow::Int16Array *intarray = (arrow::Int16Array *) array;
@@ -602,6 +610,9 @@ FmgrInfo *ParquetReader::find_castfunc(arrow::Type::type src_type,
     Oid         dst_oid = dst_type;
     bool        error = false;
     char        errstr[ERROR_STR_LEN];
+
+    if (!OidIsValid(src_oid))
+        throw Error("cast function for '%s' column not found", attname);
 
     PG_TRY();
     {
@@ -1120,6 +1131,9 @@ public:
             case arrow::Type::BOOL:
                 sz = sizeof(bool);
                 break;
+            case arrow::Type::INT8:
+                sz = sizeof(int8);
+                break;
             case arrow::Type::INT16:
                 sz = sizeof(int16);
                 break;
@@ -1162,6 +1176,12 @@ public:
                         {
                             arrow::BooleanArray *boolarray = (arrow::BooleanArray *) array;
                             ((bool *) data)[row] = boolarray->Value(row);
+                            break;
+                        }
+                    case arrow::Type::INT8:
+                        {
+                            arrow::Int8Array *intarray = (arrow::Int8Array *) array;
+                            ((int8 *) data)[row] = intarray->Value(row);
                             break;
                         }
                     case arrow::Type::INT16:
@@ -1277,6 +1297,9 @@ public:
                 {
                     case arrow::Type::BOOL:
                         slot->tts_values[attr] = BoolGetDatum(((bool *) data)[this->row]);
+                        break;
+                    case arrow::Type::INT8:
+                        slot->tts_values[attr] = Int8GetDatum(((int8 *) data)[this->row]);
                         break;
                     case arrow::Type::INT16:
                         slot->tts_values[attr] = Int16GetDatum(((int16 *) data)[this->row]);
