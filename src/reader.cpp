@@ -642,10 +642,13 @@ FmgrInfo *ParquetReader::find_castfunc(arrow::Type::type src_type,
                         break;
                     }
                 case COERCION_PATH_RELABELTYPE:
-                case COERCION_PATH_COERCEVIAIO:  /* TODO: double check that we
-                                                  * shouldn't do anything here*/
                     /* Cast is not needed */
                     castfunc = nullptr;
+                    break;
+                case COERCION_PATH_COERCEVIAIO:
+                    /* TODO: add cast via IO */
+                    elog(ERROR, "cast via IO is not supported yet ('%s' column)",
+                         attname);
                     break;
                 default:
                     elog(ERROR, "cast function to %s ('%s' column) is not found",

@@ -52,6 +52,7 @@ extern "C"
 #include "optimizer/paths.h"
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
+#include "parser/parse_coerce.h"
 #include "parser/parse_func.h"
 #include "parser/parse_oper.h"
 #include "parser/parse_type.h"
@@ -72,6 +73,12 @@ extern "C"
 #include "access/table.h"
 #include "access/relation.h"
 #include "optimizer/optimizer.h"
+#endif
+
+#if PG_VERSION_NUM < 110000
+#include "catalog/pg_am.h"
+#else
+#include "catalog/pg_am_d.h"
 #endif
 }
 
@@ -98,6 +105,7 @@ static void destroy_parquet_state(void *arg);
 struct RowGroupFilter
 {
     AttrNumber  attnum;
+    bool        is_key; /* for maps */
     Const      *value;
     int         strategy;
 };
@@ -119,6 +127,22 @@ struct ParquetFdwPlanState
     ReaderType  type;
 };
 
+static int
+get_strategy(Oid type, Oid opno, Oid am)
+{
+        Oid opclass;
+    Oid opfamily;
+
+    opclass = GetDefaultOpClass(type, am);
+
+    if (!OidIsValid(opclass))
+        return 0;
+
+    opfamily = get_opclass_family(opclass);
+
+    return get_op_opfamily_strategy(opno, opfamily);
+}
+
 /*
  * extract_rowgroup_filters
  *      Build a list of expressions we can use to filter out row groups.
@@ -131,11 +155,11 @@ extract_rowgroup_filters(List *scan_clauses,
 
     foreach (lc, scan_clauses)
     {
-        TypeCacheEntry *tce;
         Expr       *clause = (Expr *) lfirst(lc);
         OpExpr     *expr;
         Expr       *left, *right;
         int         strategy;
+        bool        is_key = false;
         Const      *c;
         Var        *v;
         Oid         opno;
@@ -180,21 +204,25 @@ extract_rowgroup_filters(List *scan_clauses,
             else
                 continue;
 
-            /* TODO */
-            tce = lookup_type_cache(exprType((Node *) left),
-                                    TYPECACHE_BTREE_OPFAMILY);
-            strategy = get_op_opfamily_strategy(opno, tce->btree_opf);
-
             /* Not a btree family operator? */
-            if (strategy == 0)
-                continue;
+            if ((strategy = get_strategy(v->vartype, opno, BTREE_AM_OID)) == 0)
+            {
+                /*
+                 * Maybe it's a gin family operator? (We only support
+                 * jsonb 'exists' operator at the moment)
+                 */
+                if ((strategy = get_strategy(v->vartype, opno, GIN_AM_OID)) == 0
+                    || strategy != JsonbExistsStrategyNumber)
+                    continue;
+                is_key = true;
+            }
         }
         else if (IsA(clause, Var))
         {
             /*
              * Trivial expression containing only a single boolean Var. This
              * also covers cases "BOOL_VAR = true"
-             * */
+             */
             v = (Var *) clause;
             strategy = BTEqualStrategyNumber;
             c = (Const *) makeBoolConst(true, false);
@@ -223,6 +251,7 @@ extract_rowgroup_filters(List *scan_clauses,
         RowGroupFilter f
         {
             .attnum = v->varattno,
+            .is_key = is_key,
             .value = c,
             .strategy = strategy,
         };
@@ -239,19 +268,118 @@ extract_rowgroup_filters(List *scan_clauses,
     }
 }
 
+static Const *
+convert_const(Const *c, Oid dst_oid)
+{
+    Oid         funcid;
+    CoercionPathType ct;
+
+    ct = find_coercion_pathway(dst_oid, c->consttype,
+                               COERCION_EXPLICIT, &funcid);
+    switch (ct)
+    {
+        case COERCION_PATH_FUNC:
+            {
+                FmgrInfo    finfo;
+                Const      *newc;
+                int16       typlen;
+                bool        typbyval;
+
+                get_typlenbyval(dst_oid, &typlen, &typbyval);
+
+                newc = makeConst(dst_oid,
+                                 0,
+                                 c->constcollid,
+                                 typlen,
+                                 0,
+                                 c->constisnull,
+                                 typbyval);
+                fmgr_info(funcid, &finfo);
+                newc->constvalue = FunctionCall1(&finfo, c->constvalue);
+
+                return newc;
+            }
+        case COERCION_PATH_RELABELTYPE:
+            /* Cast is not needed */
+            break;
+        case COERCION_PATH_COERCEVIAIO:
+            {
+                /*
+                 * In this type of cast we need to output the value to a string
+                 * and then feed this string to the input function of the
+                 * target type.
+                 */
+                Const  *newc;
+                int16   typlen;
+                bool    typbyval;
+                Oid     input_fn, output_fn;
+                Oid     input_param;
+                bool    isvarlena;
+                char   *str;
+
+                /* Construct a new Const node */
+                get_typlenbyval(dst_oid, &typlen, &typbyval);
+                newc = makeConst(dst_oid,
+                                 0,
+                                 c->constcollid,
+                                 typlen,
+                                 0,
+                                 c->constisnull,
+                                 typbyval);
+
+                /* Get IO functions */
+                getTypeOutputInfo(c->consttype, &output_fn, &isvarlena);
+                getTypeInputInfo(dst_oid, &input_fn, &input_param);
+
+                str = DatumGetCString(OidOutputFunctionCall(output_fn,
+                                                            c->constvalue));
+                newc->constvalue = OidInputFunctionCall(input_fn, str,
+                                                        input_param, 0);
+
+                return newc;
+            }
+        default:
+            elog(ERROR, "cast function to %s is not found",
+                 format_type_be(dst_oid));
+    }
+    return c;
+}
+
 /*
  * row_group_matches_filter
  *      Check if min/max values of the column of the row group match filter.
  */
 static bool
 row_group_matches_filter(parquet::Statistics *stats,
-                         arrow::DataType *arrow_type,
+                         const arrow::DataType *arrow_type,
                          RowGroupFilter *filter)
 {
     FmgrInfo finfo;
-    Datum    val = filter->value->constvalue;
+    Datum    val;
     int      collid = filter->value->constcollid;
     int      strategy = filter->strategy;
+
+    if (arrow_type->id() == arrow::Type::MAP && filter->is_key)
+    {
+        /*
+         * Special case for jsonb `?` (exists) operator. As key is always
+         * of text type we need first convert it to the target type (if needed
+         * of course).
+         */
+
+        /*
+         * Extract the key type (we don't check correctness here as we've 
+         * already done this in `extract_rowgroups_list()`)
+         */
+        auto strct = arrow_type->fields()[0];
+        auto key = strct->type()->fields()[0];
+        arrow_type = key->type().get();
+
+        /* Do conversion */
+        filter->value = convert_const(filter->value,
+                                      to_postgres_type(arrow_type->id()));
+    }
+    val = filter->value->constvalue;
 
     find_cmp_func(&finfo,
                   filter->value->consttype,
@@ -300,6 +428,7 @@ row_group_matches_filter(parquet::Statistics *stats,
             }
 
         case BTEqualStrategyNumber:
+        case JsonbExistsStrategyNumber:
             {
                 Datum   lower,
                         upper;
@@ -465,17 +594,37 @@ extract_rowgroups_list(const char *filename,
                     bool            error = false;
                     char            errstr[ERROR_STR_LEN];
                     auto           &field = schema_field.field;
+                    int             column_index;
 
                     /* Skip complex objects (lists, maps) */
-                    if (schema_field.column_index == -1)
+                    if (schema_field.column_index == -1
+                        && field->type()->id() != arrow::Type::MAP)
                         continue;
 
-                    if (strcmp(attname, schema_field.field->name().c_str()) != 0)
+                    /* TODO: make comparison case-insensitive! */
+                    if (strcmp(attname, field->name().c_str()) != 0)
                         continue;
+
+                    if (field->type()->id() == arrow::Type::MAP)
+                    {
+                        /*
+                         * Extract `key` column of the map.
+                         * See create_column_mapping for some details on map
+                         * structure.
+                         */
+                        Assert(schema_field.children.size() == 1);
+                        auto &strct = schema_field.children[0];
+
+                        Assert(strct.children.size() == 2);
+                        auto &key = strct.children[0];
+                        column_index = key.column_index;
+                    }
+                    else
+                        column_index = schema_field.column_index;
 
                     /* Found it! */
                     std::shared_ptr<parquet::Statistics>  stats;
-                    auto column = rowgroup->ColumnChunk(schema_field.column_index);
+                    auto column = rowgroup->ColumnChunk(column_index);
                     stats = column->statistics();
 
                     PG_TRY();
@@ -590,7 +739,7 @@ extract_parquet_fields(const char *path) noexcept
                     Oid     pg_subtype;
                     bool    error = false;
 
-                    if (type->children().size() != 1)
+                    if (type->num_fields() != 1)
                         throw std::runtime_error("lists of structs are not supported");
 
                     subtype_id = get_arrow_list_elem_type(type.get());

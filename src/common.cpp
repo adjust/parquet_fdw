@@ -80,7 +80,7 @@ to_postgres_type(int arrow_type)
  *      plain bytes to postgres Datum.
  */
 Datum
-bytes_to_postgres_type(const char *bytes, arrow::DataType *arrow_type)
+bytes_to_postgres_type(const char *bytes, const arrow::DataType *arrow_type)
 {
     switch(arrow_type->id())
     {
@@ -121,7 +121,7 @@ bytes_to_postgres_type(const char *bytes, arrow::DataType *arrow_type)
 arrow::Type::type
 get_arrow_list_elem_type(arrow::DataType *type)
 {
-    auto children = type->children();
+    auto children = type->fields();
 
     Assert(children.size() == 1);
     return children[0]->type()->id();
