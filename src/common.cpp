@@ -118,6 +118,25 @@ bytes_to_postgres_type(const char *bytes, const arrow::DataType *arrow_type)
     }
 }
 
+/*
+ * XXX Currently only supports ascii strings
+ */
+char *
+tolowercase(const char *input, char *output)
+{
+    int i = 0;
+
+    Assert(strlen(input) < NAMEDATALEN - 1);
+
+    do
+    {
+        output[i] = tolower(input[i]);
+    }
+    while (input[i++]);
+
+    return output;
+}
+
 arrow::Type::type
 get_arrow_list_elem_type(arrow::DataType *type)
 {

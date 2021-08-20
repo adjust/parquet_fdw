@@ -31,26 +31,6 @@ extern "C"
 bool parquet_fdw_use_threads = true;
 
 
-/*
- * XXX Currently only supports ascii strings
- */
-static char *
-tolowercase(const char *input, char *output)
-{
-    int i = 0;
-
-    Assert(strlen(input) < NAMEDATALEN - 1);
-
-    do
-    {
-        output[i] = tolower(input[i]);
-    }
-    while (input[i++]);
-
-    return output;
-}
-
-
 class FastAllocator
 {
 private:

@@ -580,10 +580,11 @@ extract_rowgroups_list(const char *filename,
             for (auto &filter : filters)
             {
                 AttrNumber      attnum;
-                const char     *attname;
+                char            pg_colname[NAMEDATALEN];
 
                 attnum = filter.attnum - 1;
-                attname = NameStr(TupleDescAttr(tupleDesc, attnum)->attname);
+                tolowercase(NameStr(TupleDescAttr(tupleDesc, attnum)->attname),
+                            pg_colname);
 
                 /*
                  * Search for the column with the same name as filtered attribute
@@ -593,24 +594,29 @@ extract_rowgroups_list(const char *filename,
                     MemoryContext   ccxt = CurrentMemoryContext;
                     bool            error = false;
                     char            errstr[ERROR_STR_LEN];
+                    char            arrow_colname[NAMEDATALEN];
                     auto           &field = schema_field.field;
                     int             column_index;
 
-                    /* Skip complex objects (lists, maps) */
+                    /* Skip complex objects (lists, structs except maps) */
                     if (schema_field.column_index == -1
                         && field->type()->id() != arrow::Type::MAP)
                         continue;
 
-                    /* TODO: make comparison case-insensitive! */
-                    if (strcmp(attname, field->name().c_str()) != 0)
+                    if (field->name().length() > NAMEDATALEN)
+                        throw Error("parquet column name '%s' is too long (max: %d)",
+                                    field->name().c_str(), NAMEDATALEN - 1);
+                    tolowercase(field->name().c_str(), arrow_colname);
+
+                    if (strcmp(pg_colname, arrow_colname) != 0)
                         continue;
 
                     if (field->type()->id() == arrow::Type::MAP)
                     {
                         /*
                          * Extract `key` column of the map.
-                         * See create_column_mapping for some details on map
-                         * structure.
+                         * See `create_column_mapping()` for some details on
+                         * map structure.
                          */
                         Assert(schema_field.children.size() == 1);
                         auto &strct = schema_field.children[0];
