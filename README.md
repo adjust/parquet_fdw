@@ -50,6 +50,7 @@ Currently `parquet_fdw` supports the following column [types](https://github.com
 
 |   Arrow type |  SQL type |
 |-------------:|----------:|
+|         INT8 |      INT2 |
 |        INT16 |      INT2 |
 |        INT32 |      INT4 |
 |        INT64 |      INT8 |

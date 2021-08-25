@@ -20,25 +20,6 @@ extern "C"
 }
 
 
-#if 0
-struct ParallelCoordinator
-{
-    slock_t     lock;
-    union
-    {
-        struct
-        {
-            int32   next_reader;
-            int32   next_rowgroup;
-        } s;    /* single file and simple multifile case */
-        struct
-        {
-            int32   next_rowgroup[FLEXIBLE_ARRAY_MEMBER]; /* per-reader counters */
-        } m;   /* multimerge case */
-    } i;
-};
-#endif
-
 class ParallelCoordinator
 {
 private:
@@ -159,8 +140,10 @@ protected:
          * Cast functions from dafult postgres type defined in `to_postgres_type`
          * to actual table column type.
          */
+        bool            need_cast;
         FmgrInfo       *castfunc;
-        FmgrInfo       *outfunc;
+        FmgrInfo       *outfunc; /* For cast via IO and for maps */
+        FmgrInfo       *infunc;  /* For cast via IO              */
 
         /* Underlying types for complex types like list and map */
         std::vector<TypeInfo> children;
@@ -173,24 +156,26 @@ protected:
         int             index;
 
         TypeInfo()
-            : arrow{}, pg{}, castfunc(nullptr), index(-1)
+            : arrow{}, pg{}, need_cast(false),
+              castfunc(nullptr), outfunc(nullptr), infunc(nullptr), index(-1)
         {}
 
         TypeInfo(TypeInfo &&ti)
-            : arrow(ti.arrow), pg(ti.pg), castfunc(nullptr),
+            : arrow(ti.arrow), pg(ti.pg), need_cast(ti.need_cast),
+              castfunc(ti.castfunc), outfunc(ti.outfunc), infunc(ti.infunc),
               children(std::move(ti.children)), index(-1)
         {}
 
-        TypeInfo(std::shared_ptr<arrow::DataType> arrow_type)
-            : arrow{arrow_type->id(), arrow_type->name()}, pg{},
-              castfunc(nullptr), index(-1)
-        {}
-
-        TypeInfo(std::shared_ptr<arrow::DataType> arrow_type, Oid typid,
-                 FmgrInfo *castfunc)
-            : arrow{arrow_type->id(), arrow_type->name()}, pg{typid, 0, false, 0},
-              castfunc(castfunc), index(-1)
-        {}
+        TypeInfo(std::shared_ptr<arrow::DataType> arrow_type, Oid typid=InvalidOid)
+            : TypeInfo()
+        {
+            arrow.type_id = arrow_type->id();
+            arrow.type_name = arrow_type->name();
+            pg.oid = typid;
+            pg.len = 0;
+            pg.byval = false;
+            pg.align = 0;
+        }
     };
 
 protected:
@@ -239,6 +224,7 @@ protected:
     bool    initialized;
 
 protected:
+    Datum do_cast(Datum val, const TypeInfo &typinfo);
     Datum read_primitive_type(arrow::Array *array, const TypeInfo &typinfo,
                               int64_t i);
     Datum nested_list_to_datum(arrow::ListArray *larray, int pos, const TypeInfo &typinfo);
@@ -246,6 +232,8 @@ protected:
     FmgrInfo *find_castfunc(arrow::Type::type src_type, Oid dst_type,
                             const char *attname);
     FmgrInfo *find_outfunc(Oid typoid);
+    FmgrInfo *find_infunc(Oid typoid);
+    void initialize_cast(TypeInfo &typinfo, const char *attname);
     template<typename T> inline void copy_to_c_array(T *values,
                                                      const arrow::Array *array,
                                                      int elem_size);

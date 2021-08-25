@@ -23,6 +23,12 @@ extern "C"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
+
+#if PG_VERSION_NUM < 110000
+#include "catalog/pg_type.h"
+#else
+#include "catalog/pg_type_d.h"
+#endif
 }
 
 #define SEGMENT_SIZE (1024 * 1024)
@@ -234,19 +240,18 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, const std::set<in
                                         pg_colname);
 
                         if (!OidIsValid(elem_type))
-                            throw Error("parquet_fdw: cannot convert parquet "
-                                        "column of type LIST to scalar type of "
-                                        " postgres column '%s'", pg_colname);
+                            throw Error("cannot convert parquet column of type "
+                                        "LIST to scalar type of postgres column '%s'",
+                                        pg_colname);
 
                         auto     &child = schema_field.children[0];
-                        FmgrInfo *castfunc = find_castfunc(child.field->type()->id(),
-                                                           elem_type, attname);
                         typinfo.children.emplace_back(child.field->type(),
-                                                      elem_type, castfunc);
+                                                      elem_type);
                         TypeInfo &elem = typinfo.children[0];
                         elem.pg.len = elem_len;
                         elem.pg.byval = elem_byval;
                         elem.pg.align = elem_align;
+                        initialize_cast(elem, attname);
 
                         this->indices.push_back(child.column_index);
                         break;
@@ -272,21 +277,33 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, const std::set<in
                         Oid pg_item_type = to_postgres_type(item.field->type()->id());
 
                         typinfo.children.emplace_back(key.field->type(),
-                                                      pg_key_type, nullptr);
+                                                      pg_key_type);
                         typinfo.children.emplace_back(item.field->type(),
-                                                      pg_item_type, nullptr);
+                                                      pg_item_type);
 
-                        typinfo.children[0].outfunc = find_outfunc(pg_key_type);
-                        typinfo.children[1].outfunc = find_outfunc(pg_item_type);
+                        PG_TRY();
+                        {
+                            typinfo.children[0].outfunc = find_outfunc(pg_key_type);
+                            typinfo.children[1].outfunc = find_outfunc(pg_item_type);
+                        }
+                        PG_CATCH();
+                        {
+                            error = true;
+                        }
+                        PG_END_TRY();
+                        if (error)
+                            throw Error("failed to initialize output function for "
+                                        "Map column '%s'", attname);
 
                         this->indices.push_back(key.column_index);
                         this->indices.push_back(item.column_index);
+
+                        /* JSONB might need cast (e.g. to TEXT) */
+                        initialize_cast(typinfo, attname);
                         break;
                     }
                     default:
-                        typinfo.castfunc = find_castfunc(typinfo.arrow.type_id,
-                                                         typinfo.pg.oid,
-                                                         attname);
+                        initialize_cast(typinfo, attname);
                         typinfo.index = schema_field.column_index;
                         this->indices.push_back(schema_field.column_index);
                 }
@@ -296,6 +313,48 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, const std::set<in
             }
         }
     }
+}
+
+Datum ParquetReader::do_cast(Datum val, const TypeInfo &typinfo)
+{
+    MemoryContext   ccxt = CurrentMemoryContext;
+    bool            error = false;
+    char            errstr[ERROR_STR_LEN];
+
+    /* du, du cast, du cast mich... */
+    PG_TRY();
+    {
+        if (typinfo.castfunc != NULL)
+        {
+            val = FunctionCall1(typinfo.castfunc, val);
+        }
+        else if (typinfo.outfunc && typinfo.infunc)
+        {
+            char *str;
+
+            str = OutputFunctionCall(typinfo.outfunc, val);
+
+            /* TODO: specify typioparam and typmod */
+            val = InputFunctionCall(typinfo.infunc, str, 0, 0);
+        }
+    }
+    PG_CATCH();
+    {
+        ErrorData *errdata;
+
+        MemoryContextSwitchTo(ccxt);
+        error = true;
+        errdata = CopyErrorData();
+        FlushErrorState();
+
+        strncpy(errstr, errdata->message, ERROR_STR_LEN - 1);
+        FreeErrorData(errdata);
+    }
+    PG_END_TRY();
+    if (error)
+        throw std::runtime_error(errstr);
+
+    return val;
 }
 
 /*
@@ -414,32 +473,8 @@ Datum ParquetReader::read_primitive_type(arrow::Array *array,
     }
 
     /* Call cast function if needed */
-    if (typinfo.castfunc != NULL)
-    {
-        MemoryContext   ccxt = CurrentMemoryContext;
-        bool            error = false;
-        char            errstr[ERROR_STR_LEN];
-
-        PG_TRY();
-        {
-            res = FunctionCall1(typinfo.castfunc, res);
-        }
-        PG_CATCH();
-        {
-            ErrorData *errdata;
-
-            MemoryContextSwitchTo(ccxt);
-            error = true;
-            errdata = CopyErrorData();
-            FlushErrorState();
-
-            strncpy(errstr, errdata->message, ERROR_STR_LEN - 1);
-            FreeErrorData(errdata);
-        }
-        PG_END_TRY();
-        if (error)
-            throw std::runtime_error(errstr);
-    }
+    if (typinfo.need_cast)
+        res = do_cast(res, typinfo);
 
     return res;
 }
@@ -533,7 +568,8 @@ ParquetReader::map_to_datum(arrow::MapArray *maparray, int pos,
                             const TypeInfo &typinfo)
 {
 	JsonbParseState *parseState = NULL;
-    JsonbValue *res;
+    JsonbValue *jb;
+    Datum       res;
 
     auto keys = maparray->keys()->Slice(maparray->value_offset(pos),
                                         maparray->value_length(pos));
@@ -543,7 +579,7 @@ ParquetReader::map_to_datum(arrow::MapArray *maparray, int pos,
     Assert(keys->length() == values->length());
     Assert(typinfo.children.size() == 2);
 
-	res = pushJsonbValue(&parseState, WJB_BEGIN_OBJECT, NULL);
+    jb = pushJsonbValue(&parseState, WJB_BEGIN_OBJECT, NULL);
 
     for (int i = 0; i < keys->length(); ++i)
     {
@@ -570,9 +606,13 @@ ParquetReader::map_to_datum(arrow::MapArray *maparray, int pos,
                        parseState, false);
     }
 
-	res = pushJsonbValue(&parseState, WJB_END_OBJECT, NULL);
+    jb = pushJsonbValue(&parseState, WJB_END_OBJECT, NULL);
+    res = JsonbPGetDatum(JsonbValueToJsonb(jb));
 
-    return JsonbPGetDatum(JsonbValueToJsonb(res));
+    if (typinfo.need_cast)
+        res = do_cast(res, typinfo);
+
+    return res;
 }
 
 
@@ -581,30 +621,34 @@ ParquetReader::map_to_datum(arrow::MapArray *maparray, int pos,
  *      Check wether implicit cast will be required and prepare cast function
  *      call.
  */
-FmgrInfo *ParquetReader::find_castfunc(arrow::Type::type src_type,
-                                       Oid dst_type, const char *attname)
+void ParquetReader::initialize_cast(TypeInfo &typinfo, const char *attname)
 {
     MemoryContext ccxt = CurrentMemoryContext;
-    FmgrInfo   *castfunc;
-    Oid         src_oid = to_postgres_type(src_type);
-    Oid         dst_oid = dst_type;
+    Oid         src_oid = to_postgres_type(typinfo.arrow.type_id);
+    Oid         dst_oid = typinfo.pg.oid;
     bool        error = false;
     char        errstr[ERROR_STR_LEN];
 
     if (!OidIsValid(src_oid))
-        throw Error("cast function for '%s' column not found", attname);
+    {
+        if (typinfo.arrow.type_id == arrow::Type::MAP)
+            src_oid = JSONBOID;
+        else
+            elog(ERROR, "failed to initialize cast function for column '%s'",
+                 attname);
+    }
 
     PG_TRY();
     {
 
         if (IsBinaryCoercible(src_oid, dst_oid))
         {
-            castfunc = nullptr;
+            typinfo.castfunc = nullptr;
         }
         else
         {
-            Oid funcid;
             CoercionPathType ct;
+            Oid     funcid;
 
             ct = find_coercion_pathway(dst_oid, src_oid,
                                        COERCION_EXPLICIT,
@@ -616,23 +660,29 @@ FmgrInfo *ParquetReader::find_castfunc(arrow::Type::type src_type,
                         MemoryContext   oldctx;
 
                         oldctx = MemoryContextSwitchTo(CurTransactionContext);
-                        castfunc = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
-                        fmgr_info(funcid, castfunc);
+                        typinfo.castfunc = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
+                        fmgr_info(funcid, typinfo.castfunc);
+                        typinfo.need_cast = true;
                         MemoryContextSwitchTo(oldctx);
+
                         break;
                     }
+
                 case COERCION_PATH_RELABELTYPE:
                     /* Cast is not needed */
-                    castfunc = nullptr;
+                    typinfo.castfunc = nullptr;
                     break;
+
                 case COERCION_PATH_COERCEVIAIO:
-                    /* TODO: add cast via IO */
-                    elog(ERROR, "cast via IO is not supported yet ('%s' column)",
-                         attname);
+                    /* Cast via IO */
+                    typinfo.outfunc = find_outfunc(src_oid);
+                    typinfo.infunc = find_infunc(dst_oid);
+                    typinfo.need_cast = true;
                     break;
+
                 default:
-                    elog(ERROR, "cast function to %s ('%s' column) is not found",
-                         format_type_be(dst_type), attname);
+                    elog(ERROR, "coercion pathway from '%s' to '%s' not found",
+                         format_type_be(src_oid), format_type_be(dst_oid));
             }
         }
     }
@@ -651,38 +701,48 @@ FmgrInfo *ParquetReader::find_castfunc(arrow::Type::type src_type,
     }
     PG_END_TRY();
     if (error)
-        throw std::runtime_error(errstr);
-
-    return castfunc;
+        throw Error("failed to initialize cast function for column '%s' (%s)",
+                    attname, errstr);
 }
 
 FmgrInfo *ParquetReader::find_outfunc(Oid typoid)
 {
-    Oid     funcoid;
-    bool    isvarlena;
-    FmgrInfo *outfunc;
-    bool    error(false);
+    MemoryContext oldctx;
+    Oid         funcoid;
+    bool        isvarlena;
+    FmgrInfo   *outfunc;
 
-    PG_TRY();
-    {
-        MemoryContext   oldctx;
+    getTypeOutputInfo(typoid, &funcoid, &isvarlena);
 
-        getTypeOutputInfo(typoid, &funcoid, &isvarlena);
+    if (!OidIsValid(funcoid))
+        elog(ERROR, "output function for '%s' not found", format_type_be(typoid));
 
-        oldctx = MemoryContextSwitchTo(CurTransactionContext);
-        outfunc = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
-        fmgr_info(funcoid, outfunc);
-        MemoryContextSwitchTo(oldctx);
-    }
-    PG_CATCH();
-    {
-        error = true;
-    }
-    PG_END_TRY();
-    if (error)
-        throw std::runtime_error("failed to find output function");
+    oldctx = MemoryContextSwitchTo(CurTransactionContext);
+    outfunc = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
+    fmgr_info(funcoid, outfunc);
+    MemoryContextSwitchTo(oldctx);
 
     return outfunc;
+}
+
+FmgrInfo *ParquetReader::find_infunc(Oid typoid)
+{
+    MemoryContext oldctx;
+    Oid         funcoid;
+    Oid         typIOParam;
+    FmgrInfo   *infunc;
+
+    getTypeInputInfo(typoid, &funcoid, &typIOParam);
+
+    if (!OidIsValid(funcoid))
+        elog(ERROR, "input function for '%s' not found", format_type_be(typoid));
+
+    oldctx = MemoryContextSwitchTo(CurTransactionContext);
+    infunc = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
+    fmgr_info(funcoid, infunc);
+    MemoryContextSwitchTo(oldctx);
+
+    return infunc;
 }
 
 /*
@@ -1268,7 +1328,8 @@ public:
             if (arrow_col >= 0)
             {
                 TypeInfo &typinfo = this->types[arrow_col];
-                void *data = this->column_data[arrow_col];
+                void     *data = this->column_data[arrow_col];
+                bool      need_cast = typinfo.need_cast;
 
                 switch(typinfo.arrow.type_id)
                 {
@@ -1301,7 +1362,11 @@ public:
                         break;
                     default:
                         slot->tts_values[attr] = ((Datum *) data)[this->row];
+                        need_cast = false;
                 }
+
+                if (need_cast)
+                    slot->tts_values[attr] = do_cast(slot->tts_values[attr], typinfo);
                 slot->tts_isnull[attr] = this->column_nulls[arrow_col][this->row];
             }
             else

@@ -208,9 +208,9 @@ CREATE FOREIGN TABLE example_fail (one INT8[], two INT8, three TEXT)
 SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/simple/example1.parquet', sorted 'one');
 SELECT one FROM example_fail;
-ERROR:  parquet_fdw: cast function to bigint[] ('one' column) is not found
+ERROR:  parquet_fdw: failed to initialize cast function for column 'one' (coercion pathway from 'bigint' to 'bigint[]' not found)
 SELECT two FROM example_fail;
-ERROR:  parquet_fdw: parquet_fdw: cannot convert parquet column of type LIST to scalar type of  postgres column 'two'
+ERROR:  parquet_fdw: cannot convert parquet column of type LIST to scalar type of postgres column 'two'
 -- files_func
 CREATE FUNCTION list_parquet_files(args JSONB)
 RETURNS TEXT[] AS
