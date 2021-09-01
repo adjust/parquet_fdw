@@ -80,7 +80,7 @@ to_postgres_type(int arrow_type)
  *      plain bytes to postgres Datum.
  */
 Datum
-bytes_to_postgres_type(const char *bytes, const arrow::DataType *arrow_type)
+bytes_to_postgres_type(const char *bytes, Size len, const arrow::DataType *arrow_type)
 {
     switch(arrow_type->id())
     {
@@ -99,8 +99,9 @@ bytes_to_postgres_type(const char *bytes, const arrow::DataType *arrow_type)
         case arrow::Type::DOUBLE:
             return Float8GetDatum(*(double *) bytes);
         case arrow::Type::STRING:
-        case arrow::Type::BINARY:
             return CStringGetTextDatum(bytes);
+        case arrow::Type::BINARY:
+            return PointerGetDatum(cstring_to_text_with_len(bytes, len));
         case arrow::Type::TIMESTAMP:
             {
                 TimestampTz ts;

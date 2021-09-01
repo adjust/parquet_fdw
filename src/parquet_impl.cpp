@@ -393,8 +393,9 @@ row_group_matches_filter(parquet::Statistics *stats,
                 Datum   lower;
                 int     cmpres;
                 bool    satisfies;
+                std::string min = std::move(stats->EncodeMin());
 
-                lower = bytes_to_postgres_type(stats->EncodeMin().c_str(),
+                lower = bytes_to_postgres_type(min.c_str(), min.length(),
                                                arrow_type);
                 cmpres = FunctionCall2Coll(&finfo, collid, val, lower);
 
@@ -413,8 +414,9 @@ row_group_matches_filter(parquet::Statistics *stats,
                 Datum   upper;
                 int     cmpres;
                 bool    satisfies;
+                std::string max = std::move(stats->EncodeMax());
 
-                upper = bytes_to_postgres_type(stats->EncodeMax().c_str(),
+                upper = bytes_to_postgres_type(max.c_str(), max.length(),
                                                arrow_type);
                 cmpres = FunctionCall2Coll(&finfo, collid, val, upper);
 
@@ -432,10 +434,12 @@ row_group_matches_filter(parquet::Statistics *stats,
             {
                 Datum   lower,
                         upper;
+                std::string min = std::move(stats->EncodeMin());
+                std::string max = std::move(stats->EncodeMax());
 
-                lower = bytes_to_postgres_type(stats->EncodeMin().c_str(),
+                lower = bytes_to_postgres_type(min.c_str(), min.length(),
                                                arrow_type);
-                upper = bytes_to_postgres_type(stats->EncodeMax().c_str(),
+                upper = bytes_to_postgres_type(max.c_str(), max.length(),
                                                arrow_type);
 
                 int l = FunctionCall2Coll(&finfo, collid, val, lower);
