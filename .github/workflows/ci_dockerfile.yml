@@ -1,0 +1,20 @@
+name: build
+
+on:
+  push:
+    branches: ['*']
+  pull_request:
+    branches: ['*']
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [14, 13, 12, 11, 10]
+    name: PostgreSQL ${{ matrix.pg }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - run: docker build --tag tests --build-arg="PG_VERSION=${{ matrix.pg }}" .
+      - run: docker run --rm tests

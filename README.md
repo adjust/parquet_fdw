@@ -1,4 +1,4 @@
-![CI](https://github.com/adjust/parquet_fdw/workflows/CI/badge.svg) ![experimental](https://img.shields.io/badge/status-experimental-orange)
+[![build](https://github.com/adjust/parquet_fdw/actions/workflows/ci_dockerfile.yml/badge.svg)](https://github.com/adjust/parquet_fdw/actions/workflows/ci_dockerfile.yml) ![experimental](https://img.shields.io/badge/status-experimental-orange)
 
 # parquet_fdw
 

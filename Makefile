@@ -8,8 +8,13 @@ EXTENSION = parquet_fdw
 DATA = parquet_fdw--0.1.sql parquet_fdw--0.1--0.2.sql
 
 REGRESS = parquet_fdw import
+REGRESS_OPTS = --inputdir=test --outputdir=test
 
-EXTRA_CLEAN = sql/parquet_fdw.sql expected/parquet_fdw.out
+EXTRA_CLEAN = test/sql/parquet_fdw.sql \
+			  test/sql/import.sql \
+			  test/expected/parquet_fdw.out \
+			  test/expected/import.out \
+			  test/results
 
 PG_CONFIG ?= pg_config
 
