@@ -1949,7 +1949,7 @@ parquetImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid /* serverOid */)
             /* check that file extension is "parquet" */
             char *ext = strrchr(filename, '.');
 
-            if (ext && strcmp(ext + 1, "parquet") != 0)
+            if (!ext || strcmp(ext + 1, "parquet") != 0)
                 continue;
 
             /*
