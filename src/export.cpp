@@ -37,10 +37,12 @@ public:
 };
 
 using BoolBuilder = DataBuilder<arrow::BooleanBuilder>;
-using IntBuilder = DataBuilder<arrow::Int32Builder>;
-using BigintBuilder = DataBuilder<arrow::Int64Builder>;
+using Int2Builder = DataBuilder<arrow::Int16Builder>;
+using Int4Builder = DataBuilder<arrow::Int32Builder>;
+using Int8Builder = DataBuilder<arrow::Int64Builder>;
 using DateBuilder = DataBuilder<arrow::Date32Builder>;
 using TextBuilder = DataBuilder<arrow::StringBuilder>;
+using ByteaBuilder = DataBuilder<arrow::BinaryBuilder>;
 
 template <>
 void BoolBuilder::Append(Datum datum) {
@@ -48,12 +50,17 @@ void BoolBuilder::Append(Datum datum) {
 }
 
 template <>
-void IntBuilder::Append(Datum datum) {
+void Int2Builder::Append(Datum datum) {
+    builder.Append(DatumGetInt16(datum));
+}
+
+template <>
+void Int4Builder::Append(Datum datum) {
     builder.Append(DatumGetInt32(datum));
 }
 
 template <>
-void BigintBuilder::Append(Datum datum) {
+void Int8Builder::Append(Datum datum) {
     builder.Append(DatumGetInt64(datum));
 }
 
@@ -68,6 +75,34 @@ void TextBuilder::Append(Datum datum) {
     builder.Append(TextDatumGetCString(datum));
 }
 
+template <>
+void ByteaBuilder::Append(Datum datum) {
+    bytea *b = DatumGetByteaP(datum);
+
+    builder.Append(VARDATA_ANY(b), VARSIZE_ANY_EXHDR(b));
+}
+
+class TimestampBuilder : public BaseDataBuilder
+{
+private:
+    arrow::TimestampBuilder builder;
+public:
+    TimestampBuilder()
+        : builder(arrow::timestamp(arrow::TimeUnit::MICRO), arrow::default_memory_pool()) {}
+    ~TimestampBuilder() {}
+    void Append(Datum datum) {
+        pg_time_t t = timestamptz_to_time_t(DatumGetTimestamp(datum));
+
+        builder.Append(t * 1000000);
+    }
+    void AppendNull() {
+        builder.AppendNull();
+    }
+    void Finish(std::shared_ptr<arrow::Array>* out) {
+        builder.Finish(out);
+    }
+};
+
 static BaseDataBuilder *
 create_data_builder(Oid typoid)
 {
@@ -75,14 +110,20 @@ create_data_builder(Oid typoid)
     {
         case BOOLOID:
             return new BoolBuilder();
+        case INT2OID:
+            return new Int2Builder();
         case INT4OID:
-            return new IntBuilder();
+            return new Int4Builder();
         case INT8OID:
-            return new BigintBuilder();
+            return new Int8Builder();
         case DATEOID:
             return new DateBuilder();
+        case TIMESTAMPOID:
+            return new TimestampBuilder();
         case TEXTOID:
             return new TextBuilder();
+        case BYTEAOID:
+            return new ByteaBuilder();
         default:
             throw std::runtime_error("parquet_fdw: unknown type");
     }
@@ -95,14 +136,20 @@ pg_to_arrow_type(Oid typoid)
     {
         case BOOLOID:
             return arrow::boolean();
+        case INT2OID:
+            return arrow::int16();
         case INT4OID:
             return arrow::int32();
         case INT8OID:
             return arrow::int64();
         case DATEOID:
             return arrow::date32();
+        case TIMESTAMPOID:
+            return arrow::timestamp(arrow::TimeUnit::MICRO);
         case TEXTOID:
             return arrow::utf8();
+        case BYTEAOID:
+            return arrow::binary();
         default:
             elog(ERROR, "parquet_fdw: export data of type %i is not supported", typoid);
     }
