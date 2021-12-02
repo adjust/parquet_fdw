@@ -171,12 +171,13 @@ export_to_parquet(PG_FUNCTION_ARGS)
     char       *filename = TextDatumGetCString(PG_GETARG_TEXT_P(1));
     bool        error = false;
     char        errmsg[256];
+    int         rowgroup = 0;
 
     SPI_connect();
     SPIPlanPtr plan = SPI_prepare(query, 0, NULL);
     Portal cursor = SPI_cursor_open("export_parquet", plan, NULL, NULL, true);
 
-    SPI_cursor_fetch(cursor, true, 2);
+    SPI_cursor_fetch(cursor, true, 100000);
 
     if (!SPI_tuptable)
         elog(ERROR, "parquet_fdw: SPI error");
@@ -205,7 +206,8 @@ export_to_parquet(PG_FUNCTION_ARGS)
             arrow::io::FileOutputStream::Open(filename));
 
         parquet::WriterProperties::Builder builder;
-        builder.compression(parquet::Compression::GZIP);
+        // builder.compression(parquet::Compression::GZIP);
+        builder.compression(parquet::Compression::ZSTD);
         auto props = builder.build();
 
         parquet::arrow::FileWriter::Open(*schema, ::arrow::default_memory_pool(),
@@ -263,7 +265,9 @@ export_to_parquet(PG_FUNCTION_ARGS)
                 elog(ERROR, "parquet_fdw: %s", errmsg);
         }
 
-        SPI_cursor_fetch(cursor, true, 2);
+        elog(LOG, "rowgroup %i done", rowgroup++);
+
+        SPI_cursor_fetch(cursor, true, 100000);
     }
     writer->Close();
 

@@ -385,6 +385,23 @@ row_group_matches_filter(parquet::Statistics *stats,
                   filter->value->consttype,
                   to_postgres_type(arrow_type->id()));
 
+    if (!OidIsValid(finfo.fn_oid)) {
+        /*
+         * Failed to find direct a comparison function between two types. What
+         * if we cast the second argument to the type of the first one?
+         */
+        filter->value = convert_const(filter->value,
+                                      to_postgres_type(arrow_type->id()));
+
+        find_cmp_func(&finfo,
+                      filter->value->consttype,
+                      to_postgres_type(arrow_type->id()));
+
+        /* If no luck again then just skip */
+        if (!OidIsValid(finfo.fn_oid))
+            return true;
+    }
+
     switch (filter->strategy)
     {
         case BTLessStrategyNumber:
@@ -1585,6 +1602,8 @@ find_cmp_func(FmgrInfo *finfo, Oid type1, Oid type2)
     Oid cmp_proc_oid;
     TypeCacheEntry *tce_1, *tce_2;
 
+    memset(finfo, 0, sizeof(FmgrInfo));
+
     tce_1 = lookup_type_cache(type1, TYPECACHE_BTREE_OPFAMILY);
     tce_2 = lookup_type_cache(type2, TYPECACHE_BTREE_OPFAMILY);
 
@@ -1592,6 +1611,9 @@ find_cmp_func(FmgrInfo *finfo, Oid type1, Oid type2)
                                      tce_1->btree_opintype,
                                      tce_2->btree_opintype,
                                      BTORDER_PROC);
+    if (!OidIsValid(cmp_proc_oid))
+        return;
+
     fmgr_info(cmp_proc_oid, finfo);
 }
 
