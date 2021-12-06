@@ -563,58 +563,58 @@ construct_array:
     return PointerGetDatum(res);
 }
 
+extern "C" {
+#include "catalog/namespace.h"
+
+#include "internal_map.h"
+}
+
 Datum
 ParquetReader::map_to_datum(arrow::MapArray *maparray, int pos,
                             const TypeInfo &typinfo)
 {
-	JsonbParseState *parseState = NULL;
-    JsonbValue *jb;
+    internal_map *map;
     Datum       res;
+    const TypeInfo &key_typinfo = typinfo.children[0];
+    const TypeInfo &val_typinfo = typinfo.children[1];
+    Datum   *keys;
+    Datum   *values;
+    bool    *nulls;
 
-    auto keys = maparray->keys()->Slice(maparray->value_offset(pos),
+    auto k = maparray->keys()->Slice(maparray->value_offset(pos),
                                         maparray->value_length(pos));
-    auto values = maparray->items()->Slice(maparray->value_offset(pos),
+    auto v = maparray->items()->Slice(maparray->value_offset(pos),
                                            maparray->value_length(pos));
 
-    Assert(keys->length() == values->length());
+    Assert(k->length() == v->length());
     Assert(typinfo.children.size() == 2);
 
-    jb = pushJsonbValue(&parseState, WJB_BEGIN_OBJECT, NULL);
+    res = make_internal_map(key_typinfo.pg.oid, val_typinfo.pg.oid, k->length());
+    map = (internal_map *) VARDATA(res);
+    keys = INTERNAL_MAP_KEYS(map);
+    values = INTERNAL_MAP_VALUES(map);
+    nulls = INTERNAL_MAP_NULLS(map);
 
-    for (int i = 0; i < keys->length(); ++i)
+    for (int i = 0; i < k->length(); ++i)
     {
-        Datum   key = (Datum) 0,
-                value = (Datum) 0;
-        bool    isnull = false;
-        const TypeInfo &key_typinfo = typinfo.children[0];
-        const TypeInfo &val_typinfo = typinfo.children[1];
-
-        if (keys->IsNull(i))
+        if (k->IsNull(i))
             throw std::runtime_error("key is null");
         
-        if (!values->IsNull(i))
+        if (!v->IsNull(i))
         {
-            key = this->read_primitive_type(keys.get(), key_typinfo, i);
-            value = this->read_primitive_type(values.get(), val_typinfo, i);
+            keys[i]   = this->read_primitive_type(k.get(), key_typinfo, i);
+            values[i] = this->read_primitive_type(v.get(), val_typinfo, i);
+            nulls[i]  = false;
         } else
-            isnull = true;
-
-        /* TODO: adding cstring would be cheaper than adding text */
-        datum_to_jsonb(key, key_typinfo.pg.oid, false, key_typinfo.outfunc,
-                       parseState, true);
-        datum_to_jsonb(value, val_typinfo.pg.oid, isnull, val_typinfo.outfunc,
-                       parseState, false);
+            nulls[i]  = true;
     }
 
-    jb = pushJsonbValue(&parseState, WJB_END_OBJECT, NULL);
-    res = JsonbPGetDatum(JsonbValueToJsonb(jb));
-
+    /* TODO: cast is always needed for internal_map; throw an ERROR if not */
     if (typinfo.need_cast)
         res = do_cast(res, typinfo);
 
     return res;
 }
-
 
 /*
  * find_castfunc
@@ -632,7 +632,15 @@ void ParquetReader::initialize_cast(TypeInfo &typinfo, const char *attname)
     if (!OidIsValid(src_oid))
     {
         if (typinfo.arrow.type_id == arrow::Type::MAP)
-            src_oid = JSONBOID;
+        {
+            /*
+             * TODO: handle case when extension is created in non-default
+             * namespace
+             */
+            src_oid = TypenameGetTypid("internal_map");
+            if (!OidIsValid(src_oid))
+                elog(ERROR, "internal_map type not found, cannot process MAP");
+        }
         else
             elog(ERROR, "failed to initialize cast function for column '%s'",
                  attname);

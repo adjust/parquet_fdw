@@ -101,14 +101,16 @@ SELECT * FROM example_import2;
    9 | fünf  | t
 (11 rows)
 
-SELECT import_parquet(
+SELECT import_parquet_explicit(
     'example_import3',
     'public',
     'parquet_srv',
+    array['one', 'two', 'three'],
+    array['jsonb', 'jsonb', 'int4']::regtype[],
     'list_parquet_files',
     '{"dir": "@abs_srcdir@/data/complex", "type": "complex"}');
- import_parquet 
-----------------
+ import_parquet_explicit 
+-------------------------
  
 (1 row)
 

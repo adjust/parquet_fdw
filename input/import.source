@@ -50,10 +50,12 @@ SELECT import_parquet_explicit(
     '{"sorted": "one"}');
 SELECT * FROM example_import2;
 
-SELECT import_parquet(
+SELECT import_parquet_explicit(
     'example_import3',
     'public',
     'parquet_srv',
+    array['one', 'two', 'three'],
+    array['jsonb', 'jsonb', 'int4']::regtype[],
     'list_parquet_files',
     '{"dir": "@abs_srcdir@/data/complex", "type": "complex"}');
 SELECT * FROM example_import3;

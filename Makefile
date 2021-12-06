@@ -1,11 +1,11 @@
 MODULE_big = parquet_fdw
-OBJS = src/common.o src/reader.o src/exec_state.o src/parquet_impl.o src/parquet_fdw.o src/export.o
+OBJS = src/common.o src/reader.o src/exec_state.o src/parquet_impl.o src/parquet_fdw.o src/export.o src/internal_map.o
 PGFILEDESC = "parquet_fdw - foreign data wrapper for parquet"
 
 SHLIB_LINK = -lm -lstdc++ -lparquet -larrow
 
 EXTENSION = parquet_fdw
-DATA = parquet_fdw--0.1.sql parquet_fdw--0.1--0.2.sql
+DATA = parquet_fdw--0.1.sql parquet_fdw--0.1--0.2.sql parquet_fdw--0.2--0.3.sql
 
 REGRESS = parquet_fdw import
 

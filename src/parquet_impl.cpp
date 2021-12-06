@@ -788,7 +788,9 @@ extract_parquet_fields(const char *path) noexcept
                     break;
                 }
                 case arrow::Type::MAP:
-                    pg_type = JSONBOID;
+                    // pg_type = JSONBOID;
+                    /* TODO */
+                    pg_type = TypenameGetTypid("internal_map");
                     break;
                 default:
                     pg_type = to_postgres_type(type->id());
