@@ -40,7 +40,7 @@ create foreign table userdata (
 )
 server parquet_srv
 options (
-    filename '/mnt/userdata1.parquet',
+    filename '/mnt/userdata1.parquet'
 );
 ```
 
