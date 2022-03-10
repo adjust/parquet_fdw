@@ -248,6 +248,15 @@ extract_rowgroup_filters(List *scan_clauses,
         else
             continue;
 
+        /*
+         * System columns should not be extract to filter, since
+         * we don't make any effort to ensure that local and
+         * remote values match (tableoid, in particular, almost
+         * certainly doesn't match).
+         */
+        if (v->varattno < 0)
+            continue;
+
         RowGroupFilter f
         {
             .attnum = v->varattno,
