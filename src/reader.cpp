@@ -1028,7 +1028,7 @@ public:
 
     void rescan(void)
     {
-        this->row_group = 0;
+        this->row_group = -1;
         this->row = 0;
         this->num_rows = 0;
     }
@@ -1380,7 +1380,7 @@ public:
 
     void rescan(void)
     {
-        this->row_group = 0;
+        this->row_group = -1;
         this->row = 0;
         this->num_rows = 0;
     }
