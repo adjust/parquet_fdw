@@ -1265,7 +1265,7 @@ parquetGetForeignPaths(PlannerInfo *root,
                                                     startup_cost,
                                                     total_cost,
                                                     NULL,   /* no pathkeys */
-                                                    NULL,	/* no outer rel either */
+                                                    baserel->lateral_relids,
                                                     NULL,	/* no extra plan */
                                                     (List *) fdw_private);
     if (!enable_multifile && is_multi)
@@ -1291,7 +1291,7 @@ parquetGetForeignPaths(PlannerInfo *root,
                                                 startup_cost,
                                                 total_cost,
                                                 pathkeys,
-                                                NULL,	/* no outer rel either */
+                                                baserel->lateral_relids,
                                                 NULL,	/* no extra plan */
                                                 (List *) private_sort);
 
@@ -1330,7 +1330,7 @@ parquetGetForeignPaths(PlannerInfo *root,
                                          startup_cost,
                                          total_cost,
                                          use_pathkeys ? pathkeys : NULL,
-                                         NULL,	/* no outer rel either */
+                                         baserel->lateral_relids,
                                          NULL,	/* no extra plan */
                                          (List *) private_parallel);
 
@@ -1365,7 +1365,7 @@ parquetGetForeignPaths(PlannerInfo *root,
                                              startup_cost,
                                              total_cost,
                                              pathkeys,
-                                             NULL,	/* no outer rel either */
+                                             baserel->lateral_relids,
                                              NULL,	/* no extra plan */
                                              (List *) private_parallel_merge);
 
