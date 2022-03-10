@@ -111,6 +111,33 @@ struct RowGroupFilter
 };
 
 /*
+ * Indexes of FDW-private information stored in fdw_private lists.
+ *
+ * These items are indexed with the enum FdwScanPrivateIndex, so an item
+ * can be fetched with list_nth().  For example, to get the filenames:
+ *		sql = strVal(list_nth(fdw_private, FdwScanPrivateFileNames));
+ */
+enum FdwScanPrivateIndex
+{
+    /* List of paths to Parquet files */
+	FdwScanPrivateFileNames,
+    /* List of Attributes actually used in query */
+	FdwScanPrivateAttributesUsed,
+    /* List of columns that Parquet files are presorted by */
+    FdwScanPrivateAttributesSorted,
+    /* use_mmap flag (as an integer Value node) */
+    FdwScanPrivateUseMmap,
+    /* use_threads flag (as an integer Value node) */
+    FdwScanPrivateUse_Threads,
+    /* ReaderType of Parquet files */
+    FdwScanPrivateType,
+    /* The limit for the number of Parquet files open simultaneously. */
+    FdwScanPrivateMaxOpenFiles,
+    /* List of Lists (per filename) */
+    FdwScanPrivateRowGroups,
+};
+
+/*
  * Plain C struct for fdw_state
  */
 struct ParquetFdwPlanState
@@ -1475,30 +1502,30 @@ parquetBeginForeignScan(ForeignScanState *node, int /* eflags */)
     {
         switch(i)
         {
-            case 0:
+            case FdwScanPrivateFileNames:
                 filenames = (List *) lfirst(lc);
                 break;
-            case 1:
+            case FdwScanPrivateAttributesUsed:
                 attrs_list = (List *) lfirst(lc);
                 foreach (lc2, attrs_list)
                     attrs_used.insert(lfirst_int(lc2));
                 break;
-            case 2:
+            case FdwScanPrivateAttributesSorted:
                 attrs_sorted = (List *) lfirst(lc);
                 break;
-            case 3:
+            case FdwScanPrivateUseMmap:
                 use_mmap = (bool) intVal((Value *) lfirst(lc));
                 break;
-            case 4:
+            case FdwScanPrivateUse_Threads:
                 use_threads = (bool) intVal((Value *) lfirst(lc));
                 break;
-            case 5:
+            case FdwScanPrivateType:
                 reader_type = (ReaderType) intVal((Value *) lfirst(lc));
                 break;
-            case 6:
+            case FdwScanPrivateMaxOpenFiles:
                 max_open_files = intVal((Value *) lfirst(lc));
                 break;
-            case 7:
+            case FdwScanPrivateRowGroups:
                 rowgroups_list = (List *) lfirst(lc);
                 break;
         }
@@ -1794,8 +1821,8 @@ parquetExplainForeignScan(ForeignScanState *node, ExplainState *es)
 
 	fdw_private = ((ForeignScan *) node->ss.ps.plan)->fdw_private;
     filenames = (List *) linitial(fdw_private);
-    reader_type = (ReaderType) intVal((Value *) list_nth(fdw_private, 5));
-    rowgroups_list = (List *) llast(fdw_private);
+    reader_type = (ReaderType) intVal((Value *) list_nth(fdw_private, FdwScanPrivateType));
+    rowgroups_list = (List *) list_nth(fdw_private, FdwScanPrivateRowGroups);
 
     switch (reader_type)
     {
