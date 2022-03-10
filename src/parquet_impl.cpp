@@ -1863,6 +1863,11 @@ parquetIsForeignScanParallelSafe(PlannerInfo * /* root */,
                                  RelOptInfo *rel,
                                  RangeTblEntry * /* rte */)
 {
+    /* Plan nodes that reference a correlated SubPlan is always parallel restricted. 
+     * Therefore, return false when there is lateral join.
+     */
+    if (rel->lateral_relids)
+        return false;
     return true;
 }
 
