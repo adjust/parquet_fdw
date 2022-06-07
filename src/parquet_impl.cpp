@@ -689,8 +689,8 @@ extract_rowgroups_list(const char *filename,
     }
     if (!error.empty()) {
         elog(ERROR,
-             "parquet_fdw: failed to exctract row groups from Parquet file: %s",
-             error.c_str());
+             "parquet_fdw: failed to extract row groups from Parquet file: %s ('%s')",
+             error.c_str(), filename);
     }
 
     return rowgroups;
