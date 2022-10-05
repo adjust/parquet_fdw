@@ -3,7 +3,8 @@
 
 #include <cstdarg>
 #include <cstddef>
-
+#include <iostream>
+using namespace std;
 #include "arrow/api.h"
 
 extern "C"
@@ -22,13 +23,18 @@ extern "C"
 #define to_postgres_timestamp(tstype, i, ts)                    \
     switch ((tstype)->unit()) {                                 \
         case arrow::TimeUnit::SECOND:                           \
-            ts = time_t_to_timestamptz((i)); break;             \
+            ts = time_t_to_timestamptz((i));                    \
+            break;                                              \
         case arrow::TimeUnit::MILLI:                            \
-            ts = time_t_to_timestamptz((i) / 1000); break;      \
+            ts = time_t_to_timestamptz((i) / 1000);             \
+            ts = TimestampTzPlusMilliseconds(ts, i % 1000);     \
+            break;                                              \
         case arrow::TimeUnit::MICRO:                            \
-            ts = time_t_to_timestamptz((i) / 1000000); break;   \
+            ts = time_t_to_timestamptz((i) / 1000000);          \
+            break;                                              \
         case arrow::TimeUnit::NANO:                             \
-            ts = time_t_to_timestamptz((i) / 1000000000); break;\
+            ts = time_t_to_timestamptz((i) / 1000000000);       \
+            break;                                              \
         default:                                                \
             elog(ERROR, "Timestamp of unknown precision: %d",   \
                  (tstype)->unit());                             \
