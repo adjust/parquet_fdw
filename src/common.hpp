@@ -3,8 +3,7 @@
 
 #include <cstdarg>
 #include <cstddef>
-#include <iostream>
-using namespace std;
+
 #include "arrow/api.h"
 
 extern "C"
@@ -31,6 +30,7 @@ extern "C"
             break;                                              \
         case arrow::TimeUnit::MICRO:                            \
             ts = time_t_to_timestamptz((i) / 1000000);          \
+            ts = ((ts) + (i % 1000000));                        \
             break;                                              \
         case arrow::TimeUnit::NANO:                             \
             ts = time_t_to_timestamptz((i) / 1000000000);       \
