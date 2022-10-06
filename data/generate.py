@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 # example1.parquet file
 df1 = pd.DataFrame({'one': [1, 2, 3],
@@ -24,9 +24,9 @@ table1 = pa.Table.from_pandas(df1)
 df2 = pd.DataFrame({'one': [4, 5, 6],
                     'two': [[10, 11, 12], [13, 14, 15], [16, 17, 18]],
                     'three': ['uno', 'dos', 'tres'],
-                    'four': [datetime(2018, 1, 4),
-                             datetime(2018, 1, 5),
-                             datetime(2018, 1, 6)],
+                    'four': [datetime(2018, 1, 4) + timedelta(seconds=10),
+                             datetime(2018, 1, 5) + timedelta(milliseconds=10),
+                             datetime(2018, 1, 6) + timedelta(microseconds=10)],
                     'five': [date(2018, 1, 4),
                              date(2018, 1, 5),
                              date(2018, 1, 6)],
