@@ -47,6 +47,7 @@ extern "C"
 #include "nodes/execnodes.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/makefuncs.h"
+#include "nodes/pathnodes.h"
 #include "optimizer/cost.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
@@ -93,6 +94,7 @@ extern "C"
 
 bool enable_multifile;
 bool enable_multifile_merge;
+bool force_multifile_merge;
 
 
 static void find_cmp_func(FmgrInfo *finfo, Oid type1, Oid type2);
@@ -368,7 +370,7 @@ row_group_matches_filter(parquet::Statistics *stats,
          */
 
         /*
-         * Extract the key type (we don't check correctness here as we've 
+         * Extract the key type (we don't check correctness here as we've
          * already done this in `extract_rowgroups_list()`)
          */
         auto strct = arrow_type->fields()[0];
@@ -1170,6 +1172,12 @@ static void
 cost_merge(Path *path, uint32 nfiles, Cost input_startup_cost,
            Cost input_total_cost, double rows)
 {
+    if (force_multifile_merge) {
+        path->startup_cost = 0.0;
+        path->total_cost = 0.0;
+        return;
+    }
+
     Cost		startup_cost = 0;
     Cost		run_cost = 0;
     Cost		comparison_cost;
@@ -1233,6 +1241,8 @@ parquetGetForeignPaths(PlannerInfo *root,
         Oid         sort_op;
         Var        *var;
         List       *attr_pathkey;
+        ListCell   *plc;
+        bool        is_redundant = false;
 
         /* Build an expression (simple var) */
         get_atttypetypmodcoll(relid, attnum, &typid, &typmod, &collid);
@@ -1247,7 +1257,17 @@ parquetGetForeignPaths(PlannerInfo *root,
         attr_pathkey = build_expression_pathkey(root, (Expr *) var, NULL,
                                                 sort_op, baserel->relids,
                                                 true);
-        pathkeys = list_concat(pathkeys, attr_pathkey);
+
+        foreach(plc, attr_pathkey)
+        {
+            PathKey *pathkey = (PathKey *) lfirst(plc);
+
+            if (EC_MUST_BE_REDUNDANT(pathkey->pk_eclass))
+                is_redundant = true;
+    	}
+
+        if (!is_redundant)
+            pathkeys = list_concat(pathkeys, attr_pathkey);
     }
 
     foreign_path = (Path *) create_foreignscan_path(root, baserel,
@@ -2044,7 +2064,7 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
         else if (strcmp(def->defname, "files_func") == 0)
         {
             Oid     jsonboid = JSONBOID;
-            List   *funcname = stringToQualifiedNameList(defGetString(def)); 
+            List   *funcname = stringToQualifiedNameList(defGetString(def));
             Oid     funcoid;
             Oid     rettype;
 
@@ -2062,7 +2082,7 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
         }
         else if (strcmp(def->defname, "files_func_arg") == 0)
         {
-            /* 
+            /*
              * Try to convert the string value into JSONB to validate it is
              * properly formatted.
              */

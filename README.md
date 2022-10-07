@@ -88,6 +88,7 @@ GUC variables:
 * **parquet_fdw.use_threads** - global switch that allow user to enable or disable threads (default `true`);
 * **parquet_fdw.enable_multifile** - enable Multifile reader (default `true`).
 * **parquet_fdw.enable_multifile_merge** - enable Multifile Merge reader (default `true`).
+* **parquet_fdw.force_multifile_merge** - always choose Multifile Merge reader (default `false`).
 
 ### Parallel queries
 

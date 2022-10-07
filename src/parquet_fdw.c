@@ -63,6 +63,7 @@ extern Datum parquet_fdw_validator_impl(PG_FUNCTION_ARGS);
 extern bool parquet_fdw_use_threads;
 extern bool enable_multifile;
 extern bool enable_multifile_merge;
+extern bool force_multifile_merge;
 
 void
 _PG_init(void)
@@ -94,6 +95,17 @@ _PG_init(void)
 							NULL,
 							&enable_multifile_merge,
 							true,
+							PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomBoolVariable("parquet_fdw.force_multifile_merge",
+							"Always use Multifile Merge reader",
+							NULL,
+							&force_multifile_merge,
+							false,
 							PGC_USERSET,
 							0,
 							NULL,
