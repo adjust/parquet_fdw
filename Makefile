@@ -36,6 +36,14 @@ endif
 # (this happens on travis-ci). Redefine COMPILE.cxx.bc without this option.
 COMPILE.cxx.bc = $(CLANG) -xc++ -Wno-ignored-attributes $(BITCODE_CXXFLAGS) $(CPPFLAGS) -emit-llvm -c
 
+# gcc 10.1 enables moutline-atomics per default on aarch64
+# including the deprecated flag breaks compilation
+GCC_GTEQ_1001 := $(shell expr `gcc -dumpfullversion -dumpversion | sed -e 's/\.\([0-9][0-9]\)/\1/g' -e 's/\.\([0-9]\)/0\1/g' -e 's/^[0-9]\{3,4\}$$/&00/'` \>= 100100)
+
+ifeq "$(GCC_GTEQ_1001)" "1"
+override CXXFLAGS := $(filter-out -moutline-atomics, $(CXXFLAGS))
+endif
+
 # XXX: a hurdle to use common compiler flags when building bytecode from C++
 # files. should be not unnecessary, but src/Makefile.global omits passing those
 # flags for an unnknown reason.
