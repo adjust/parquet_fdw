@@ -119,4 +119,5 @@ SELECT * FROM example_import3;
  {"4": "test1", "5": "test2"}         | {"2018-01-03": 20, "2018-01-04": 25} |     2
 (2 rows)
 
+DROP OWNED by regress_parquet_fdw;
 DROP EXTENSION parquet_fdw CASCADE;

@@ -1,0 +1,31 @@
+SET datestyle = 'ISO';
+SET client_min_messages = WARNING;
+SET log_statement TO 'none';
+CREATE EXTENSION parquet_fdw;
+DROP ROLE IF EXISTS regress_parquet_fdw;
+CREATE ROLE regress_parquet_fdw LOGIN SUPERUSER;
+
+SET ROLE regress_parquet_fdw;
+CREATE SERVER parquet_srv FOREIGN DATA WRAPPER parquet_fdw;
+CREATE USER MAPPING FOR regress_parquet_fdw SERVER parquet_srv;
+
+SET ROLE regress_parquet_fdw;
+
+CREATE TABLE example_part (
+    id      int,
+    date    timestamp,
+    num     int
+)
+PARTITION BY range(date);
+
+CREATE FOREIGN TABLE example_part1
+PARTITION OF example_part FOR VALUES FROM ('2018-01-01') TO ('2018-02-01')
+SERVER parquet_srv
+OPTIONS (filename '@abs_srcdir@/data/partition/example_part1.parquet', sorted 'id date');
+
+CREATE FOREIGN TABLE example_part2
+PARTITION OF example_part FOR VALUES FROM ('2018-02-01') TO ('2018-03-01')
+SERVER parquet_srv
+OPTIONS (filename '@abs_srcdir@/data/partition/example_part2.parquet', sorted 'id date');
+
+SELECT * FROM example_part WHERE date = '2018-01-01';
