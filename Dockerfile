@@ -18,4 +18,4 @@ RUN apt-get update && \
 
 USER postgres
 
-ENTRYPOINT PGDATA=${PGDATA} bash /src/run_tests.sh
+ENTRYPOINT PGDATA=${PGDATA} bash /src/test/run_tests.sh

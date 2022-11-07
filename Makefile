@@ -12,7 +12,7 @@ INPUT_TEST = $(sort $(wildcard test/input/*.source))
 REGRESS = $(patsubst test/input/%.source,%,$(INPUT_TEST))
 EXTRA_CLEAN = $(patsubst test/input/%.source,test/sql/%.sql,$(INPUT_TEST)) \
 	$(patsubst test/input/%.source,test/expected/%.out,$(INPUT_TEST))
-REGRESS_OPTS = --inputdir=test
+REGRESS_OPTS = --inputdir=test --outputdir=test
 
 PG_CONFIG ?= pg_config
 
