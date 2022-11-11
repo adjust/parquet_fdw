@@ -28,4 +28,6 @@ PARTITION OF example_part FOR VALUES FROM ('2018-02-01') TO ('2018-03-01')
 SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/partition/example_part2.parquet', sorted 'id date');
 
+SELECT * FROM example_part WHERE id = 1;
+
 SELECT * FROM example_part WHERE date = '2018-01-01';

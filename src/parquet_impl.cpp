@@ -1209,6 +1209,7 @@ parquetGetForeignPaths(PlannerInfo *root,
     List       *pathkeys = NIL;
     std::list<RowGroupFilter> filters;
     ListCell   *lc;
+    ListCell   *lc2;
 
     fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
 
@@ -1222,9 +1223,10 @@ parquetGetForeignPaths(PlannerInfo *root,
     fdw_private->type = is_multi ? RT_MULTI :
         (list_length(fdw_private->filenames) == 0 ? RT_TRIVIAL : RT_SINGLE);
 
-    /* Build pathkeys based on attrs_sorted */
-    foreach (lc, fdw_private->attrs_sorted)
+    /* Build pathkeys based on attrs_sorted and ORDER BY clause passed by user */
+    forboth (lc, fdw_private->attrs_sorted, lc2, root->sort_pathkeys)
     {
+        PathKey    *root_pathkey = (PathKey *) lfirst(lc2);
         Oid         relid = root->simple_rte_array[baserel->relid]->relid;
         int         attnum = lfirst_int(lc);
         Oid         typid,
@@ -1232,7 +1234,10 @@ parquetGetForeignPaths(PlannerInfo *root,
         int32       typmod;
         Oid         sort_op;
         Var        *var;
-        List       *attr_pathkey;
+        List       *attr_pathkeys;
+
+        if (root_pathkey->pk_eclass->ec_has_volatile)
+            break;
 
         /* Build an expression (simple var) */
         get_atttypetypmodcoll(relid, attnum, &typid, &typmod, &collid);
@@ -1244,10 +1249,22 @@ parquetGetForeignPaths(PlannerInfo *root,
                                  &sort_op, NULL, NULL,
                                  NULL);
 
-        attr_pathkey = build_expression_pathkey(root, (Expr *) var, NULL,
+        attr_pathkeys = build_expression_pathkey(root, (Expr *) var, NULL,
                                                 sort_op, baserel->relids,
                                                 true);
-        pathkeys = list_concat(pathkeys, attr_pathkey);
+
+        if (attr_pathkeys != NIL)
+        {
+            PathKey    *attr_pathkey = (PathKey *) linitial(attr_pathkeys);
+
+            if (attr_pathkey->pk_eclass != root_pathkey->pk_eclass ||
+                attr_pathkey->pk_opfamily != root_pathkey->pk_opfamily ||
+                attr_pathkey->pk_strategy != root_pathkey->pk_strategy ||
+                attr_pathkey->pk_nulls_first != root_pathkey->pk_nulls_first)
+                break;
+        }
+
+        pathkeys = list_concat(pathkeys, attr_pathkeys);
     }
 
     foreign_path = (Path *) create_foreignscan_path(root, baserel,
