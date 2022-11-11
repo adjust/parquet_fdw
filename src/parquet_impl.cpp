@@ -1257,10 +1257,7 @@ parquetGetForeignPaths(PlannerInfo *root,
         {
             PathKey    *attr_pathkey = (PathKey *) linitial(attr_pathkeys);
 
-            if (attr_pathkey->pk_eclass != root_pathkey->pk_eclass ||
-                attr_pathkey->pk_opfamily != root_pathkey->pk_opfamily ||
-                attr_pathkey->pk_strategy != root_pathkey->pk_strategy ||
-                attr_pathkey->pk_nulls_first != root_pathkey->pk_nulls_first)
+            if (!equal(attr_pathkey, root_pathkey))
                 break;
         }
 
