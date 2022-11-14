@@ -1223,7 +1223,20 @@ parquetGetForeignPaths(PlannerInfo *root,
     fdw_private->type = is_multi ? RT_MULTI :
         (list_length(fdw_private->filenames) == 0 ? RT_TRIVIAL : RT_SINGLE);
 
-    /* Build pathkeys based on attrs_sorted and ORDER BY clause passed by user */
+    /*
+     * Build pathkeys for the foreign table based on attrs_sorted and ORDER BY
+     * clause passed by user.
+     *
+     * pathkeys is used by Postgres to sort the result. After we build pathkeys
+     * for the foreign table Postgres will assume that the returned data is
+     * already sorted. In the function parquetBeginForeignScan() we make sure
+     * that the data from parquet files are sorted.
+     * 
+     * We need to make sure that we don't add PathKey for an attribute which is
+     * not passed by ORDER BY. We will stop building pathkeys as soon as we see
+     * that an attribute on ORDER BY and "sorted" doesn't match, since in that
+     * case Postgres will need to sort by remaining attributes by itself.
+     */
     forboth (lc, fdw_private->attrs_sorted, lc2, root->sort_pathkeys)
     {
         PathKey    *root_pathkey = (PathKey *) lfirst(lc2);
@@ -1239,7 +1252,7 @@ parquetGetForeignPaths(PlannerInfo *root,
         if (root_pathkey->pk_eclass->ec_has_volatile)
             break;
 
-        /* Build an expression (simple var) */
+        /* Build an expression (simple var) for the attribute */
         get_atttypetypmodcoll(relid, attnum, &typid, &typmod, &collid);
         var = makeVar(baserel->relid, attnum, typid, typmod, collid, 0);
 
@@ -1249,6 +1262,7 @@ parquetGetForeignPaths(PlannerInfo *root,
                                  &sort_op, NULL, NULL,
                                  NULL);
 
+        /* Create PathKey for the attribute from "sorted" option */
         attr_pathkeys = build_expression_pathkey(root, (Expr *) var, NULL,
                                                 sort_op, baserel->relids,
                                                 true);
@@ -1257,6 +1271,13 @@ parquetGetForeignPaths(PlannerInfo *root,
         {
             PathKey    *attr_pathkey = (PathKey *) linitial(attr_pathkeys);
 
+            /*
+             * Compare the attribute from "sorted" option and the attribute from
+             * ORDER BY clause ("root"). If they don't match stop here and use
+             * whatever pathkeys we've build so far. Postgres will use remaining
+             * attributes from ORDER BY clause to sort data on higher level of
+             * execution.
+             */
             if (!equal(attr_pathkey, root_pathkey))
                 break;
         }
