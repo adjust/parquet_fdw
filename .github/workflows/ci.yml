@@ -18,11 +18,9 @@ jobs:
             ccflags: '-DCACHING_TEST'
     name: PostgreSQL ${{ matrix.pg }}
     runs-on: ubuntu-latest
-    container: zilder/pg-ext-check
     steps:
-      - run: pg-setup ${{ matrix.pg }}
       - uses: actions/checkout@v2
-      - run: ./install_arrow.sh
-      - run: build-check
+      - run: docker build -t parquet_fdw --build-arg PG_MAJOR=${{ matrix.pg }} .
+      - run: docker run --rm parquet_fdw
         env:
           CCFLAGS: ${{ matrix.ccflags }}

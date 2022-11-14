@@ -7,14 +7,17 @@ SHLIB_LINK = -lm -lstdc++ -lparquet -larrow
 EXTENSION = parquet_fdw
 DATA = parquet_fdw--0.1.sql parquet_fdw--0.1--0.2.sql
 
-REGRESS = parquet_fdw import
+INPUT_TEST = $(sort $(wildcard test/input/*.source))
 
-EXTRA_CLEAN = sql/parquet_fdw.sql expected/parquet_fdw.out
+REGRESS = $(patsubst test/input/%.source,%,$(INPUT_TEST))
+EXTRA_CLEAN = $(patsubst test/input/%.source,test/sql/%.sql,$(INPUT_TEST)) \
+	$(patsubst test/input/%.source,test/expected/%.out,$(INPUT_TEST))
+REGRESS_OPTS = --inputdir=test --outputdir=test
 
 PG_CONFIG ?= pg_config
 
-# parquet_impl.cpp requires C++ 11.
-override PG_CXXFLAGS += -std=c++11 -O3
+# parquet_impl.cpp requires C++ 11 and latest libarrow requires C++ 17
+override PG_CXXFLAGS += -std=c++17 -O3
 
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 
@@ -34,7 +37,7 @@ endif
 
 # PostgreSQL uses link time optimization option which may break compilation
 # (this happens on travis-ci). Redefine COMPILE.cxx.bc without this option.
-COMPILE.cxx.bc = $(CLANG) -xc++ -Wno-ignored-attributes $(BITCODE_CXXFLAGS) $(CPPFLAGS) -emit-llvm -c
+COMPILE.cxx.bc = $(CLANG) -xc++ -Wno-ignored-attributes -Wno-register $(BITCODE_CXXFLAGS) $(CPPFLAGS) -emit-llvm -c
 
 # XXX: a hurdle to use common compiler flags when building bytecode from C++
 # files. should be not unnecessary, but src/Makefile.global omits passing those
