@@ -87,24 +87,3 @@ table = pa.Table.from_pandas(df, schema)
 
 with pq.ParquetWriter('complex/example3.parquet', table.schema) as writer:
     writer.write_table(table)
-
-# Parquet files for partitions
-df_part1 = pd.DataFrame({'id': [1, 1, 2],
-                         'date': [datetime(2018, 1, 1),
-                                  datetime(2018, 1, 2),
-                                  datetime(2018, 1, 3)],
-                         'num': [10, 23, 9]})
-table_part1 = pa.Table.from_pandas(df_part1)
-
-with pq.ParquetWriter('partition/example_part1.parquet', table_part1.schema) as writer:
-    writer.write_table(table_part1)
-
-df_part2 = pd.DataFrame({'id': [1, 2, 2],
-                         'date': [datetime(2018, 2, 1),
-                                  datetime(2018, 2, 2),
-                                  datetime(2018, 2, 3)],
-                         'num': [59, 1, 32]})
-table_part2 = pa.Table.from_pandas(df_part2)
-
-with pq.ParquetWriter('partition/example_part2.parquet', table_part2.schema) as writer:
-    writer.write_table(table_part2)

@@ -16,7 +16,7 @@ REGRESS_OPTS = --inputdir=test --outputdir=test
 
 PG_CONFIG ?= pg_config
 
-# parquet_impl.cpp requires C++ 11 and latest libarrow requires C++ 17
+# parquet_impl.cpp requires C++ 11 and libarrow 10+ requires C++ 17
 override PG_CXXFLAGS += -std=c++17 -O3
 
 PGXS := $(shell $(PG_CONFIG) --pgxs)
@@ -37,6 +37,10 @@ endif
 
 # PostgreSQL uses link time optimization option which may break compilation
 # (this happens on travis-ci). Redefine COMPILE.cxx.bc without this option.
+#
+# We need to use -Wno-register since C++17 raises an error if "register" keyword
+# is used. PostgreSQL headers still uses the keyword, particularly:
+# src/include/storage/s_lock.h.
 COMPILE.cxx.bc = $(CLANG) -xc++ -Wno-ignored-attributes -Wno-register $(BITCODE_CXXFLAGS) $(CPPFLAGS) -emit-llvm -c
 
 # XXX: a hurdle to use common compiler flags when building bytecode from C++
