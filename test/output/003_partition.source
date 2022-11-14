@@ -1,0 +1,102 @@
+SET datestyle = 'ISO';
+SET client_min_messages = WARNING;
+SET log_statement TO 'none';
+CREATE EXTENSION parquet_fdw;
+DROP ROLE IF EXISTS regress_parquet_fdw;
+CREATE ROLE regress_parquet_fdw LOGIN SUPERUSER;
+SET ROLE regress_parquet_fdw;
+CREATE SERVER parquet_srv FOREIGN DATA WRAPPER parquet_fdw;
+CREATE USER MAPPING FOR regress_parquet_fdw SERVER parquet_srv;
+SET ROLE regress_parquet_fdw;
+CREATE TABLE example_part (
+    id      int,
+    date    timestamp,
+    num     int
+)
+PARTITION BY range(date);
+CREATE FOREIGN TABLE example_part1
+PARTITION OF example_part FOR VALUES FROM ('2018-01-01') TO ('2018-02-01')
+SERVER parquet_srv
+OPTIONS (filename '@abs_srcdir@/data/partition/example_part1.parquet', sorted 'id date');
+CREATE FOREIGN TABLE example_part2
+PARTITION OF example_part FOR VALUES FROM ('2018-02-01') TO ('2018-03-01')
+SERVER parquet_srv
+OPTIONS (filename '@abs_srcdir@/data/partition/example_part2.parquet', sorted 'id date');
+-- Test that "sorted" option works if there is no ORDER BY
+EXPLAIN (COSTS OFF) SELECT * FROM example_part WHERE id = 1;
+             QUERY PLAN              
+-------------------------------------
+ Append
+   ->  Foreign Scan on example_part1
+         Filter: (id = 1)
+         Reader: Single File
+         Row groups: 1
+   ->  Foreign Scan on example_part2
+         Filter: (id = 1)
+         Reader: Single File
+         Row groups: 1
+(9 rows)
+
+SELECT * FROM example_part WHERE id = 1;
+ id |        date         | num 
+----+---------------------+-----
+  1 | 2018-01-01 00:00:00 |  10
+  1 | 2018-01-02 00:00:00 |  23
+  1 | 2018-02-01 00:00:00 |  59
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM example_part WHERE date = '2018-01-01';
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Foreign Scan on example_part1
+   Filter: (date = '2018-01-01 00:00:00'::timestamp without time zone)
+   Reader: Single File
+   Row groups: 1
+(4 rows)
+
+SELECT * FROM example_part WHERE date = '2018-01-01';
+ id |        date         | num 
+----+---------------------+-----
+  1 | 2018-01-01 00:00:00 |  10
+(1 row)
+
+-- Test that "sorted" option works together with ORDER BY
+EXPLAIN (COSTS OFF) SELECT * FROM example_part WHERE id = 1 ORDER BY date;
+                QUERY PLAN                 
+-------------------------------------------
+ Sort
+   Sort Key: example_part1.date
+   ->  Append
+         ->  Foreign Scan on example_part1
+               Filter: (id = 1)
+               Reader: Single File
+               Row groups: 1
+         ->  Foreign Scan on example_part2
+               Filter: (id = 1)
+               Reader: Single File
+               Row groups: 1
+(11 rows)
+
+SELECT * FROM example_part WHERE id = 1 ORDER BY date;
+ id |        date         | num 
+----+---------------------+-----
+  1 | 2018-01-01 00:00:00 |  10
+  1 | 2018-01-02 00:00:00 |  23
+  1 | 2018-02-01 00:00:00 |  59
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM example_part WHERE date = '2018-01-01' ORDER BY id;
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Foreign Scan on example_part1
+   Filter: (date = '2018-01-01 00:00:00'::timestamp without time zone)
+   Reader: Single File
+   Row groups: 1
+(4 rows)
+
+SELECT * FROM example_part WHERE date = '2018-01-01' ORDER BY id;
+ id |        date         | num 
+----+---------------------+-----
+  1 | 2018-01-01 00:00:00 |  10
+(1 row)
+
