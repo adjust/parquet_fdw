@@ -24,14 +24,14 @@ SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/partition/example_part2.parquet', sorted 'id date');
 -- Test that "sorted" option works if there is no ORDER BY
 EXPLAIN (COSTS OFF) SELECT * FROM example_part WHERE id = 1;
-             QUERY PLAN              
--------------------------------------
+                     QUERY PLAN                     
+----------------------------------------------------
  Append
-   ->  Foreign Scan on example_part1
+   ->  Foreign Scan on example_part1 example_part_1
          Filter: (id = 1)
          Reader: Single File
          Row groups: 1
-   ->  Foreign Scan on example_part2
+   ->  Foreign Scan on example_part2 example_part_2
          Filter: (id = 1)
          Reader: Single File
          Row groups: 1
@@ -46,14 +46,13 @@ SELECT * FROM example_part WHERE id = 1;
 (3 rows)
 
 EXPLAIN (COSTS OFF) SELECT * FROM example_part WHERE date = '2018-01-01';
-                                 QUERY PLAN                                  
------------------------------------------------------------------------------
- Append
-   ->  Foreign Scan on example_part1
-         Filter: (date = '2018-01-01 00:00:00'::timestamp without time zone)
-         Reader: Single File
-         Row groups: 1
-(5 rows)
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Foreign Scan on example_part1 example_part
+   Filter: (date = '2018-01-01 00:00:00'::timestamp without time zone)
+   Reader: Single File
+   Row groups: 1
+(4 rows)
 
 SELECT * FROM example_part WHERE date = '2018-01-01';
  id |        date         | num 
@@ -63,16 +62,16 @@ SELECT * FROM example_part WHERE date = '2018-01-01';
 
 -- Test that "sorted" option works together with ORDER BY
 EXPLAIN (COSTS OFF) SELECT * FROM example_part WHERE id = 1 ORDER BY date;
-                QUERY PLAN                 
--------------------------------------------
+                        QUERY PLAN                        
+----------------------------------------------------------
  Sort
-   Sort Key: example_part1.date
+   Sort Key: example_part.date
    ->  Append
-         ->  Foreign Scan on example_part1
+         ->  Foreign Scan on example_part1 example_part_1
                Filter: (id = 1)
                Reader: Single File
                Row groups: 1
-         ->  Foreign Scan on example_part2
+         ->  Foreign Scan on example_part2 example_part_2
                Filter: (id = 1)
                Reader: Single File
                Row groups: 1
@@ -87,16 +86,13 @@ SELECT * FROM example_part WHERE id = 1 ORDER BY date;
 (3 rows)
 
 EXPLAIN (COSTS OFF) SELECT * FROM example_part WHERE date = '2018-01-01' ORDER BY id;
-                                    QUERY PLAN                                     
------------------------------------------------------------------------------------
- Sort
-   Sort Key: example_part1.id
-   ->  Append
-         ->  Foreign Scan on example_part1
-               Filter: (date = '2018-01-01 00:00:00'::timestamp without time zone)
-               Reader: Single File
-               Row groups: 1
-(7 rows)
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Foreign Scan on example_part1 example_part
+   Filter: (date = '2018-01-01 00:00:00'::timestamp without time zone)
+   Reader: Single File
+   Row groups: 1
+(4 rows)
 
 SELECT * FROM example_part WHERE date = '2018-01-01' ORDER BY id;
  id |        date         | num 
