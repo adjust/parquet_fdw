@@ -195,4 +195,5 @@ ANALYZE example_sorted;
 
 SET client_min_messages = WARNING;
 
+DROP OWNED by regress_parquet_fdw;
 DROP EXTENSION parquet_fdw CASCADE;
