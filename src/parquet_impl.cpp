@@ -824,7 +824,7 @@ create_foreign_table_query(const char *tablename,
     /* append table name */
     if (schemaname)
         appendStringInfo(&str, "%s.%s (",
-                         schemaname, quote_identifier(tablename));
+                         quote_identifier(schemaname), quote_identifier(tablename));
     else
         appendStringInfo(&str, "%s (", quote_identifier(tablename));
 
@@ -838,14 +838,14 @@ create_foreign_table_query(const char *tablename,
         const char *type_name = format_type_be(pg_type);
 
         if (!is_first)
-            appendStringInfo(&str, ", %s %s", name, type_name);
+            appendStringInfo(&str, ", %s %s", quote_identifier(name), type_name);
         else
         {
-            appendStringInfo(&str, "%s %s", name, type_name);
+            appendStringInfo(&str, "%s %s", quote_identifier(name), type_name);
             is_first = false;
         }
     }
-    appendStringInfo(&str, ") SERVER %s ", servername);
+    appendStringInfo(&str, ") SERVER %s ", quote_identifier(servername));
     appendStringInfo(&str, "OPTIONS (filename '");
 
     /* list paths */
