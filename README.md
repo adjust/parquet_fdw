@@ -1,50 +1,31 @@
+Apache Parquet Foreign Data Wrapper for PostgreSQL
+==================================================
+
+This is a foreign data wrapper (FDW) to connect [PostgreSQL](https://www.postgresql.org/)
+to [Apache Parquet](https://parquet.apache.org/) in **readonly** mode.
+
 [![build](https://github.com/adjust/parquet_fdw/actions/workflows/ci.yml/badge.svg)](https://github.com/adjust/parquet_fdw/actions/workflows/ci.yml) ![experimental](https://img.shields.io/badge/status-experimental-orange)
 
-# parquet_fdw
+Contents
+--------
 
-Read-only Apache Parquet foreign data wrapper for PostgreSQL.
+1. [Features](#features)
+2. [Supported platforms](#supported-platforms)
+3. [Installation](#installation)
+4. [Usage](#usage)
+5. [Functions](#functions)
+6. [Identifier case handling](#identifier-case-handling)
+7. [Generated columns](#generated-columns)
+8. [Character set handling](#character-set-handling)
+9. [Examples](#examples)
+10. [Limitations](#limitations)
+11. [Contributing](#contributing)
+12. [Useful links](#useful-links)
+13. [License](#license)
 
-## Installation
-
-`parquet_fdw` requires `libarrow` and `libparquet` installed in your system (requires version 0.15+, for previous versions use branch [arrow-0.14](https://github.com/adjust/parquet_fdw/tree/arrow-0.14)). Please refer to [libarrow installation page](https://arrow.apache.org/install/) or [building guide](https://github.com/apache/arrow/blob/master/docs/source/developers/cpp/building.rst).
-To build `parquet_fdw` run:
-```sh
-make install
-```
-or in case when PostgreSQL is installed in a custom location:
-```sh
-make install PG_CONFIG=/path/to/pg_config
-```
-It is possible to pass additional compilation flags through either custom
-`CCFLAGS` or standard `PG_CFLAGS`, `PG_CXXFLAGS`, `PG_CPPFLAGS` variables.
-
-After extension was successfully installed run in `psql`:
-```sql
-create extension parquet_fdw;
-```
-
-## Basic usage
-
-To start using `parquet_fdw` one should first create a server and user mapping. For example:
-```sql
-create server parquet_srv foreign data wrapper parquet_fdw;
-create user mapping for postgres server parquet_srv options (user 'postgres');
-```
-
-Now you should be able to create foreign table for Parquet files.
-```sql
-create foreign table userdata (
-    id           int,
-    first_name   text,
-    last_name    text
-)
-server parquet_srv
-options (
-    filename '/mnt/userdata1.parquet'
-);
-```
-
-## Advanced
+Features
+--------
+## Common features
 
 Currently `parquet_fdw` supports the following column [types](https://github.com/apache/arrow/blob/master/cpp/src/arrow/type.h):
 
@@ -63,7 +44,63 @@ Currently `parquet_fdw` supports the following column [types](https://github.com
 |         LIST |     ARRAY |
 |          MAP |     JSONB |
 
-Currently `parquet_fdw` doesn't support structs and nested lists.
+- Parallel queries. `parquet_fdw` also supports [parallel query execution](https://www.postgresql.org/docs/current/parallel-query.html) (not to confuse with multi-threaded decoding feature of Apache Arrow).
+
+- GUC variables:
+  - **parquet_fdw.use_threads** - global switch that allow user to enable or disable threads (default `true`);
+  - **parquet_fdw.enable_multifile** - enable Multifile reader (default `true`).
+  - **parquet_fdw.enable_multifile_merge** - enable Multifile Merge reader (default `true`).
+
+- Currently `parquet_fdw` doesn't support structs and nested lists.
+
+## Pushdowning
+
+**yet not described**
+
+Supported platforms
+-------------------
+
+`parquet_fdw` was developed on Linux, and should run on any
+reasonably POSIX-compliant system.
+
+`parquet_fdw` is designed to be compatible with PostgreSQL 10 ~ 15.
+
+Installation
+------------
+### Prerequisites
+
+`parquet_fdw` requires `libarrow` and `libparquet` installed in your system (requires version 0.15+, for previous versions use branch [arrow-0.14](https://github.com/adjust/parquet_fdw/tree/arrow-0.14)). Please refer to [libarrow installation page](https://arrow.apache.org/install/) or [building guide](https://github.com/apache/arrow/blob/master/docs/source/developers/cpp/building.rst).
+
+### Source installation
+
+To build `parquet_fdw` run:
+```sh
+make install
+```
+or in case when PostgreSQL is installed in a custom location:
+```sh
+make install PG_CONFIG=/path/to/pg_config
+```
+It is possible to pass additional compilation flags through either custom
+`CCFLAGS` or standard `PG_CFLAGS`, `PG_CXXFLAGS`, `PG_CPPFLAGS` variables.
+
+Usage
+-----
+
+## CREATE SERVER options
+
+`parquet_fdw` accepts no options via the `CREATE SERVER` command.
+
+## CREATE USER MAPPING options
+
+`parquet_fdw` accepts the following options via the `CREATE USER MAPPING`
+command:
+
+- **user** as *string*
+
+  Username to use when connecting to Apache Parquet.
+
+## CREATE FOREIGN TABLE options
 
 Foreign table may be created for a single Parquet file and for a set of files. It is also possible to specify a user defined function, which would return a list of file paths. Depending on the number of files and table options `parquet_fdw` may use one of the following execution strategies:
 
@@ -74,28 +111,47 @@ Foreign table may be created for a single Parquet file and for a set of files. I
 | **Multifile Merge**     | Reader which merges presorted Parquet files so that the produced result is also ordered; used when `sorted` option is specified and the query plan implies ordering (e.g. contains `ORDER BY` clause) |
 | **Caching Multifile Merge** | Same as `Multifile Merge`, but keeps the number of simultaneously open files limited; used when the number of specified Parquet files exceeds `max_open_files` |
 
-Following table options are supported:
-* **filename** - space separated list of paths to Parquet files to read;
-* **sorted** - space separated list of columns that Parquet files are presorted by; that would help postgres to avoid redundant sorting when running query with `ORDER BY` clause or in other cases when having a presorted set is beneficial (Group Aggregate, Merge Join);
-* **files_in_order** - specifies that files specified by `filename` or returned by `files_func` are ordered according to `sorted` option and have no intersection rangewise; this allows to use `Gather Merge` node on top of parallel Multifile scan (default `false`);
-* **use_mmap** - whether memory map operations will be used instead of file read operations (default `false`);
-* **use_threads** - enables Apache Arrow's parallel columns decoding/decompression (default `false`);
-* **files_func** - user defined function that is used by parquet_fdw to retrieve the list of parquet files on each query; function must take one `JSONB` argument and return text array of full paths to parquet files;
-* **files_func_arg** - argument for the function, specified by **files_func**;
-* **max_open_files** - the limit for the number of Parquet files open simultaneously.
+`parquet_fdw` accepts the following table-level options via the
+`CREATE FOREIGN TABLE` command.
 
-GUC variables:
-* **parquet_fdw.use_threads** - global switch that allow user to enable or disable threads (default `true`);
-* **parquet_fdw.enable_multifile** - enable Multifile reader (default `true`).
-* **parquet_fdw.enable_multifile_merge** - enable Multifile Merge reader (default `true`).
+- **filename** as *string*, optional
 
-### Parallel queries
+  Space separated list of paths to Parquet files to read.
+  
+- **sorted** as *string*, optional
 
-`parquet_fdw` also supports [parallel query execution](https://www.postgresql.org/docs/current/parallel-query.html) (not to confuse with multi-threaded decoding feature of Apache Arrow).
+  Space separated list of columns that Parquet files are presorted by; that would help postgres to avoid redundant sorting when running query with `ORDER BY` clause or in other cases when having a presorted set is beneficial (Group Aggregate, Merge Join).
+  
+- **files_in_order** as *boolean*, optional
 
-### Import
+  Specifies that files specified by `filename` or returned by `files_func` are ordered according to `sorted` option and have no intersection rangewise; this allows to use `Gather Merge` node on top of parallel Multifile scan (default `false`).
+  
+- **use_mmap** as *boolean*, optional
 
-`parquet_fdw` also supports [`IMPORT FOREIGN SCHEMA`](https://www.postgresql.org/docs/current/sql-importforeignschema.html) command to discover parquet files in the specified directory on filesystem and create foreign tables according to those files. It can be used as follows:
+  Whether memory map operations will be used instead of file read operations (default `false`).
+  
+- **use_threads** as *boolean*, optional
+
+  Enables Apache Arrow's parallel columns decoding/decompression (default `false`).
+  
+- **files_func** as *string*, optional
+
+  User defined function that is used by parquet_fdw to retrieve the list of parquet files on each query; function must take one `JSONB` argument and return text array of full paths to parquet files.
+  
+- **files_func_arg** as *string*, optional
+
+  Argument for the function, specified by **files_func**.
+  
+- **max_open_files** as *string*, optional
+
+  The limit for the number of Parquet files open simultaneously.
+  
+## IMPORT FOREIGN SCHEMA options
+
+`parquet_fdw` supports [IMPORT FOREIGN SCHEMA](https://www.postgresql.org/docs/current/sql-importforeignschema.html) and 
+ accepts no custom options. `IMPORT FOREIGN SCHEMA` command discover parquet files in the specified directory on filesystem and create foreign tables according to those files.
+ 
+Example:
 
 ```sql
 import foreign schema "/path/to/directory"
@@ -155,3 +211,104 @@ select import_parquet_explicit(
 );
 ```
 
+## TRUNCATE support
+
+`parquet_fdw` as **readonly** don't implements the foreign data wrapper `TRUNCATE` API, available
+from PostgreSQL 14. 
+
+Functions
+---------
+
+As well as the standard `parquet_fdw_handler()` and `parquet_fdw_validator()`
+functions, `parquet_fdw` provides the following user-callable utility functions:
+
+Functions from this FDW in PostgreSQL catalog are **yet not described**.
+
+Identifier case handling
+------------------------
+
+PostgreSQL folds identifiers to lower case by default.
+All rules and problems with Apache Parquet identifiers **yet not tested and described**.
+
+Generated columns
+-----------------
+
+Behavoiur within generated columns **yet not tested**. Generated columns isn't conceptual
+aplicable to **readonly** data sources.
+
+For more details on generated columns see:
+
+- [Generated Columns](https://www.postgresql.org/docs/current/ddl-generated-columns.html)
+- [CREATE FOREIGN TABLE](https://www.postgresql.org/docs/current/sql-createforeigntable.html)
+
+Character set handling
+----------------------
+
+Encodings mapping between PostgeeSQL and Apache Parquet **yet not described**.
+
+Examples
+--------
+
+After extension was successfully installed run in `psql` as superuser for a database:
+```sql
+create extension parquet_fdw;
+```
+
+To start using `parquet_fdw` one should first create a server and user mapping as superuser. For example:
+```sql
+create server parquet_srv foreign data wrapper parquet_fdw;
+create user mapping for postgres server parquet_srv options (user 'postgres');
+
+-- make a {non_privileged_user} (insert a username you need) able to work with Apache Parquet
+grant usage on foreign server to {non_privileged_user};
+create user mapping for {non_privileged_user} server parquet_srv options (user '.....');
+```
+
+Now you should be able to create foreign table for Parquet files as {non_privileged_user}.
+```sql
+create foreign table userdata (
+    id           int,
+    first_name   text,
+    last_name    text
+)
+server parquet_srv
+options (
+    filename '/mnt/userdata1.parquet'
+);
+```
+
+Limitations
+-----------
+
+* Currently `parquet_fdw` doesn't support structs and nested lists.
+   
+Contributing
+------------
+
+Pull requests is welcome.
+
+Useful links
+------------
+
+### Source code
+
+ - https://github.com/pgspider/parquet_fdw
+
+### General FDW Documentation
+
+ - https://www.postgresql.org/docs/current/ddl-foreign-data.html
+ - https://www.postgresql.org/docs/current/sql-createforeigndatawrapper.html
+ - https://www.postgresql.org/docs/current/sql-createforeigntable.html
+ - https://www.postgresql.org/docs/current/sql-importforeignschema.html
+ - https://www.postgresql.org/docs/current/fdwhandler.html
+ - https://www.postgresql.org/docs/current/postgres-fdw.html
+
+### Other FDWs
+
+ - https://wiki.postgresql.org/wiki/Fdw
+ - https://pgxn.org/tag/fdw/
+ 
+License
+-------
+
+See the [`LICENSE`](LICENSE) file for full details.
