@@ -826,7 +826,7 @@ create_foreign_table_query(const char *tablename,
     /* append table name */
     if (schemaname)
         appendStringInfo(&str, "%s.%s (",
-                         schemaname, quote_identifier(tablename));
+                         quote_identifier(schemaname), quote_identifier(tablename));
     else
         appendStringInfo(&str, "%s (", quote_identifier(tablename));
 
@@ -840,14 +840,14 @@ create_foreign_table_query(const char *tablename,
         const char *type_name = format_type_be(pg_type);
 
         if (!is_first)
-            appendStringInfo(&str, ", %s %s", name, type_name);
+            appendStringInfo(&str, ", %s %s", quote_identifier(name), type_name);
         else
         {
-            appendStringInfo(&str, "%s %s", name, type_name);
+            appendStringInfo(&str, "%s %s", quote_identifier(name), type_name);
             is_first = false;
         }
     }
-    appendStringInfo(&str, ") SERVER %s ", servername);
+    appendStringInfo(&str, ") SERVER %s ", quote_identifier(servername));
     appendStringInfo(&str, "OPTIONS (filename '");
 
     /* list paths */
@@ -1216,7 +1216,8 @@ parquetGetForeignPaths(PlannerInfo *root,
     bool        is_sorted, is_multi;
     List       *pathkeys = NIL;
     std::list<RowGroupFilter> filters;
-    ListCell   *lc;
+    ListCell   *lc_sorted;
+    ListCell   *lc_rootsort;
 
     fdw_private = (ParquetFdwPlanState *) baserel->fdw_private;
 
@@ -1230,21 +1231,38 @@ parquetGetForeignPaths(PlannerInfo *root,
     fdw_private->type = is_multi ? RT_MULTI :
         (list_length(fdw_private->filenames) == 0 ? RT_TRIVIAL : RT_SINGLE);
 
-    /* Build pathkeys based on attrs_sorted */
-    foreach (lc, fdw_private->attrs_sorted)
+    /*
+     * Build pathkeys for the foreign table based on attrs_sorted and ORDER BY
+     * clause passed by user.
+     *
+     * pathkeys is used by Postgres to sort the result. After we build pathkeys
+     * for the foreign table Postgres will assume that the returned data is
+     * already sorted. In the function parquetBeginForeignScan() we make sure
+     * that the data from parquet files are sorted.
+     * 
+     * We need to make sure that we don't add PathKey for an attribute which is
+     * not passed by ORDER BY. We will stop building pathkeys as soon as we see
+     * that an attribute on ORDER BY and "sorted" doesn't match, since in that
+     * case Postgres will need to sort by remaining attributes by itself.
+     */
+    lc_rootsort = list_head(root->sort_pathkeys);
+    foreach (lc_sorted, fdw_private->attrs_sorted)
     {
         Oid         relid = root->simple_rte_array[baserel->relid]->relid;
-        int         attnum = lfirst_int(lc);
+        int         attnum = lfirst_int(lc_sorted);
         Oid         typid,
                     collid;
         int32       typmod;
         Oid         sort_op;
         Var        *var;
-        List       *attr_pathkey;
+        List       *attr_pathkeys;
         ListCell   *plc;
         bool        is_redundant = false;
 
-        /* Build an expression (simple var) */
+        if (lc_rootsort == NULL)
+            break;
+
+        /* Build an expression (simple var) for the attribute */
         get_atttypetypmodcoll(relid, attnum, &typid, &typmod, &collid);
         var = makeVar(baserel->relid, attnum, typid, typmod, collid, 0);
 
@@ -1254,20 +1272,43 @@ parquetGetForeignPaths(PlannerInfo *root,
                                  &sort_op, NULL, NULL,
                                  NULL);
 
-        attr_pathkey = build_expression_pathkey(root, (Expr *) var, NULL,
+        /* Create PathKey for the attribute from "sorted" option */
+        attr_pathkeys = build_expression_pathkey(root, (Expr *) var, NULL,
                                                 sort_op, baserel->relids,
                                                 true);
 
-        foreach(plc, attr_pathkey)
+        if (attr_pathkeys != NIL)
         {
-            PathKey *pathkey = (PathKey *) lfirst(plc);
+            PathKey    *attr_pathkey = (PathKey *) linitial(attr_pathkeys);
+            bool        is_redundant = false;
+            bool        is_equal = false;
 
-            if (EC_MUST_BE_REDUNDANT(pathkey->pk_eclass))
+            if (EC_MUST_BE_REDUNDANT(attr_pathkey->pk_eclass))
                 is_redundant = true;
-    	}
 
-        if (!is_redundant)
-            pathkeys = list_concat(pathkeys, attr_pathkey);
+            if (lc_rootsort != NULL)
+            {
+                PathKey    *root_pathkey = (PathKey *) lfirst(lc_rootsort);
+
+                /*
+                * Compare the attribute from "sorted" option and the attribute from
+                * ORDER BY clause ("root"). If they don't match stop here and use
+                * whatever pathkeys we've build so far. Postgres will use remaining
+                * attributes from ORDER BY clause to sort data on higher level of
+                * execution.
+                */
+                if (!equal(attr_pathkey, root_pathkey))
+                {
+                    if (!is_redundant)
+                        break;
+                }
+                else
+                    lc_rootsort = lnext(lc_rootsort);
+            }
+
+            if (!is_redundant)
+                pathkeys = list_concat(pathkeys, attr_pathkeys);
+        }
     }
 
     foreign_path = (Path *) create_foreignscan_path(root, baserel,
