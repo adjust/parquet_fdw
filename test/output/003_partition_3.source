@@ -62,20 +62,18 @@ SELECT * FROM example_part WHERE date = '2018-01-01';
 
 -- Test that "sorted" option works together with ORDER BY
 EXPLAIN (COSTS OFF) SELECT * FROM example_part WHERE id = 1 ORDER BY date;
-                        QUERY PLAN                        
-----------------------------------------------------------
- Sort
-   Sort Key: example_part.date
-   ->  Append
-         ->  Foreign Scan on example_part1 example_part_1
-               Filter: (id = 1)
-               Reader: Single File
-               Row groups: 1
-         ->  Foreign Scan on example_part2 example_part_2
-               Filter: (id = 1)
-               Reader: Single File
-               Row groups: 1
-(11 rows)
+                     QUERY PLAN                     
+----------------------------------------------------
+ Append
+   ->  Foreign Scan on example_part1 example_part_1
+         Filter: (id = 1)
+         Reader: Single File
+         Row groups: 1
+   ->  Foreign Scan on example_part2 example_part_2
+         Filter: (id = 1)
+         Reader: Single File
+         Row groups: 1
+(9 rows)
 
 SELECT * FROM example_part WHERE id = 1 ORDER BY date;
  id |        date         | num 

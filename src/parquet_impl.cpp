@@ -47,7 +47,6 @@ extern "C"
 #include "nodes/execnodes.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/makefuncs.h"
-#include "nodes/pathnodes.h"
 #include "optimizer/cost.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
@@ -94,7 +93,6 @@ extern "C"
 
 bool enable_multifile;
 bool enable_multifile_merge;
-bool force_multifile_merge;
 
 
 static void find_cmp_func(FmgrInfo *finfo, Oid type1, Oid type2);
@@ -1172,12 +1170,6 @@ static void
 cost_merge(Path *path, uint32 nfiles, Cost input_startup_cost,
            Cost input_total_cost, double rows)
 {
-    if (force_multifile_merge) {
-        path->startup_cost = 0.0;
-        path->total_cost = 0.0;
-        return;
-    }
-
     Cost		startup_cost = 0;
     Cost		run_cost = 0;
     Cost		comparison_cost;
@@ -1256,8 +1248,6 @@ parquetGetForeignPaths(PlannerInfo *root,
         Oid         sort_op;
         Var        *var;
         List       *attr_pathkeys;
-        ListCell   *plc;
-        bool        is_redundant = false;
 
         if (lc_rootsort == NULL)
             break;
@@ -1291,19 +1281,25 @@ parquetGetForeignPaths(PlannerInfo *root,
                 PathKey    *root_pathkey = (PathKey *) lfirst(lc_rootsort);
 
                 /*
-                * Compare the attribute from "sorted" option and the attribute from
-                * ORDER BY clause ("root"). If they don't match stop here and use
-                * whatever pathkeys we've build so far. Postgres will use remaining
-                * attributes from ORDER BY clause to sort data on higher level of
-                * execution.
-                */
+                 * Compare the attribute from "sorted" option and the attribute from
+                 * ORDER BY clause ("root"). If they don't match stop here and use
+                 * whatever pathkeys we've build so far. Postgres will use remaining
+                 * attributes from ORDER BY clause to sort data on higher level of
+                 * execution.
+                 */
                 if (!equal(attr_pathkey, root_pathkey))
                 {
                     if (!is_redundant)
                         break;
                 }
                 else
+                {
+#if PG_VERSION_NUM < 130000
                     lc_rootsort = lnext(lc_rootsort);
+#else
+                    lc_rootsort = lnext(root->sort_pathkeys, lc_rootsort);
+#endif
+                }
             }
 
             if (!is_redundant)
@@ -1323,7 +1319,7 @@ parquetGetForeignPaths(PlannerInfo *root,
     if (!enable_multifile && is_multi)
         foreign_path->total_cost += disable_cost;
 
-    add_path(baserel, (Path *) foreign_path);
+    add_path(baserel, foreign_path);
 
     if (fdw_private->type == RT_TRIVIAL)
         return;
@@ -1354,7 +1350,7 @@ parquetGetForeignPaths(PlannerInfo *root,
                 RT_CACHING_MULTI_MERGE : RT_MULTI_MERGE;
 
             cost_merge((Path *) path, list_length(private_sort->filenames),
-                       startup_cost, total_cost, private_sort->matched_rows);
+                       startup_cost, total_cost, path->rows);
 
             if (!enable_multifile_merge)
                 path->total_cost += disable_cost;
@@ -1366,7 +1362,9 @@ parquetGetForeignPaths(PlannerInfo *root,
     if (baserel->consider_parallel > 0)
     {
         ParquetFdwPlanState *private_parallel;
-        bool use_pathkeys = false;
+        bool        use_pathkeys = false;
+        int         num_workers = max_parallel_workers_per_gather;
+        double      rows_per_worker = baserel->rows / (num_workers + 1);
 
         private_parallel = (ParquetFdwPlanState *) palloc(sizeof(ParquetFdwPlanState));
         memcpy(private_parallel, fdw_private, sizeof(ParquetFdwPlanState));
@@ -1378,18 +1376,14 @@ parquetGetForeignPaths(PlannerInfo *root,
         Path *path = (Path *)
                  create_foreignscan_path(root, baserel,
                                          NULL,	/* default pathtarget */
-                                         baserel->rows,
+                                         rows_per_worker,
                                          startup_cost,
-                                         total_cost,
+                                         startup_cost + run_cost / (num_workers + 1),
                                          use_pathkeys ? pathkeys : NULL,
                                          NULL,	/* no outer rel either */
                                          NULL,	/* no extra plan */
                                          (List *) private_parallel);
 
-        int num_workers = max_parallel_workers_per_gather;
-
-        path->rows = path->rows / (num_workers + 1);
-        path->total_cost       = startup_cost + run_cost / (num_workers + 1);
         path->parallel_workers = num_workers;
         path->parallel_aware   = true;
         path->parallel_safe    = true;
@@ -1413,7 +1407,7 @@ parquetGetForeignPaths(PlannerInfo *root,
             Path *path = (Path *)
                      create_foreignscan_path(root, baserel,
                                              NULL,	/* default pathtarget */
-                                             baserel->rows,
+                                             rows_per_worker,
                                              startup_cost,
                                              total_cost,
                                              pathkeys,
@@ -1421,12 +1415,9 @@ parquetGetForeignPaths(PlannerInfo *root,
                                              NULL,	/* no extra plan */
                                              (List *) private_parallel_merge);
 
-            int num_workers = max_parallel_workers_per_gather;
-
             cost_merge(path, list_length(private_parallel_merge->filenames),
-                       startup_cost, total_cost, private_parallel_merge->matched_rows);
+                       startup_cost, total_cost, path->rows);
 
-            path->rows = path->rows / (num_workers + 1);
             path->total_cost = path->startup_cost + path->total_cost / (num_workers + 1);
             path->parallel_workers = num_workers;
             path->parallel_aware   = true;
