@@ -6,6 +6,8 @@ to [Apache Parquet](https://parquet.apache.org/) in **readonly** mode.
 
 [![build](https://github.com/adjust/parquet_fdw/actions/workflows/ci.yml/badge.svg)](https://github.com/adjust/parquet_fdw/actions/workflows/ci.yml) ![experimental](https://img.shields.io/badge/status-experimental-orange)
 
+<img src="https://upload.wikimedia.org/wikipedia/commons/2/29/Postgresql_elephant.svg" align="center" height="100" alt="PostgreSQL"/>	+	<img src="https://img.stackshare.io/service/4264/OGYr_m6J_400x400.jpeg" align="center" height="100" alt="Parquet"/>
+
 Contents
 --------
 
