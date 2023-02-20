@@ -1207,6 +1207,7 @@ parquetGetForeignPaths(PlannerInfo *root,
     Cost        run_cost;
     bool        is_sorted, is_multi;
     List       *pathkeys = NIL;
+    List       *source_pathkeys = NIL;
     std::list<RowGroupFilter> filters;
     ListCell   *lc_sorted;
     ListCell   *lc_rootsort;
@@ -1225,7 +1226,7 @@ parquetGetForeignPaths(PlannerInfo *root,
 
     /*
      * Build pathkeys for the foreign table based on attrs_sorted and ORDER BY
-     * clause passed by user.
+     * (or WINDOW FUNCTION) clause passed by user.
      *
      * pathkeys is used by Postgres to sort the result. After we build pathkeys
      * for the foreign table Postgres will assume that the returned data is
@@ -1237,7 +1238,12 @@ parquetGetForeignPaths(PlannerInfo *root,
      * that an attribute on ORDER BY and "sorted" doesn't match, since in that
      * case Postgres will need to sort by remaining attributes by itself.
      */
-    lc_rootsort = list_head(root->sort_pathkeys);
+    if (root->sort_pathkeys != NIL)
+        source_pathkeys = root->sort_pathkeys;
+    else
+        source_pathkeys = root->window_pathkeys;
+    lc_rootsort = list_head(source_pathkeys);
+
     foreach (lc_sorted, fdw_private->attrs_sorted)
     {
         Oid         relid = root->simple_rte_array[baserel->relid]->relid;
@@ -1297,7 +1303,7 @@ parquetGetForeignPaths(PlannerInfo *root,
 #if PG_VERSION_NUM < 130000
                     lc_rootsort = lnext(lc_rootsort);
 #else
-                    lc_rootsort = lnext(root->sort_pathkeys, lc_rootsort);
+                    lc_rootsort = lnext(source_pathkeys, lc_rootsort);
 #endif
                 }
             }
