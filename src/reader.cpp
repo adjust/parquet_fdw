@@ -893,8 +893,8 @@ public:
             ->ReadTable(this->indices, &this->table);
 
         if (!status.ok())
-            throw Error("failed to read rowgroup #%i: %s",
-                        rowgroup, status.message().c_str());
+            throw Error("failed to read rowgroup #%i: %s (%s)",
+                        rowgroup, status.message().c_str(), this->filename.c_str());
 
         if (!this->table)
             throw std::runtime_error("got empty table");
@@ -1128,8 +1128,8 @@ public:
             ->RowGroup(rowgroup)
             ->ReadTable(this->indices, &table);
         if (!status.ok())
-            throw Error("failed to read rowgroup #%i: %s",
-                        rowgroup, status.message().c_str());
+            throw Error("failed to read rowgroup #%i: %s (%s)",
+                        rowgroup, status.message().c_str(), this->filename.c_str());
 
         /* Release resources acquired in the previous iteration */
         allocator->recycle();
