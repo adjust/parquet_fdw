@@ -166,7 +166,7 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, const std::set<in
     auto    p_schema = this->reader->parquet_reader()->metadata()->schema();
 
     if (!parquet::arrow::SchemaManifest::Make(p_schema, nullptr, props, &manifest).ok())
-        throw Error("error creating arrow schema ('%s')", this->filename);
+        throw Error("error creating arrow schema ('%s')", this->filename.c_str());
 
     this->map.resize(tupleDesc->natts);
     for (int i = 0; i < tupleDesc->natts; i++)
@@ -191,7 +191,7 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, const std::set<in
 
             if (field_name.length() > NAMEDATALEN)
                 throw Error("parquet column name '%s' is too long (max: %d, file: '%s')",
-                            field_name.c_str(), NAMEDATALEN - 1, this->filename);
+                            field_name.c_str(), NAMEDATALEN - 1, this->filename.c_str());
             tolowercase(schema_field.field->name().c_str(), arrow_colname);
 
             /*
