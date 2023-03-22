@@ -560,7 +560,8 @@ extract_rowgroups_list(const char *filename,
                 &reader);
 
         if (!status.ok())
-            throw Error("failed to open Parquet file %s", status.message().c_str());
+            throw Error("failed to open Parquet file: %s ('%s')",
+                        status.message().c_str(), filename);
 
         auto meta = reader->parquet_reader()->metadata();
         parquet::ArrowReaderProperties  props;
@@ -569,7 +570,7 @@ extract_rowgroups_list(const char *filename,
         status = parquet::arrow::SchemaManifest::Make(meta->schema(), nullptr,
                                                       props, &manifest);
         if (!status.ok())
-            throw Error("error creating arrow schema");
+            throw Error("error creating arrow schema ('%s')", filename);
 
         /* Check each row group whether it matches the filters */
         for (int r = 0; r < reader->num_row_groups(); r++)
@@ -725,12 +726,12 @@ extract_parquet_fields(const char *path) noexcept
                     parquet::ParquetFileReader::OpenFile(path, false),
                     &reader);
         if (!status.ok())
-            throw Error("failed to open Parquet file %s",
-                                 status.message().c_str());
+            throw Error("failed to open Parquet file %s ('%s')",
+                        status.message().c_str(), path);
 
         auto p_schema = reader->parquet_reader()->metadata()->schema();
         if (!parquet::arrow::SchemaManifest::Make(p_schema, nullptr, props, &manifest).ok())
-            throw std::runtime_error("error creating arrow schema");
+            throw Error("error creating arrow schema ('%s')", path);
 
         fields = (FieldInfo *) exc_palloc(
                 sizeof(FieldInfo) * manifest.schema_fields.size());
@@ -750,7 +751,7 @@ extract_parquet_fields(const char *path) noexcept
                     bool    error = false;
 
                     if (type->num_fields() != 1)
-                        throw std::runtime_error("lists of structs are not supported");
+                        throw Error("lists of structs are not supported ('%s')", path);
 
                     subtype_id = get_arrow_list_elem_type(type.get());
                     pg_subtype = to_postgres_type(subtype_id);
@@ -767,7 +768,8 @@ extract_parquet_fields(const char *path) noexcept
                     PG_END_TRY();
 
                     if (error)
-                        throw std::runtime_error("failed to get the type of array elements");
+                        throw Error("failed to get the type of array elements for %d",
+                                    pg_subtype);
                     break;
                 }
                 case arrow::Type::MAP:
@@ -789,7 +791,7 @@ extract_parquet_fields(const char *path) noexcept
             }
             else
             {
-                throw Error("cannot convert field '%s' of type '%s' in %s",
+                throw Error("cannot convert field '%s' of type '%s' in '%s'",
                             field->name().c_str(), type->name().c_str(), path);
             }
         }
