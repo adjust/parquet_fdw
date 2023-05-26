@@ -144,7 +144,7 @@ Foreign table may be created for a single Parquet file and for a set of files. I
 
   Argument for the function, specified by **files_func**.
   
-- **max_open_files** as *string*, optional, no default
+- **max_open_files** as *integer*, optional
 
   The limit for the number of Parquet files open simultaneously.
   
