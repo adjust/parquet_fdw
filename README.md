@@ -98,7 +98,7 @@ Usage
 `parquet_fdw` accepts the following options via the `CREATE USER MAPPING`
 command:
 
-- **user** as *string*
+- **user** as *string*, no default
 
   Username to use when connecting to Apache Parquet.
 
@@ -116,35 +116,35 @@ Foreign table may be created for a single Parquet file and for a set of files. I
 `parquet_fdw` accepts the following table-level options via the
 `CREATE FOREIGN TABLE` command.
 
-- **filename** as *string*, optional
+- **filename** as *string*, optional, no default
 
   Space separated list of paths to Parquet files to read.
   
-- **sorted** as *string*, optional
+- **sorted** as *string*, optional, no default
 
   Space separated list of columns that Parquet files are presorted by; that would help postgres to avoid redundant sorting when running query with `ORDER BY` clause or in other cases when having a presorted set is beneficial (Group Aggregate, Merge Join).
   
-- **files_in_order** as *boolean*, optional
+- **files_in_order** as *boolean*, optional, default `false`
 
-  Specifies that files specified by `filename` or returned by `files_func` are ordered according to `sorted` option and have no intersection rangewise; this allows to use `Gather Merge` node on top of parallel Multifile scan (default `false`).
+  Specifies that files specified by `filename` or returned by `files_func` are ordered according to `sorted` option and have no intersection rangewise; this allows to use `Gather Merge` node on top of parallel Multifile scan.
   
-- **use_mmap** as *boolean*, optional
+- **use_mmap** as *boolean*, optional, default `false`
 
-  Whether memory map operations will be used instead of file read operations (default `false`).
+  Whether memory map operations will be used instead of file read operations.
   
-- **use_threads** as *boolean*, optional
+- **use_threads** as *boolean*, optional, default `false`
 
-  Enables Apache Arrow's parallel columns decoding/decompression (default `false`).
+  Enables Apache Arrow's parallel columns decoding/decompression.
   
-- **files_func** as *string*, optional
+- **files_func** as *string*, optional, no default
 
-  User defined function that is used by parquet_fdw to retrieve the list of parquet files on each query; function must take one `JSONB` argument and return text array of full paths to parquet files.
+  User defined function that is used by `parquet_fdw` to retrieve the list of parquet files on each query; function must take one `JSONB` argument and return text array of full paths to parquet files.
   
-- **files_func_arg** as *string*, optional
+- **files_func_arg** as *string*, optional, no default
 
   Argument for the function, specified by **files_func**.
   
-- **max_open_files** as *string*, optional
+- **max_open_files** as *string*, optional, no default
 
   The limit for the number of Parquet files open simultaneously.
   
