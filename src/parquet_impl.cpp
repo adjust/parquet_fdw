@@ -130,7 +130,7 @@ struct ParquetFdwPlanState
 static int
 get_strategy(Oid type, Oid opno, Oid am)
 {
-        Oid opclass;
+    Oid opclass;
     Oid opfamily;
 
     opclass = GetDefaultOpClass(type, am);
@@ -331,8 +331,7 @@ convert_const(Const *c, Oid dst_oid)
                 getTypeOutputInfo(c->consttype, &output_fn, &isvarlena);
                 getTypeInputInfo(dst_oid, &input_fn, &input_param);
 
-                str = DatumGetCString(OidOutputFunctionCall(output_fn,
-                                                            c->constvalue));
+                str = OidOutputFunctionCall(output_fn, c->constvalue);
                 newc->constvalue = OidInputFunctionCall(input_fn, str,
                                                         input_param, 0);
 
@@ -393,7 +392,7 @@ row_group_matches_filter(parquet::Statistics *stats,
                 Datum   lower;
                 int     cmpres;
                 bool    satisfies;
-                std::string min = std::move(stats->EncodeMin());
+                std::string min = stats->EncodeMin();
 
                 lower = bytes_to_postgres_type(min.c_str(), min.length(),
                                                arrow_type);
@@ -414,7 +413,7 @@ row_group_matches_filter(parquet::Statistics *stats,
                 Datum   upper;
                 int     cmpres;
                 bool    satisfies;
-                std::string max = std::move(stats->EncodeMax());
+                std::string max = stats->EncodeMax();
 
                 upper = bytes_to_postgres_type(max.c_str(), max.length(),
                                                arrow_type);
@@ -434,8 +433,8 @@ row_group_matches_filter(parquet::Statistics *stats,
             {
                 Datum   lower,
                         upper;
-                std::string min = std::move(stats->EncodeMin());
-                std::string max = std::move(stats->EncodeMax());
+                std::string min = stats->EncodeMin();
+                std::string max = stats->EncodeMax();
 
                 lower = bytes_to_postgres_type(min.c_str(), min.length(),
                                                arrow_type);
@@ -950,7 +949,7 @@ get_filenames_from_userfunc(const char *funcname, const char *funcarg)
 {
     Jsonb      *j = NULL;
     Oid         funcid;
-    List       *f = stringToQualifiedNameList(funcname);
+    List       *f = stringToQualifiedNameList(funcname, NULL);
     Datum       filenames;
     Oid         jsonboid = JSONBOID;
     Datum      *values;
@@ -1265,9 +1264,8 @@ parquetGetForeignPaths(PlannerInfo *root,
                                  NULL);
 
         /* Create PathKey for the attribute from "sorted" option */
-        attr_pathkeys = build_expression_pathkey(root, (Expr *) var, NULL,
-                                                sort_op, baserel->relids,
-                                                true);
+        attr_pathkeys = build_expression_pathkey(root, (Expr *) var, sort_op,
+                                                 baserel->relids, true);
 
         if (attr_pathkeys != NIL)
         {
@@ -2081,7 +2079,7 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
         else if (strcmp(def->defname, "files_func") == 0)
         {
             Oid     jsonboid = JSONBOID;
-            List   *funcname = stringToQualifiedNameList(defGetString(def));
+            List   *funcname = stringToQualifiedNameList(defGetString(def), NULL);
             Oid     funcoid;
             Oid     rettype;
 

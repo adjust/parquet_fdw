@@ -4,3 +4,5 @@
 regression.diffs
 regression.out
 results
+.cache
+compile_commands.json
