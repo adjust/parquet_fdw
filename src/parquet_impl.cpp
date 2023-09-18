@@ -560,7 +560,8 @@ extract_rowgroups_list(const char *filename,
                 &reader);
 
         if (!status.ok())
-            throw Error("failed to open Parquet file %s", status.message().c_str());
+            throw Error("failed to open Parquet file: %s ('%s')",
+                        status.message().c_str(), filename);
 
         auto meta = reader->parquet_reader()->metadata();
         parquet::ArrowReaderProperties  props;
@@ -569,7 +570,7 @@ extract_rowgroups_list(const char *filename,
         status = parquet::arrow::SchemaManifest::Make(meta->schema(), nullptr,
                                                       props, &manifest);
         if (!status.ok())
-            throw Error("error creating arrow schema");
+            throw Error("error creating arrow schema ('%s')", filename);
 
         /* Check each row group whether it matches the filters */
         for (int r = 0; r < reader->num_row_groups(); r++)
@@ -725,12 +726,12 @@ extract_parquet_fields(const char *path) noexcept
                     parquet::ParquetFileReader::OpenFile(path, false),
                     &reader);
         if (!status.ok())
-            throw Error("failed to open Parquet file %s",
-                                 status.message().c_str());
+            throw Error("failed to open Parquet file %s ('%s')",
+                        status.message().c_str(), path);
 
         auto p_schema = reader->parquet_reader()->metadata()->schema();
         if (!parquet::arrow::SchemaManifest::Make(p_schema, nullptr, props, &manifest).ok())
-            throw std::runtime_error("error creating arrow schema");
+            throw Error("error creating arrow schema ('%s')", path);
 
         fields = (FieldInfo *) exc_palloc(
                 sizeof(FieldInfo) * manifest.schema_fields.size());
@@ -750,7 +751,7 @@ extract_parquet_fields(const char *path) noexcept
                     bool    error = false;
 
                     if (type->num_fields() != 1)
-                        throw std::runtime_error("lists of structs are not supported");
+                        throw Error("lists of structs are not supported ('%s')", path);
 
                     subtype_id = get_arrow_list_elem_type(type.get());
                     pg_subtype = to_postgres_type(subtype_id);
@@ -767,7 +768,8 @@ extract_parquet_fields(const char *path) noexcept
                     PG_END_TRY();
 
                     if (error)
-                        throw std::runtime_error("failed to get the type of array elements");
+                        throw Error("failed to get the type of array elements for %d",
+                                    pg_subtype);
                     break;
                 }
                 case arrow::Type::MAP:
@@ -789,7 +791,7 @@ extract_parquet_fields(const char *path) noexcept
             }
             else
             {
-                throw Error("cannot convert field '%s' of type '%s' in %s",
+                throw Error("cannot convert field '%s' of type '%s' in '%s'",
                             field->name().c_str(), type->name().c_str(), path);
             }
         }
@@ -1033,7 +1035,7 @@ get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
         else if (strcmp(def->defname, "max_open_files") == 0)
         {
             /* check that int value is valid */
-            fdw_private->max_open_files = pg_atoi(defGetString(def), sizeof(int32), '\0');
+            fdw_private->max_open_files = string_to_int32(defGetString(def));
         }
         else if (strcmp(def->defname, "files_in_order") == 0)
         {
@@ -1085,7 +1087,7 @@ parquetGetForeignRelSize(PlannerInfo *root,
     fdw_private->filenames = NIL;
     foreach (lc, filenames_orig)
     {
-        char *filename = strVal((Value *) lfirst(lc));
+        char *filename = strVal(lfirst(lc));
         List *rowgroups = extract_rowgroups_list(filename, tupleDesc, filters,
                                                  &matched_rows, &total_rows);
 
@@ -1232,7 +1234,7 @@ parquetGetForeignPaths(PlannerInfo *root,
      * for the foreign table Postgres will assume that the returned data is
      * already sorted. In the function parquetBeginForeignScan() we make sure
      * that the data from parquet files are sorted.
-     * 
+     *
      * We need to make sure that we don't add PathKey for an attribute which is
      * not passed by ORDER BY. We will stop building pathkeys as soon as we see
      * that an attribute on ORDER BY and "sorted" doesn't match, since in that
@@ -1536,16 +1538,16 @@ parquetBeginForeignScan(ForeignScanState *node, int /* eflags */)
                 attrs_sorted = (List *) lfirst(lc);
                 break;
             case 3:
-                use_mmap = (bool) intVal((Value *) lfirst(lc));
+                use_mmap = (bool) intVal(lfirst(lc));
                 break;
             case 4:
-                use_threads = (bool) intVal((Value *) lfirst(lc));
+                use_threads = (bool) intVal(lfirst(lc));
                 break;
             case 5:
-                reader_type = (ReaderType) intVal((Value *) lfirst(lc));
+                reader_type = (ReaderType) intVal(lfirst(lc));
                 break;
             case 6:
-                max_open_files = intVal((Value *) lfirst(lc));
+                max_open_files = intVal(lfirst(lc));
                 break;
             case 7:
                 rowgroups_list = (List *) lfirst(lc);
@@ -1608,7 +1610,7 @@ parquetBeginForeignScan(ForeignScanState *node, int /* eflags */)
 
         forboth (lc, filenames, lc2, rowgroups_list)
         {
-            char *filename = strVal((Value *) lfirst(lc));
+            char *filename = strVal(lfirst(lc));
             List *rowgroups = (List *) lfirst(lc2);
 
             festate->add_file(filename, rowgroups);
@@ -1724,7 +1726,7 @@ parquetAcquireSampleRowsFunc(Relation relation, int /* elevel */,
 
     foreach (lc, fdw_private.filenames)
     {
-        char *filename = strVal((Value *) lfirst(lc));
+        char *filename = strVal(lfirst(lc));
 
         try
         {
@@ -1843,7 +1845,7 @@ parquetExplainForeignScan(ForeignScanState *node, ExplainState *es)
 
 	fdw_private = ((ForeignScan *) node->ss.ps.plan)->fdw_private;
     filenames = (List *) linitial(fdw_private);
-    reader_type = (ReaderType) intVal((Value *) list_nth(fdw_private, 5));
+    reader_type = (ReaderType) intVal(list_nth(fdw_private, 5));
     rowgroups_list = (List *) llast(fdw_private);
 
     switch (reader_type)
@@ -1867,7 +1869,7 @@ parquetExplainForeignScan(ForeignScanState *node, ExplainState *es)
 
     forboth(lc, filenames, lc2, rowgroups_list)
     {
-        char   *filename = strVal((Value *) lfirst(lc));
+        char   *filename = strVal(lfirst(lc));
         List   *rowgroups = (List *) lfirst(lc2);
         bool    is_first = true;
 
@@ -2084,7 +2086,7 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
             foreach(lc, filenames)
             {
                 struct stat stat_buf;
-                char       *fn = strVal((Value *) lfirst(lc));
+                char       *fn = strVal(lfirst(lc));
 
                 if (stat(fn, &stat_buf) != 0)
                 {
@@ -2141,7 +2143,7 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
         else if (strcmp(def->defname, "max_open_files") == 0)
         {
             /* check that int value is valid */
-            pg_atoi(defGetString(def), sizeof(int32), '\0');
+            string_to_int32(defGetString(def));
         }
         else if (strcmp(def->defname, "files_in_order") == 0)
         {
