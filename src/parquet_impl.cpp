@@ -47,6 +47,7 @@ extern "C"
 #include "nodes/execnodes.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/makefuncs.h"
+#include "nodes/pathnodes.h"
 #include "optimizer/cost.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
@@ -1273,13 +1274,12 @@ parquetGetForeignPaths(PlannerInfo *root,
         /* Create PathKey for the attribute from "sorted" option */
         attr_pathkeys = build_expression_pathkey(root, (Expr *) var, NULL,
                                                 sort_op, baserel->relids,
-                                                true);
+                                                false);
 
         if (attr_pathkeys != NIL)
         {
             PathKey    *attr_pathkey = (PathKey *) linitial(attr_pathkeys);
             bool        is_redundant = false;
-            bool        is_equal = false;
 
             if (EC_MUST_BE_REDUNDANT(attr_pathkey->pk_eclass))
                 is_redundant = true;
@@ -1502,7 +1502,7 @@ parquetGetForeignPlan(PlannerInfo * /* root */,
 extern "C" void
 parquetBeginForeignScan(ForeignScanState *node, int /* eflags */)
 {
-    ParquetFdwExecutionState   *festate;
+    ParquetFdwExecutionState   *festate = NULL;
     MemoryContextCallback      *callback;
     MemoryContext   reader_cxt;
 	ForeignScan    *plan = (ForeignScan *) node->ss.ps.plan;
