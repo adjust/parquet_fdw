@@ -1,3 +1,5 @@
+-- directory paths are passed to us in environment variables
+\getenv abs_srcdir PG_ABS_SRCDIR
 SET datestyle = 'ISO';
 SET client_min_messages = WARNING;
 SET log_statement TO 'none';
@@ -14,24 +16,26 @@ CREATE TABLE example_part (
     num     int
 )
 PARTITION BY range(date);
+\set filepart1 :abs_srcdir '/data/partition/example_part1.parquet'
+\set filepart2 :abs_srcdir '/data/partition/example_part2.parquet'
 CREATE FOREIGN TABLE example_part1
 PARTITION OF example_part FOR VALUES FROM ('2018-01-01') TO ('2018-02-01')
 SERVER parquet_srv
-OPTIONS (filename '@abs_srcdir@/data/partition/example_part1.parquet', sorted 'id date');
+OPTIONS (filename :'filepart1', sorted 'id date');
 CREATE FOREIGN TABLE example_part2
 PARTITION OF example_part FOR VALUES FROM ('2018-02-01') TO ('2018-03-01')
 SERVER parquet_srv
-OPTIONS (filename '@abs_srcdir@/data/partition/example_part2.parquet', sorted 'id date');
+OPTIONS (filename :'filepart2', sorted 'id date');
 -- Test that "sorted" option works if there is no ORDER BY
 EXPLAIN (COSTS OFF) SELECT * FROM example_part WHERE id = 1;
-             QUERY PLAN              
--------------------------------------
+                     QUERY PLAN                     
+----------------------------------------------------
  Append
-   ->  Foreign Scan on example_part1
+   ->  Foreign Scan on example_part1 example_part_1
          Filter: (id = 1)
          Reader: Single File
          Row groups: 1
-   ->  Foreign Scan on example_part2
+   ->  Foreign Scan on example_part2 example_part_2
          Filter: (id = 1)
          Reader: Single File
          Row groups: 1
@@ -48,7 +52,7 @@ SELECT * FROM example_part WHERE id = 1;
 EXPLAIN (COSTS OFF) SELECT * FROM example_part WHERE date = '2018-01-01';
                               QUERY PLAN                               
 -----------------------------------------------------------------------
- Foreign Scan on example_part1
+ Foreign Scan on example_part1 example_part
    Filter: (date = '2018-01-01 00:00:00'::timestamp without time zone)
    Reader: Single File
    Row groups: 1
@@ -62,16 +66,16 @@ SELECT * FROM example_part WHERE date = '2018-01-01';
 
 -- Test that "sorted" option works together with ORDER BY
 EXPLAIN (COSTS OFF) SELECT * FROM example_part WHERE id = 1 ORDER BY date;
-                QUERY PLAN                 
--------------------------------------------
+                        QUERY PLAN                        
+----------------------------------------------------------
  Sort
-   Sort Key: example_part1.date
+   Sort Key: example_part.date
    ->  Append
-         ->  Foreign Scan on example_part1
+         ->  Foreign Scan on example_part1 example_part_1
                Filter: (id = 1)
                Reader: Single File
                Row groups: 1
-         ->  Foreign Scan on example_part2
+         ->  Foreign Scan on example_part2 example_part_2
                Filter: (id = 1)
                Reader: Single File
                Row groups: 1
@@ -88,7 +92,7 @@ SELECT * FROM example_part WHERE id = 1 ORDER BY date;
 EXPLAIN (COSTS OFF) SELECT * FROM example_part WHERE date = '2018-01-01' ORDER BY id;
                               QUERY PLAN                               
 -----------------------------------------------------------------------
- Foreign Scan on example_part1
+ Foreign Scan on example_part1 example_part
    Filter: (date = '2018-01-01 00:00:00'::timestamp without time zone)
    Reader: Single File
    Row groups: 1

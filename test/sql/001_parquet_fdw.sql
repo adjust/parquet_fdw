@@ -1,3 +1,6 @@
+-- directory paths are passed to us in environment variables
+\getenv abs_srcdir PG_ABS_SRCDIR
+
 SET datestyle = 'ISO';
 SET client_min_messages = WARNING;
 SET log_statement TO 'none';
@@ -11,6 +14,8 @@ CREATE USER MAPPING FOR regress_parquet_fdw SERVER parquet_srv;
 
 SET ROLE regress_parquet_fdw;
 
+\set filename1 :abs_srcdir '/data/simple/example1.parquet'
+
 CREATE FOREIGN TABLE example1 (
     one     INT8,
     two     INT8[],
@@ -20,7 +25,7 @@ CREATE FOREIGN TABLE example1 (
     six     BOOL,
     seven   FLOAT8)
 SERVER parquet_srv
-OPTIONS (filename '@abs_srcdir@/data/simple/example1.parquet', sorted 'one');
+OPTIONS (filename :'filename1', sorted 'one');
 
 SELECT * FROM example1;
 
@@ -61,29 +66,35 @@ SERVER parquet_srv;
 CREATE FOREIGN TABLE example_fail (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv
 OPTIONS (filename 'nonexistent.parquet', some_option '123');
+
 CREATE FOREIGN TABLE example_fail (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv
-OPTIONS (filename '@abs_srcdir@/data/simple/example1.parquet', some_option '123');
+OPTIONS (filename :'filename1', some_option '123');
 
 -- type mismatch
 CREATE FOREIGN TABLE example_fail (one INT8[], two INT8, three TEXT)
 SERVER parquet_srv
-OPTIONS (filename '@abs_srcdir@/data/simple/example1.parquet', sorted 'one');
+OPTIONS (filename :'filename1', sorted 'one');
 SELECT one FROM example_fail;
 SELECT two FROM example_fail;
 
 -- files_func
+\set simplepath :abs_srcdir '/data/simple/'
+
 CREATE FUNCTION list_parquet_files(args JSONB)
 RETURNS TEXT[] AS
 $$
     SELECT ARRAY[args->>'dir' || '/example1.parquet', args->>'dir' || '/example2.parquet']::TEXT[];
 $$
 LANGUAGE SQL;
+
+\set func_arg '{"dir": "' :simplepath '"}'
+
 CREATE FOREIGN TABLE example_func (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv
 OPTIONS (
     files_func 'list_parquet_files',
-    files_func_arg '{"dir": "@abs_srcdir@/data/simple"}',
+    files_func_arg :'func_arg',
     sorted 'one');
 SELECT * FROM example_func;
 
@@ -92,10 +103,15 @@ CREATE FUNCTION int_array_func(args JSONB)
 RETURNS INT[] AS
 $$ SELECT ARRAY[1,2,3]::INT[]; $$
 LANGUAGE SQL;
-CREATE FUNCTION no_args_func()
-RETURNS TEXT[] AS
-$$ SELECT ARRAY['@abs_srcdir@/data/simple/example1.parquet']::TEXT[]; $$
-LANGUAGE SQL;
+
+SELECT format($func$
+    CREATE FUNCTION no_args_func()
+    RETURNS TEXT[] AS
+        $$ SELECT ARRAY['%s']::TEXT[]; $$
+    LANGUAGE SQL;
+$func$, :'filename1');
+\gexec
+
 CREATE FOREIGN TABLE example_inv_func (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv
 OPTIONS (files_func 'int_array_func');
@@ -109,6 +125,9 @@ DROP FUNCTION list_parquet_files(JSONB);
 DROP FUNCTION int_array_func(JSONB);
 DROP FUNCTION no_args_func();
 
+\set filename2 :abs_srcdir '/data/simple/example2.parquet'
+\set filenames :filename1 ' ' :filename2
+
 -- sequential multifile reader
 CREATE FOREIGN TABLE example_seq (
     one     INT8,
@@ -119,7 +138,8 @@ CREATE FOREIGN TABLE example_seq (
     six     BOOL,
     seven   FLOAT8)
 SERVER parquet_srv
-OPTIONS (filename '@abs_srcdir@/data/simple/example1.parquet @abs_srcdir@/data/simple/example2.parquet');
+OPTIONS (filename :'filenames');
+
 EXPLAIN (COSTS OFF) SELECT * FROM example_seq;
 SELECT * FROM example_seq;
 
@@ -133,7 +153,8 @@ CREATE FOREIGN TABLE example_sorted (
     six     BOOL,
     seven   FLOAT8)
 SERVER parquet_srv
-OPTIONS (filename '@abs_srcdir@/data/simple/example1.parquet @abs_srcdir@/data/simple/example2.parquet', sorted 'one');
+OPTIONS (filename :'filenames', sorted 'one');
+
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY one;
 SELECT * FROM example_sorted ORDER BY one;
 
@@ -147,7 +168,8 @@ CREATE FOREIGN TABLE example_sorted_caching (
     six     BOOL,
     seven   FLOAT8)
 SERVER parquet_srv
-OPTIONS (filename '@abs_srcdir@/data/simple/example1.parquet @abs_srcdir@/data/simple/example2.parquet', sorted 'one', max_open_files '1');
+OPTIONS (filename :'filenames', sorted 'one', max_open_files '1');
+
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted_caching ORDER BY one;
 SELECT * FROM example_sorted ORDER BY one;
 
@@ -174,9 +196,12 @@ CREATE FOREIGN TABLE example_multisort (
     five    DATE,
     six     BOOL)
 SERVER parquet_srv
-OPTIONS (filename '@abs_srcdir@/data/simple/example1.parquet', sorted 'one five');
+OPTIONS (filename :'filename1', sorted 'one five');
+
 EXPLAIN (COSTS OFF) SELECT * FROM example_multisort ORDER BY one, five;
 SELECT * FROM example_multisort ORDER BY one, five;
+
+\set complexfile3 :abs_srcdir '/data/complex/example3.parquet'
 
 -- maps
 SET client_min_messages = DEBUG1;
@@ -185,7 +210,7 @@ CREATE FOREIGN TABLE example3 (
     two     JSONB,
     three   INT2)
 SERVER parquet_srv
-OPTIONS (filename '@abs_srcdir@/data/complex/example3.parquet', sorted 'one');
+OPTIONS (filename :'complexfile3', sorted 'one');
 
 SELECT * FROM example3;
 SELECT * FROM example3 WHERE three = 3;

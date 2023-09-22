@@ -7,14 +7,14 @@ SHLIB_LINK = -lm -lstdc++ -lparquet -larrow
 EXTENSION = parquet_fdw
 DATA = parquet_fdw--0.1.sql parquet_fdw--0.1--0.2.sql
 
-INPUT_TEST = $(sort $(wildcard test/input/*.source))
+TESTS = $(sort $(wildcard test/sql/*.sql))
 
-REGRESS = $(patsubst test/input/%.source,%,$(INPUT_TEST))
-EXTRA_CLEAN = $(patsubst test/input/%.source,test/sql/%.sql,$(INPUT_TEST)) \
-	$(patsubst test/input/%.source,test/expected/%.out,$(INPUT_TEST))
+REGRESS = $(patsubst test/sql/%.sql,%,$(TESTS))
 REGRESS_OPTS = --inputdir=test --outputdir=test
 
 PG_CONFIG ?= pg_config
+
+export PG_ABS_SRCDIR
 
 # parquet_impl.cpp requires C++ 11 and libarrow 10+ requires C++ 17
 override PG_CXXFLAGS += -std=c++17 -O3
