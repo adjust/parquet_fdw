@@ -2,16 +2,17 @@ name: CI
 
 on:
   push:
-    branches: ['*']
+    branches:
+      - master
+      - main
   pull_request:
-    branches: ['*']
 
 jobs:
   test:
     strategy:
       fail-fast: false
       matrix:
-        pg: [14, 13, 12, 11, 10]
+        pg: [15, 14, 13, 12, 11, 10]
         ccflags: ['']
         include:
           - pg: 13
