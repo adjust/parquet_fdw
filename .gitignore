@@ -1,6 +1,10 @@
 *.o
 *.so
 *.bc
+
+# Ignore generated test files
+test/sql/*.sql
+test/expected/*.out
 regression.diffs
 regression.out
 results

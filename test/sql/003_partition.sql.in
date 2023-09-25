@@ -1,6 +1,3 @@
--- directory paths are passed to us in environment variables
-\getenv abs_srcdir PG_ABS_SRCDIR
-
 SET datestyle = 'ISO';
 SET client_min_messages = WARNING;
 SET log_statement TO 'none';
@@ -21,18 +18,15 @@ CREATE TABLE example_part (
 )
 PARTITION BY range(date);
 
-\set filepart1 :abs_srcdir '/data/partition/example_part1.parquet'
-\set filepart2 :abs_srcdir '/data/partition/example_part2.parquet'
-
 CREATE FOREIGN TABLE example_part1
 PARTITION OF example_part FOR VALUES FROM ('2018-01-01') TO ('2018-02-01')
 SERVER parquet_srv
-OPTIONS (filename :'filepart1', sorted 'id date');
+OPTIONS (filename 'PG_ABS_SRCDIR/test/data/partition/example_part1.parquet', sorted 'id date');
 
 CREATE FOREIGN TABLE example_part2
 PARTITION OF example_part FOR VALUES FROM ('2018-02-01') TO ('2018-03-01')
 SERVER parquet_srv
-OPTIONS (filename :'filepart2', sorted 'id date');
+OPTIONS (filename 'PG_ABS_SRCDIR/test/data/partition/example_part2.parquet', sorted 'id date');
 
 -- Test that "sorted" option works if there is no ORDER BY
 EXPLAIN (COSTS OFF) SELECT * FROM example_part WHERE id = 1;

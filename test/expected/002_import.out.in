@@ -1,5 +1,3 @@
--- directory paths are passed to us in environment variables
-\getenv abs_srcdir PG_ABS_SRCDIR
 SET datestyle = 'ISO';
 SET client_min_messages = WARNING;
 SET log_statement TO 'none';
@@ -9,9 +7,8 @@ CREATE ROLE regress_parquet_fdw LOGIN SUPERUSER;
 CREATE SERVER parquet_srv FOREIGN DATA WRAPPER parquet_fdw;
 CREATE USER MAPPING FOR regress_parquet_fdw SERVER parquet_srv;
 SET ROLE regress_parquet_fdw;
-\set simplepath :abs_srcdir '/data/simple/'
 -- import foreign schema
-IMPORT FOREIGN SCHEMA :"simplepath"
+IMPORT FOREIGN SCHEMA "PG_ABS_SRCDIR/test/data/simple/"
 FROM SERVER parquet_srv
 INTO public
 OPTIONS (sorted 'one');
@@ -46,13 +43,12 @@ $$
     WHERE filetype = args->>'type';
 $$
 LANGUAGE SQL;
-\set func_arg '{"dir": "' :simplepath '", "type": "simple"}'
 SELECT import_parquet(
     'example_import',
     'public',
     'parquet_srv',
     'list_parquet_files',
-    :'func_arg',
+    '{"dir": "PG_ABS_SRCDIR/test/data/simple/", "type": "simple"}',
     '{"sorted": "one"}');
  import_parquet 
 ----------------
@@ -82,7 +78,7 @@ SELECT import_parquet_explicit(
     array['one', 'three', 'six'],
     array['int8', 'text', 'bool']::regtype[],
     'list_parquet_files',
-    :'func_arg',
+    '{"dir": "PG_ABS_SRCDIR/test/data/simple/", "type": "simple"}',
     '{"sorted": "one"}');
  import_parquet_explicit 
 -------------------------
@@ -105,14 +101,12 @@ SELECT * FROM example_import2;
    9 | fünf  | t
 (11 rows)
 
-\set complexpath :abs_srcdir '/data/complex/'
-\set complex_func_arg '{"dir": "' :complexpath '", "type": "complex"}'
 SELECT import_parquet(
     'example_import3',
     'public',
     'parquet_srv',
     'list_parquet_files',
-    :'complex_func_arg');
+    '{"dir": "PG_ABS_SRCDIR/test/data/complex/", "type": "complex"}');
  import_parquet 
 ----------------
  
