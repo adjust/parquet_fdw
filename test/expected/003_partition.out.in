@@ -17,11 +17,11 @@ PARTITION BY range(date);
 CREATE FOREIGN TABLE example_part1
 PARTITION OF example_part FOR VALUES FROM ('2018-01-01') TO ('2018-02-01')
 SERVER parquet_srv
-OPTIONS (filename 'PG_ABS_SRCDIR/test/data/partition/example_part1.parquet', sorted 'id date');
+OPTIONS (filename '@abs_srcdir@/data/partition/example_part1.parquet', sorted 'id date');
 CREATE FOREIGN TABLE example_part2
 PARTITION OF example_part FOR VALUES FROM ('2018-02-01') TO ('2018-03-01')
 SERVER parquet_srv
-OPTIONS (filename 'PG_ABS_SRCDIR/test/data/partition/example_part2.parquet', sorted 'id date');
+OPTIONS (filename '@abs_srcdir@/data/partition/example_part2.parquet', sorted 'id date');
 -- Test that "sorted" option works if there is no ORDER BY
 EXPLAIN (COSTS OFF) SELECT * FROM example_part WHERE id = 1;
                      QUERY PLAN                     

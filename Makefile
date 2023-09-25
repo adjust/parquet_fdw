@@ -63,7 +63,7 @@ COMPILE.cxx.bc = $(CLANG) -xc++ -Wno-ignored-attributes -Wno-register $(BITCODE_
 installcheck: $(TEST_SQL) $(TEST_EXPECTED)
 
 $(TEST_SQL): test/sql/%.sql: test/sql/%.sql.in
-	sed 's,PG_ABS_SRCDIR,$(ROOT_DIR),g' $< > $@
+	sed 's,@abs_srcdir@,$(ROOT_DIR)/test,g' $< > $@
 
 $(TEST_EXPECTED): test/expected/%.out: test/expected/%.out.in
-	sed 's,PG_ABS_SRCDIR,$(ROOT_DIR),g' $< > $@
+	sed 's,@abs_srcdir@,$(ROOT_DIR)/test,g' $< > $@
