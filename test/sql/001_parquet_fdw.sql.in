@@ -61,6 +61,7 @@ SERVER parquet_srv;
 CREATE FOREIGN TABLE example_fail (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv
 OPTIONS (filename 'nonexistent.parquet', some_option '123');
+
 CREATE FOREIGN TABLE example_fail (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/simple/example1.parquet', some_option '123');
@@ -79,6 +80,7 @@ $$
     SELECT ARRAY[args->>'dir' || '/example1.parquet', args->>'dir' || '/example2.parquet']::TEXT[];
 $$
 LANGUAGE SQL;
+
 CREATE FOREIGN TABLE example_func (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv
 OPTIONS (
@@ -92,10 +94,12 @@ CREATE FUNCTION int_array_func(args JSONB)
 RETURNS INT[] AS
 $$ SELECT ARRAY[1,2,3]::INT[]; $$
 LANGUAGE SQL;
+
 CREATE FUNCTION no_args_func()
 RETURNS TEXT[] AS
 $$ SELECT ARRAY['@abs_srcdir@/data/simple/example1.parquet']::TEXT[]; $$
 LANGUAGE SQL;
+
 CREATE FOREIGN TABLE example_inv_func (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv
 OPTIONS (files_func 'int_array_func');
@@ -120,6 +124,7 @@ CREATE FOREIGN TABLE example_seq (
     seven   FLOAT8)
 SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/simple/example1.parquet @abs_srcdir@/data/simple/example2.parquet');
+
 EXPLAIN (COSTS OFF) SELECT * FROM example_seq;
 SELECT * FROM example_seq;
 
@@ -134,6 +139,7 @@ CREATE FOREIGN TABLE example_sorted (
     seven   FLOAT8)
 SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/simple/example1.parquet @abs_srcdir@/data/simple/example2.parquet', sorted 'one');
+
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY one;
 SELECT * FROM example_sorted ORDER BY one;
 
@@ -148,6 +154,7 @@ CREATE FOREIGN TABLE example_sorted_caching (
     seven   FLOAT8)
 SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/simple/example1.parquet @abs_srcdir@/data/simple/example2.parquet', sorted 'one', max_open_files '1');
+
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted_caching ORDER BY one;
 SELECT * FROM example_sorted ORDER BY one;
 
@@ -175,6 +182,7 @@ CREATE FOREIGN TABLE example_multisort (
     six     BOOL)
 SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/simple/example1.parquet', sorted 'one five');
+
 EXPLAIN (COSTS OFF) SELECT * FROM example_multisort ORDER BY one, five;
 SELECT * FROM example_multisort ORDER BY one, five;
 
