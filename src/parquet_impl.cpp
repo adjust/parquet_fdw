@@ -47,7 +47,6 @@ extern "C"
 #include "nodes/execnodes.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/makefuncs.h"
-#include "nodes/pathnodes.h"
 #include "optimizer/cost.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
@@ -80,6 +79,10 @@ extern "C"
 #include "catalog/pg_am.h"
 #else
 #include "catalog/pg_am_d.h"
+#endif
+
+#if PG_VERSION_NUM >= 120000
+#include "nodes/pathnodes.h"
 #endif
 }
 
@@ -1241,10 +1244,7 @@ parquetGetForeignPaths(PlannerInfo *root,
      * that an attribute on ORDER BY and "sorted" doesn't match, since in that
      * case Postgres will need to sort by remaining attributes by itself.
      */
-    if (root->sort_pathkeys != NIL)
-        source_pathkeys = root->sort_pathkeys;
-    else
-        source_pathkeys = root->window_pathkeys;
+    source_pathkeys = root->query_pathkeys;
     lc_rootsort = list_head(source_pathkeys);
 
     foreach (lc_sorted, fdw_private->attrs_sorted)
@@ -1276,7 +1276,9 @@ parquetGetForeignPaths(PlannerInfo *root,
                                                 sort_op, baserel->relids,
                                                 false);
 
-        if (attr_pathkeys != NIL)
+        if (attr_pathkeys == NIL)
+            break;
+        else
         {
             PathKey    *attr_pathkey = (PathKey *) linitial(attr_pathkeys);
             bool        is_redundant = false;

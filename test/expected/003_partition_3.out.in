@@ -8,93 +8,511 @@ SET ROLE regress_parquet_fdw;
 CREATE SERVER parquet_srv FOREIGN DATA WRAPPER parquet_fdw;
 CREATE USER MAPPING FOR regress_parquet_fdw SERVER parquet_srv;
 SET ROLE regress_parquet_fdw;
-CREATE TABLE example_part (
+-- Test sorted "id token date"
+CREATE TABLE example_parent1 (
     id      int,
+    token   int,
     date    timestamp,
     num     int
 )
 PARTITION BY range(date);
-CREATE FOREIGN TABLE example_part1
-PARTITION OF example_part FOR VALUES FROM ('2018-01-01') TO ('2018-02-01')
+CREATE FOREIGN TABLE example_child1_1
+PARTITION OF example_parent1 FOR VALUES FROM ('2018-01-01') TO ('2018-02-01')
 SERVER parquet_srv
-OPTIONS (filename '@abs_srcdir@/data/partition/example_part1.parquet', sorted 'id date');
-CREATE FOREIGN TABLE example_part2
-PARTITION OF example_part FOR VALUES FROM ('2018-02-01') TO ('2018-03-01')
+OPTIONS (filename '@abs_srcdir@/data/partition/example_part1.parquet', sorted 'id token date');
+CREATE FOREIGN TABLE example_child1_2
+PARTITION OF example_parent1 FOR VALUES FROM ('2018-02-01') TO ('2018-03-01')
 SERVER parquet_srv
-OPTIONS (filename '@abs_srcdir@/data/partition/example_part2.parquet', sorted 'id date');
--- Test that "sorted" option works if there is no ORDER BY
-EXPLAIN (COSTS OFF) SELECT * FROM example_part WHERE id = 1;
-             QUERY PLAN              
--------------------------------------
+OPTIONS (filename '@abs_srcdir@/data/partition/example_part2.parquet', sorted 'id token date');
+-- Tests without ORDER BY
+EXPLAIN (COSTS OFF) SELECT * FROM example_parent1 WHERE id = 1;
+               QUERY PLAN               
+----------------------------------------
  Append
-   ->  Foreign Scan on example_part1
+   ->  Foreign Scan on example_child1_1
          Filter: (id = 1)
          Reader: Single File
          Row groups: 1
-   ->  Foreign Scan on example_part2
+   ->  Foreign Scan on example_child1_2
          Filter: (id = 1)
          Reader: Single File
          Row groups: 1
 (9 rows)
 
-SELECT * FROM example_part WHERE id = 1;
- id |        date         | num 
-----+---------------------+-----
-  1 | 2018-01-01 00:00:00 |  10
-  1 | 2018-01-02 00:00:00 |  23
-  1 | 2018-02-01 00:00:00 |  59
+SELECT * FROM example_parent1 WHERE id = 1;
+ id | token |        date         | num 
+----+-------+---------------------+-----
+  1 |     1 | 2018-01-01 00:00:00 |  10
+  1 |     1 | 2018-01-02 00:00:00 |  23
+  1 |     1 | 2018-02-01 00:00:00 |  59
 (3 rows)
 
-EXPLAIN (COSTS OFF) SELECT * FROM example_part WHERE date = '2018-01-01';
+EXPLAIN (COSTS OFF) SELECT * FROM example_parent1 WHERE date = '2018-01-01';
                               QUERY PLAN                               
 -----------------------------------------------------------------------
- Foreign Scan on example_part1
+ Foreign Scan on example_child1_1
    Filter: (date = '2018-01-01 00:00:00'::timestamp without time zone)
    Reader: Single File
    Row groups: 1
 (4 rows)
 
-SELECT * FROM example_part WHERE date = '2018-01-01';
- id |        date         | num 
-----+---------------------+-----
-  1 | 2018-01-01 00:00:00 |  10
+SELECT * FROM example_parent1 WHERE date = '2018-01-01';
+ id | token |        date         | num 
+----+-------+---------------------+-----
+  1 |     1 | 2018-01-01 00:00:00 |  10
 (1 row)
 
--- Test that "sorted" option works together with ORDER BY
-EXPLAIN (COSTS OFF) SELECT * FROM example_part WHERE id = 1 ORDER BY date;
-             QUERY PLAN              
--------------------------------------
+-- Postgres will sort by "token, date" because example_parent1 is partitioned
+-- by "date".
+EXPLAIN (COSTS OFF) SELECT * FROM example_parent1 WHERE id = 1 ORDER BY token, date;
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Sort
+   Sort Key: example_child1_1.token, example_child1_1.date
+   ->  Append
+         ->  Foreign Scan on example_child1_1
+               Filter: (id = 1)
+               Reader: Single File
+               Row groups: 1
+         ->  Foreign Scan on example_child1_2
+               Filter: (id = 1)
+               Reader: Single File
+               Row groups: 1
+(11 rows)
+
+SELECT * FROM example_parent1 WHERE id = 1 ORDER BY token, date;
+ id | token |        date         | num 
+----+-------+---------------------+-----
+  1 |     1 | 2018-01-01 00:00:00 |  10
+  1 |     1 | 2018-01-02 00:00:00 |  23
+  1 |     1 | 2018-02-01 00:00:00 |  59
+(3 rows)
+
+-- Postgres won't sort since ORDER BY "id" is redundant and matches "sorted" option
+EXPLAIN (COSTS OFF) SELECT * FROM example_parent1 WHERE date = '2018-01-01' ORDER BY id;
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Foreign Scan on example_child1_1
+   Filter: (date = '2018-01-01 00:00:00'::timestamp without time zone)
+   Reader: Single File
+   Row groups: 1
+(4 rows)
+
+SELECT * FROM example_parent1 WHERE date = '2018-01-01' ORDER BY id;
+ id | token |        date         | num 
+----+-------+---------------------+-----
+  1 |     1 | 2018-01-01 00:00:00 |  10
+(1 row)
+
+-- Postgres will sort by "date, token" since ORDER BY "date, token" doesn't
+-- match "sorted" option
+EXPLAIN (COSTS OFF) SELECT * FROM example_parent1 WHERE id = 1 ORDER BY date, token;
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Sort
+   Sort Key: example_child1_1.date, example_child1_1.token
+   ->  Append
+         ->  Foreign Scan on example_child1_1
+               Filter: (id = 1)
+               Reader: Single File
+               Row groups: 1
+         ->  Foreign Scan on example_child1_2
+               Filter: (id = 1)
+               Reader: Single File
+               Row groups: 1
+(11 rows)
+
+SELECT * FROM example_parent1 WHERE id = 1 ORDER BY date, token;
+ id | token |        date         | num 
+----+-------+---------------------+-----
+  1 |     1 | 2018-01-01 00:00:00 |  10
+  1 |     1 | 2018-01-02 00:00:00 |  23
+  1 |     1 | 2018-02-01 00:00:00 |  59
+(3 rows)
+
+-- Postgres will sort by "date" since ORDER BY "date" matches "sorted" option
+EXPLAIN (COSTS OFF) SELECT * FROM example_parent1 WHERE id = 1 ORDER BY date;
+                  QUERY PLAN                  
+----------------------------------------------
+ Sort
+   Sort Key: example_child1_1.date
+   ->  Append
+         ->  Foreign Scan on example_child1_1
+               Filter: (id = 1)
+               Reader: Single File
+               Row groups: 1
+         ->  Foreign Scan on example_child1_2
+               Filter: (id = 1)
+               Reader: Single File
+               Row groups: 1
+(11 rows)
+
+SELECT * FROM example_parent1 WHERE id = 1 ORDER BY date;
+ id | token |        date         | num 
+----+-------+---------------------+-----
+  1 |     1 | 2018-01-01 00:00:00 |  10
+  1 |     1 | 2018-01-02 00:00:00 |  23
+  1 |     1 | 2018-02-01 00:00:00 |  59
+(3 rows)
+
+-- Test sorted "id date token"
+CREATE TABLE example_parent2 (
+    id      int,
+    token   int,
+    date    timestamp,
+    num     int
+)
+PARTITION BY range(date);
+CREATE FOREIGN TABLE example_child2_1
+PARTITION OF example_parent2 FOR VALUES FROM ('2018-01-01') TO ('2018-02-01')
+SERVER parquet_srv
+OPTIONS (filename '@abs_srcdir@/data/partition/example_part1.parquet', sorted 'id date token');
+CREATE FOREIGN TABLE example_child2_2
+PARTITION OF example_parent2 FOR VALUES FROM ('2018-02-01') TO ('2018-03-01')
+SERVER parquet_srv
+OPTIONS (filename '@abs_srcdir@/data/partition/example_part2.parquet', sorted 'id date token');
+-- Postgres will sort by "token, date" because example_parent2 is partitioned
+-- by "date".
+EXPLAIN (COSTS OFF) SELECT * FROM example_parent2 WHERE id = 1 ORDER BY token, date;
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Sort
+   Sort Key: example_child2_1.token, example_child2_1.date
+   ->  Append
+         ->  Foreign Scan on example_child2_1
+               Filter: (id = 1)
+               Reader: Single File
+               Row groups: 1
+         ->  Foreign Scan on example_child2_2
+               Filter: (id = 1)
+               Reader: Single File
+               Row groups: 1
+(11 rows)
+
+SELECT * FROM example_parent2 WHERE id = 1 ORDER BY token, date;
+ id | token |        date         | num 
+----+-------+---------------------+-----
+  1 |     1 | 2018-01-01 00:00:00 |  10
+  1 |     1 | 2018-01-02 00:00:00 |  23
+  1 |     1 | 2018-02-01 00:00:00 |  59
+(3 rows)
+
+-- Postgres won't sort since ORDER BY "id" is redundant and matches "sorted" option
+EXPLAIN (COSTS OFF) SELECT * FROM example_parent2 WHERE date = '2018-01-01' ORDER BY id;
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Foreign Scan on example_child2_1
+   Filter: (date = '2018-01-01 00:00:00'::timestamp without time zone)
+   Reader: Single File
+   Row groups: 1
+(4 rows)
+
+SELECT * FROM example_parent2 WHERE date = '2018-01-01' ORDER BY id;
+ id | token |        date         | num 
+----+-------+---------------------+-----
+  1 |     1 | 2018-01-01 00:00:00 |  10
+(1 row)
+
+-- Postgres won't sort by "date, token" since ORDER BY "date, token" matches
+-- "sorted" option
+EXPLAIN (COSTS OFF) SELECT * FROM example_parent2 WHERE id = 1 ORDER BY date, token;
+               QUERY PLAN               
+----------------------------------------
  Append
-   ->  Foreign Scan on example_part1
+   ->  Foreign Scan on example_child2_1
          Filter: (id = 1)
          Reader: Single File
          Row groups: 1
-   ->  Foreign Scan on example_part2
+   ->  Foreign Scan on example_child2_2
          Filter: (id = 1)
          Reader: Single File
          Row groups: 1
 (9 rows)
 
-SELECT * FROM example_part WHERE id = 1 ORDER BY date;
- id |        date         | num 
-----+---------------------+-----
-  1 | 2018-01-01 00:00:00 |  10
-  1 | 2018-01-02 00:00:00 |  23
-  1 | 2018-02-01 00:00:00 |  59
+SELECT * FROM example_parent2 WHERE id = 1 ORDER BY date, token;
+ id | token |        date         | num 
+----+-------+---------------------+-----
+  1 |     1 | 2018-01-01 00:00:00 |  10
+  1 |     1 | 2018-01-02 00:00:00 |  23
+  1 |     1 | 2018-02-01 00:00:00 |  59
 (3 rows)
 
-EXPLAIN (COSTS OFF) SELECT * FROM example_part WHERE date = '2018-01-01' ORDER BY id;
+-- Postgres won't sort by "date" since ORDER BY "date" matches "sorted" option
+EXPLAIN (COSTS OFF) SELECT * FROM example_parent2 WHERE id = 1 ORDER BY date;
+               QUERY PLAN               
+----------------------------------------
+ Append
+   ->  Foreign Scan on example_child2_1
+         Filter: (id = 1)
+         Reader: Single File
+         Row groups: 1
+   ->  Foreign Scan on example_child2_2
+         Filter: (id = 1)
+         Reader: Single File
+         Row groups: 1
+(9 rows)
+
+SELECT * FROM example_parent2 WHERE id = 1 ORDER BY date;
+ id | token |        date         | num 
+----+-------+---------------------+-----
+  1 |     1 | 2018-01-01 00:00:00 |  10
+  1 |     1 | 2018-01-02 00:00:00 |  23
+  1 |     1 | 2018-02-01 00:00:00 |  59
+(3 rows)
+
+-- Test window functions
+-- Postgres will sort by "token, date" because example_parent1 is partitioned
+-- by "date".
+EXPLAIN (COSTS OFF)
+SELECT max(max_num) AS max_num
+FROM (
+    SELECT max(num) OVER w AS max_num, token
+    FROM example_parent1
+    WHERE id = 1 AND (token BETWEEN 1 AND 2)
+    WINDOW w AS (PARTITION BY token ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+) t
+GROUP BY token
+ORDER BY token;
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ GroupAggregate
+   Group Key: example_child1_1.token
+   ->  WindowAgg
+         ->  Merge Append
+               Sort Key: example_child1_1.token, example_child1_1.date
+               ->  Foreign Scan on example_child1_1
+                     Filter: ((token >= 1) AND (token <= 2) AND (id = 1))
+                     Reader: Single File
+                     Row groups: 1
+               ->  Foreign Scan on example_child1_2
+                     Filter: ((token >= 1) AND (token <= 2) AND (id = 1))
+                     Reader: Single File
+                     Row groups: 1
+(13 rows)
+
+-- Postgres won't sort by "token, date" since query pathkeys match "sorted" option
+-- and "id" is a redundant key
+EXPLAIN (COSTS OFF)
+SELECT max(max_num) AS max_num
+FROM (
+    SELECT max(num) OVER w AS max_num, token
+    FROM example_child1_1
+    WHERE id = 1 AND (token BETWEEN 1 AND 2)
+    WINDOW w AS (PARTITION BY token ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+) t
+GROUP BY token
+ORDER BY token;
+                             QUERY PLAN                             
+--------------------------------------------------------------------
+ GroupAggregate
+   Group Key: example_child1_1.token
+   ->  WindowAgg
+         ->  Foreign Scan on example_child1_1
+               Filter: ((token >= 1) AND (token <= 2) AND (id = 1))
+               Reader: Single File
+               Row groups: 1
+(7 rows)
+
+-- Postgres won't sort by "token" since query pathkeys match "sorted" option
+-- and "id" is a redundant key
+EXPLAIN (COSTS OFF)
+SELECT max(max_num) AS max_num
+FROM (
+    SELECT max(num) OVER w AS max_num, token
+    FROM example_child1_1
+    WHERE id = 1 AND (token BETWEEN 1 AND 2)
+    WINDOW w AS (PARTITION BY token ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+) t
+GROUP BY token
+ORDER BY token;
+                             QUERY PLAN                             
+--------------------------------------------------------------------
+ GroupAggregate
+   Group Key: example_child1_1.token
+   ->  WindowAgg
+         ->  Foreign Scan on example_child1_1
+               Filter: ((token >= 1) AND (token <= 2) AND (id = 1))
+               Reader: Single File
+               Row groups: 1
+(7 rows)
+
+-- Postgres will sort by "date" since query pathkeys don't match "sorted" option
+EXPLAIN (COSTS OFF)
+SELECT max(max_num) AS max_num
+FROM (
+    SELECT max(num) OVER w AS max_num, token
+    FROM example_child1_1
+    WHERE id = 1 AND (token BETWEEN 1 AND 2)
+    WINDOW w AS (PARTITION BY date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+) t
+GROUP BY token
+ORDER BY token;
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ GroupAggregate
+   Group Key: t.token
+   ->  Sort
+         Sort Key: t.token
+         ->  Subquery Scan on t
+               ->  WindowAgg
+                     ->  Sort
+                           Sort Key: example_child1_1.date
+                           ->  Foreign Scan on example_child1_1
+                                 Filter: ((token >= 1) AND (token <= 2) AND (id = 1))
+                                 Reader: Single File
+                                 Row groups: 1
+(12 rows)
+
+-- Postgres will sort by "token, date" since query pathkeys don't match "sorted" option
+EXPLAIN (COSTS OFF)
+SELECT max(max_num) AS max_num
+FROM (
+    SELECT max(num) OVER w AS max_num, token
+    FROM example_child1_1
+    WHERE (token BETWEEN 1 AND 2)
+    WINDOW w AS (PARTITION BY token ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+) t
+GROUP BY token
+ORDER BY token;
                               QUERY PLAN                               
 -----------------------------------------------------------------------
- Foreign Scan on example_part1
-   Filter: (date = '2018-01-01 00:00:00'::timestamp without time zone)
-   Reader: Single File
-   Row groups: 1
-(4 rows)
+ GroupAggregate
+   Group Key: example_child1_1.token
+   ->  WindowAgg
+         ->  Sort
+               Sort Key: example_child1_1.token, example_child1_1.date
+               ->  Foreign Scan on example_child1_1
+                     Filter: ((token >= 1) AND (token <= 2))
+                     Reader: Single File
+                     Row groups: 1
+(9 rows)
 
-SELECT * FROM example_part WHERE date = '2018-01-01' ORDER BY id;
- id |        date         | num 
-----+---------------------+-----
-  1 | 2018-01-01 00:00:00 |  10
-(1 row)
+-- Postgres will sort by "token, date" because example_parent2 is partitioned
+-- by "date".
+EXPLAIN (COSTS OFF)
+SELECT max(max_num) AS max_num
+FROM (
+    SELECT max(num) OVER w AS max_num, token
+    FROM example_parent2
+    WHERE id = 1 AND (token BETWEEN 1 AND 2)
+    WINDOW w AS (PARTITION BY token ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+) t
+GROUP BY token
+ORDER BY token;
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ GroupAggregate
+   Group Key: example_child2_1.token
+   ->  WindowAgg
+         ->  Sort
+               Sort Key: example_child2_1.token, example_child2_1.date
+               ->  Append
+                     ->  Foreign Scan on example_child2_1
+                           Filter: ((token >= 1) AND (token <= 2) AND (id = 1))
+                           Reader: Single File
+                           Row groups: 1
+                     ->  Foreign Scan on example_child2_2
+                           Filter: ((token >= 1) AND (token <= 2) AND (id = 1))
+                           Reader: Single File
+                           Row groups: 1
+(14 rows)
+
+-- Postgres will sort by "token, date" since query pathkeys don't match
+-- "sorted" option
+EXPLAIN (COSTS OFF)
+SELECT max(max_num) AS max_num
+FROM (
+    SELECT max(num) OVER w AS max_num, token
+    FROM example_child2_1
+    WHERE id = 1 AND (token BETWEEN 1 AND 2)
+    WINDOW w AS (PARTITION BY token ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+) t
+GROUP BY token
+ORDER BY token;
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ GroupAggregate
+   Group Key: example_child2_1.token
+   ->  WindowAgg
+         ->  Sort
+               Sort Key: example_child2_1.token, example_child2_1.date
+               ->  Foreign Scan on example_child2_1
+                     Filter: ((token >= 1) AND (token <= 2) AND (id = 1))
+                     Reader: Single File
+                     Row groups: 1
+(9 rows)
+
+-- Postgres will sort by "token" since query pathkeys don't match "sorted" option
+EXPLAIN (COSTS OFF)
+SELECT max(max_num) AS max_num
+FROM (
+    SELECT max(num) OVER w AS max_num, token
+    FROM example_child2_1
+    WHERE id = 1 AND (token BETWEEN 1 AND 2)
+    WINDOW w AS (PARTITION BY token ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+) t
+GROUP BY token
+ORDER BY token;
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ GroupAggregate
+   Group Key: example_child2_1.token
+   ->  WindowAgg
+         ->  Sort
+               Sort Key: example_child2_1.token
+               ->  Foreign Scan on example_child2_1
+                     Filter: ((token >= 1) AND (token <= 2) AND (id = 1))
+                     Reader: Single File
+                     Row groups: 1
+(9 rows)
+
+-- Postgres will sort by "token" since query pathkeys don't match "sorted" option
+EXPLAIN (COSTS OFF)
+SELECT max(max_num) AS max_num
+FROM (
+    SELECT max(num) OVER w AS max_num, token
+    FROM example_child2_1
+    WHERE id = 1 AND (token BETWEEN 1 AND 2)
+    WINDOW w AS (PARTITION BY date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+) t
+GROUP BY token
+ORDER BY token;
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ GroupAggregate
+   Group Key: t.token
+   ->  Sort
+         Sort Key: t.token
+         ->  Subquery Scan on t
+               ->  WindowAgg
+                     ->  Foreign Scan on example_child2_1
+                           Filter: ((token >= 1) AND (token <= 2) AND (id = 1))
+                           Reader: Single File
+                           Row groups: 1
+(10 rows)
+
+-- Postgres will sort by "token, date" since query pathkeys don't match
+-- "sorted" option
+EXPLAIN (COSTS OFF)
+SELECT max(max_num) AS max_num
+FROM (
+    SELECT max(num) OVER w AS max_num, token
+    FROM example_child2_1
+    WHERE (token BETWEEN 1 AND 2)
+    WINDOW w AS (PARTITION BY token ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+) t
+GROUP BY token
+ORDER BY token;
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ GroupAggregate
+   Group Key: example_child2_1.token
+   ->  WindowAgg
+         ->  Sort
+               Sort Key: example_child2_1.token, example_child2_1.date
+               ->  Foreign Scan on example_child2_1
+                     Filter: ((token >= 1) AND (token <= 2))
+                     Reader: Single File
+                     Row groups: 1
+(9 rows)
 
