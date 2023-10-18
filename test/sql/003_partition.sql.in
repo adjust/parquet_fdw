@@ -11,33 +11,212 @@ CREATE USER MAPPING FOR regress_parquet_fdw SERVER parquet_srv;
 
 SET ROLE regress_parquet_fdw;
 
-CREATE TABLE example_part (
+-- Test sorted "id token date"
+CREATE TABLE example_parent1 (
     id      int,
+    token   int,
     date    timestamp,
     num     int
 )
 PARTITION BY range(date);
 
-CREATE FOREIGN TABLE example_part1
-PARTITION OF example_part FOR VALUES FROM ('2018-01-01') TO ('2018-02-01')
+CREATE FOREIGN TABLE example_child1_1
+PARTITION OF example_parent1 FOR VALUES FROM ('2018-01-01') TO ('2018-02-01')
 SERVER parquet_srv
-OPTIONS (filename '@abs_srcdir@/data/partition/example_part1.parquet', sorted 'id date');
+OPTIONS (filename '@abs_srcdir@/data/partition/example_part1.parquet', sorted 'id token date');
 
-CREATE FOREIGN TABLE example_part2
-PARTITION OF example_part FOR VALUES FROM ('2018-02-01') TO ('2018-03-01')
+CREATE FOREIGN TABLE example_child1_2
+PARTITION OF example_parent1 FOR VALUES FROM ('2018-02-01') TO ('2018-03-01')
 SERVER parquet_srv
-OPTIONS (filename '@abs_srcdir@/data/partition/example_part2.parquet', sorted 'id date');
+OPTIONS (filename '@abs_srcdir@/data/partition/example_part2.parquet', sorted 'id token date');
 
--- Test that "sorted" option works if there is no ORDER BY
-EXPLAIN (COSTS OFF) SELECT * FROM example_part WHERE id = 1;
-SELECT * FROM example_part WHERE id = 1;
+-- Tests without ORDER BY
+EXPLAIN (COSTS OFF) SELECT * FROM example_parent1 WHERE id = 1;
+SELECT * FROM example_parent1 WHERE id = 1;
 
-EXPLAIN (COSTS OFF) SELECT * FROM example_part WHERE date = '2018-01-01';
-SELECT * FROM example_part WHERE date = '2018-01-01';
+EXPLAIN (COSTS OFF) SELECT * FROM example_parent1 WHERE date = '2018-01-01';
+SELECT * FROM example_parent1 WHERE date = '2018-01-01';
 
--- Test that "sorted" option works together with ORDER BY
-EXPLAIN (COSTS OFF) SELECT * FROM example_part WHERE id = 1 ORDER BY date;
-SELECT * FROM example_part WHERE id = 1 ORDER BY date;
+-- Postgres will sort by "token, date" because example_parent1 is partitioned
+-- by "date".
+EXPLAIN (COSTS OFF) SELECT * FROM example_parent1 WHERE id = 1 ORDER BY token, date;
+SELECT * FROM example_parent1 WHERE id = 1 ORDER BY token, date;
 
-EXPLAIN (COSTS OFF) SELECT * FROM example_part WHERE date = '2018-01-01' ORDER BY id;
-SELECT * FROM example_part WHERE date = '2018-01-01' ORDER BY id;
+-- Postgres won't sort since ORDER BY "id" is redundant and matches "sorted" option
+EXPLAIN (COSTS OFF) SELECT * FROM example_parent1 WHERE date = '2018-01-01' ORDER BY id;
+SELECT * FROM example_parent1 WHERE date = '2018-01-01' ORDER BY id;
+
+-- Postgres will sort by "date, token" since ORDER BY "date, token" doesn't
+-- match "sorted" option
+EXPLAIN (COSTS OFF) SELECT * FROM example_parent1 WHERE id = 1 ORDER BY date, token;
+SELECT * FROM example_parent1 WHERE id = 1 ORDER BY date, token;
+
+-- Postgres will sort by "date" since ORDER BY "date" matches "sorted" option
+EXPLAIN (COSTS OFF) SELECT * FROM example_parent1 WHERE id = 1 ORDER BY date;
+SELECT * FROM example_parent1 WHERE id = 1 ORDER BY date;
+
+-- Test sorted "id date token"
+CREATE TABLE example_parent2 (
+    id      int,
+    token   int,
+    date    timestamp,
+    num     int
+)
+PARTITION BY range(date);
+
+CREATE FOREIGN TABLE example_child2_1
+PARTITION OF example_parent2 FOR VALUES FROM ('2018-01-01') TO ('2018-02-01')
+SERVER parquet_srv
+OPTIONS (filename '@abs_srcdir@/data/partition/example_part1.parquet', sorted 'id date token');
+
+CREATE FOREIGN TABLE example_child2_2
+PARTITION OF example_parent2 FOR VALUES FROM ('2018-02-01') TO ('2018-03-01')
+SERVER parquet_srv
+OPTIONS (filename '@abs_srcdir@/data/partition/example_part2.parquet', sorted 'id date token');
+
+-- Postgres will sort by "token, date" because example_parent2 is partitioned
+-- by "date".
+EXPLAIN (COSTS OFF) SELECT * FROM example_parent2 WHERE id = 1 ORDER BY token, date;
+SELECT * FROM example_parent2 WHERE id = 1 ORDER BY token, date;
+
+-- Postgres won't sort since ORDER BY "id" is redundant and matches "sorted" option
+EXPLAIN (COSTS OFF) SELECT * FROM example_parent2 WHERE date = '2018-01-01' ORDER BY id;
+SELECT * FROM example_parent2 WHERE date = '2018-01-01' ORDER BY id;
+
+-- Postgres won't sort by "date, token" since ORDER BY "date, token" matches
+-- "sorted" option
+EXPLAIN (COSTS OFF) SELECT * FROM example_parent2 WHERE id = 1 ORDER BY date, token;
+SELECT * FROM example_parent2 WHERE id = 1 ORDER BY date, token;
+
+-- Postgres won't sort by "date" since ORDER BY "date" matches "sorted" option
+EXPLAIN (COSTS OFF) SELECT * FROM example_parent2 WHERE id = 1 ORDER BY date;
+SELECT * FROM example_parent2 WHERE id = 1 ORDER BY date;
+
+-- Test window functions
+
+-- Postgres will sort by "token, date" because example_parent1 is partitioned
+-- by "date".
+EXPLAIN (COSTS OFF)
+SELECT max(max_num) AS max_num
+FROM (
+    SELECT max(num) OVER w AS max_num, token
+    FROM example_parent1
+    WHERE id = 1 AND (token BETWEEN 1 AND 2)
+    WINDOW w AS (PARTITION BY token ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+) t
+GROUP BY token
+ORDER BY token;
+
+-- Postgres won't sort by "token, date" since query pathkeys match "sorted" option
+-- and "id" is a redundant key
+EXPLAIN (COSTS OFF)
+SELECT max(max_num) AS max_num
+FROM (
+    SELECT max(num) OVER w AS max_num, token
+    FROM example_child1_1
+    WHERE id = 1 AND (token BETWEEN 1 AND 2)
+    WINDOW w AS (PARTITION BY token ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+) t
+GROUP BY token
+ORDER BY token;
+
+-- Postgres won't sort by "token" since query pathkeys match "sorted" option
+-- and "id" is a redundant key
+EXPLAIN (COSTS OFF)
+SELECT max(max_num) AS max_num
+FROM (
+    SELECT max(num) OVER w AS max_num, token
+    FROM example_child1_1
+    WHERE id = 1 AND (token BETWEEN 1 AND 2)
+    WINDOW w AS (PARTITION BY token ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+) t
+GROUP BY token
+ORDER BY token;
+
+-- Postgres will sort by "date" since query pathkeys don't match "sorted" option
+EXPLAIN (COSTS OFF)
+SELECT max(max_num) AS max_num
+FROM (
+    SELECT max(num) OVER w AS max_num, token
+    FROM example_child1_1
+    WHERE id = 1 AND (token BETWEEN 1 AND 2)
+    WINDOW w AS (PARTITION BY date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+) t
+GROUP BY token
+ORDER BY token;
+
+-- Postgres will sort by "token, date" since query pathkeys don't match "sorted" option
+EXPLAIN (COSTS OFF)
+SELECT max(max_num) AS max_num
+FROM (
+    SELECT max(num) OVER w AS max_num, token
+    FROM example_child1_1
+    WHERE (token BETWEEN 1 AND 2)
+    WINDOW w AS (PARTITION BY token ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+) t
+GROUP BY token
+ORDER BY token;
+
+-- Postgres will sort by "token, date" because example_parent2 is partitioned
+-- by "date".
+EXPLAIN (COSTS OFF)
+SELECT max(max_num) AS max_num
+FROM (
+    SELECT max(num) OVER w AS max_num, token
+    FROM example_parent2
+    WHERE id = 1 AND (token BETWEEN 1 AND 2)
+    WINDOW w AS (PARTITION BY token ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+) t
+GROUP BY token
+ORDER BY token;
+
+-- Postgres will sort by "token, date" since query pathkeys don't match
+-- "sorted" option
+EXPLAIN (COSTS OFF)
+SELECT max(max_num) AS max_num
+FROM (
+    SELECT max(num) OVER w AS max_num, token
+    FROM example_child2_1
+    WHERE id = 1 AND (token BETWEEN 1 AND 2)
+    WINDOW w AS (PARTITION BY token ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+) t
+GROUP BY token
+ORDER BY token;
+
+-- Postgres will sort by "token" since query pathkeys don't match "sorted" option
+EXPLAIN (COSTS OFF)
+SELECT max(max_num) AS max_num
+FROM (
+    SELECT max(num) OVER w AS max_num, token
+    FROM example_child2_1
+    WHERE id = 1 AND (token BETWEEN 1 AND 2)
+    WINDOW w AS (PARTITION BY token ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+) t
+GROUP BY token
+ORDER BY token;
+
+-- Postgres will sort by "token" since query pathkeys don't match "sorted" option
+EXPLAIN (COSTS OFF)
+SELECT max(max_num) AS max_num
+FROM (
+    SELECT max(num) OVER w AS max_num, token
+    FROM example_child2_1
+    WHERE id = 1 AND (token BETWEEN 1 AND 2)
+    WINDOW w AS (PARTITION BY date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+) t
+GROUP BY token
+ORDER BY token;
+
+-- Postgres will sort by "token, date" since query pathkeys don't match
+-- "sorted" option
+EXPLAIN (COSTS OFF)
+SELECT max(max_num) AS max_num
+FROM (
+    SELECT max(num) OVER w AS max_num, token
+    FROM example_child2_1
+    WHERE (token BETWEEN 1 AND 2)
+    WINDOW w AS (PARTITION BY token ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+) t
+GROUP BY token
+ORDER BY token;
+
