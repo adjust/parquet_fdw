@@ -10,6 +10,7 @@ extern "C"
 #include "utils/memutils.h"
 #include "utils/memdebug.h"
 #include "utils/timestamp.h"
+#include "utils/numeric.h"
 }
 
 #if PG_VERSION_NUM < 130000
@@ -69,6 +70,8 @@ to_postgres_type(int arrow_type)
             return TIMESTAMPOID;
         case arrow::Type::DATE32:
             return DATEOID;
+        case arrow::Type::DECIMAL:
+            return NUMERICOID;
         default:
             return InvalidOid;
     }
@@ -114,6 +117,18 @@ bytes_to_postgres_type(const char *bytes, Size len, const arrow::DataType *arrow
         case arrow::Type::DATE32:
             return DateADTGetDatum(*(int32 *) bytes +
                                    (UNIX_EPOCH_JDATE - POSTGRES_EPOCH_JDATE));
+        case arrow::Type::DECIMAL128: {
+            auto dectype = (arrow::Decimal128Type *)arrow_type;
+            std::string val = arrow::Decimal128(bytes).ToString(dectype->scale());
+
+            return NumericGetDatum(DirectFunctionCall1(numeric_in, CStringGetDatum(val.c_str())));
+        }
+        case arrow::Type::DECIMAL256: {
+            auto dectype = (arrow::Decimal256Type *)arrow_type;
+            std::string val = arrow::Decimal256(bytes).ToString(dectype->scale());
+
+            return NumericGetDatum(DirectFunctionCall1(numeric_in, CStringGetDatum(val.c_str())));
+        }
         default:
             return PointerGetDatum(NULL);
     }
