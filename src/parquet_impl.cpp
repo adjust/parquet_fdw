@@ -393,7 +393,7 @@ row_group_matches_filter(parquet::Statistics *stats,
                 Datum   lower;
                 int     cmpres;
                 bool    satisfies;
-                std::string min = std::move(stats->EncodeMin());
+                std::string min = stats->EncodeMin();
 
                 lower = bytes_to_postgres_type(min.c_str(), min.length(),
                                                arrow_type);
@@ -414,7 +414,7 @@ row_group_matches_filter(parquet::Statistics *stats,
                 Datum   upper;
                 int     cmpres;
                 bool    satisfies;
-                std::string max = std::move(stats->EncodeMax());
+                std::string max = stats->EncodeMax();
 
                 upper = bytes_to_postgres_type(max.c_str(), max.length(),
                                                arrow_type);
@@ -434,8 +434,8 @@ row_group_matches_filter(parquet::Statistics *stats,
             {
                 Datum   lower,
                         upper;
-                std::string min = std::move(stats->EncodeMin());
-                std::string max = std::move(stats->EncodeMax());
+                std::string min = stats->EncodeMin();
+                std::string max = stats->EncodeMax();
 
                 lower = bytes_to_postgres_type(min.c_str(), min.length(),
                                                arrow_type);
