@@ -14,6 +14,9 @@ make install
 or in case when PostgreSQL is installed in a custom location:
 ```sh
 make install PG_CONFIG=/path/to/pg_config
+
+# generate compile_commands.json
+sudo bear -- make install PG_CONFIG=/usr/local/pgsql/bin/pg_config
 ```
 It is possible to pass additional compilation flags through either custom
 `CCFLAGS` or standard `PG_CFLAGS`, `PG_CXXFLAGS`, `PG_CPPFLAGS` variables.

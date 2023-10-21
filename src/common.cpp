@@ -27,7 +27,7 @@ exc_palloc(std::size_t size)
 	void	   *ret;
 	MemoryContext context = CurrentMemoryContext;
 
-	AssertArg(MemoryContextIsValid(context));
+	Assert(MemoryContextIsValid(context));
 
 	if (!AllocSizeIsValid(size))
 		throw std::bad_alloc();
