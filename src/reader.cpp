@@ -385,12 +385,28 @@ Datum ParquetReader::read_primitive_type(arrow::Array *array,
             res = Int8GetDatum(value);
             break;
         }
+        case arrow::Type::UINT8:
+        {
+            arrow::UInt8Array *uintarray = (arrow::UInt8Array *) array;
+            unsigned value = uintarray->Value(i);
+
+            res = UInt8GetDatum(value);
+            break;
+        }
         case arrow::Type::INT16:
         {
             arrow::Int16Array *intarray = (arrow::Int16Array *) array;
             int value = intarray->Value(i);
 
             res = Int16GetDatum(value);
+            break;
+        }
+        case arrow::Type::UINT16:
+        {
+            arrow::UInt16Array *uintarray = (arrow::UInt16Array *) array;
+            unsigned value = uintarray->Value(i);
+
+            res = UInt16GetDatum(value);
             break;
         }
         case arrow::Type::INT32:
@@ -401,12 +417,28 @@ Datum ParquetReader::read_primitive_type(arrow::Array *array,
             res = Int32GetDatum(value);
             break;
         }
+        case arrow::Type::UINT32:
+        {
+            arrow::UInt32Array *uintarray = (arrow::UInt32Array *) array;
+            unsigned value = uintarray->Value(i);
+
+            res = UInt32GetDatum(value);
+            break;
+        }
         case arrow::Type::INT64:
         {
             arrow::Int64Array *intarray = (arrow::Int64Array *) array;
             int64 value = intarray->Value(i);
 
             res = Int64GetDatum(value);
+            break;
+        }
+        case arrow::Type::UINT64:
+        {
+            arrow::UInt64Array *uintarray = (arrow::UInt64Array *) array;
+            uint64 value = uintarray->Value(i);
+
+            res = UInt64GetDatum(value);
             break;
         }
         case arrow::Type::FLOAT:
@@ -426,6 +458,7 @@ Datum ParquetReader::read_primitive_type(arrow::Array *array,
             break;
         }
         case arrow::Type::STRING:
+        case arrow::Type::FIXED_SIZE_BINARY:
         case arrow::Type::BINARY:
         {
             arrow::BinaryArray *binarray = (arrow::BinaryArray *) array;
@@ -505,7 +538,7 @@ Datum ParquetReader::nested_list_to_datum(arrow::ListArray *larray, int pos,
 
 #if SIZEOF_DATUM == 8
     /* Fill values and nulls arrays */
-    if (array->null_count() == 0 && typinfo.arrow.type_id == arrow::Type::INT64)
+    if (array->null_count() == 0 && (typinfo.arrow.type_id == arrow::Type::INT64 || typinfo.arrow.type_id == arrow::Type::UINT64))
     {
         /*
          * Ok, there are no nulls, so probably we could just memcpy the
