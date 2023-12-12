@@ -859,7 +859,9 @@ create_foreign_table_query(const char *tablename,
         else
             is_first = false;
 
+        appendStringInfoChar(&str, '"');
         appendStringInfoString(&str, paths[i]);
+        appendStringInfoChar(&str, '"');
     }
     appendStringInfoChar(&str, '\'');
 
