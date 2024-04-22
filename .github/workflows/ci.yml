@@ -13,10 +13,6 @@ jobs:
       fail-fast: false
       matrix:
         pg: [16, 15, 14, 13, 12, 11, 10]
-        ccflags: ['']
-        include:
-          - pg: 13
-            ccflags: '-DCACHING_TEST'
     name: PostgreSQL ${{ matrix.pg }}
     runs-on: ubuntu-latest
     steps:

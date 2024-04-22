@@ -331,8 +331,11 @@ convert_const(Const *c, Oid dst_oid)
                 getTypeOutputInfo(c->consttype, &output_fn, &isvarlena);
                 getTypeInputInfo(dst_oid, &input_fn, &input_param);
 
-                str = DatumGetCString(OidOutputFunctionCall(output_fn,
-                                                            c->constvalue));
+                // pg_16 update
+                char* output = OidOutputFunctionCall(output_fn, c->constvalue);
+                Datum datumValue = PointerGetDatum(output);
+                str = DatumGetCString(datumValue);
+                // str = DatumGetCString(OidOutputFunctionCall(output_fn, c->constvalue));
                 newc->constvalue = OidInputFunctionCall(input_fn, str,
                                                         input_param, 0);
 
@@ -948,9 +951,17 @@ OidFunctionCall1NullableArg(Oid functionId, Datum arg, bool argisnull)
 static List *
 get_filenames_from_userfunc(const char *funcname, const char *funcarg)
 {
+//pg16 update
+#if PG_VERSION_NUM > 160000
+    Node* minimalContext = new Node();
+    List* f = stringToQualifiedNameList(funcname, minimalContext);
+    delete minimalContext;
+#else
+    List* f = stringToQualifiedNameList(funcname);
+#endif
+
     Jsonb      *j = NULL;
     Oid         funcid;
-    List       *f = stringToQualifiedNameList(funcname);
     Datum       filenames;
     Oid         jsonboid = JSONBOID;
     Datum      *values;
@@ -1265,9 +1276,16 @@ parquetGetForeignPaths(PlannerInfo *root,
                                  NULL);
 
         /* Create PathKey for the attribute from "sorted" option */
-        attr_pathkeys = build_expression_pathkey(root, (Expr *) var, NULL,
-                                                sort_op, baserel->relids,
-                                                true);
+        // pg16- pdate
+        #if PG_VERSION_NUM > 160000
+            attr_pathkeys = build_expression_pathkey(root, (Expr *) var,
+                                                    sort_op, baserel->relids,
+                                                    true);
+        #else
+            attr_pathkeys = build_expression_pathkey(root, (Expr *) var, NULL,
+                                                    sort_op, baserel->relids,
+                                                    true);
+        #endif
 
         if (attr_pathkeys != NIL)
         {
@@ -2080,8 +2098,16 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
         }
         else if (strcmp(def->defname, "files_func") == 0)
         {
+            //pg16 update
+            #if PG_VERSION_NUM > 160000
+                Node* minimalContext = new Node();
+                List *funcname = stringToQualifiedNameList(defGetString(def), minimalContext);
+                delete minimalContext;
+            #else
+                List   *funcname = stringToQualifiedNameList(defGetString(def));
+            #endif
+
             Oid     jsonboid = JSONBOID;
-            List   *funcname = stringToQualifiedNameList(defGetString(def));
             Oid     funcoid;
             Oid     rettype;
 
