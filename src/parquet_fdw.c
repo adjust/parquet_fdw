@@ -1,15 +1,9 @@
 #include "postgres.h"
 #include "fmgr.h"
 
-#include "access/reloptions.h"
-#include "catalog/pg_foreign_table.h"
-#include "commands/defrem.h"
 #include "commands/explain.h"
 #include "foreign/fdwapi.h"
-#include "optimizer/planmain.h"
-#include "utils/builtins.h"
 #include "utils/guc.h"
-#include "utils/elog.h"
 
 
 PG_MODULE_MAGIC;
