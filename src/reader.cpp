@@ -1,11 +1,7 @@
 #include <list>
 
-#include "arrow/api.h"
-#include "arrow/io/api.h"
-#include "arrow/array.h"
 #include "parquet/arrow/reader.h"
 #include "parquet/arrow/schema.h"
-#include "parquet/exception.h"
 #include "parquet/file_reader.h"
 #include "parquet/statistics.h"
 

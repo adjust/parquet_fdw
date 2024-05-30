@@ -2,7 +2,6 @@
 #define PARQUET_FDW_READER_HPP
 
 #include <memory>
-#include <mutex>
 #include <set>
 #include <vector>
 
@@ -15,7 +14,6 @@ extern "C"
 #include "fmgr.h"
 #include "access/tupdesc.h"
 #include "executor/tuptable.h"
-#include "nodes/pg_list.h"
 #include "storage/spin.h"
 }
 
