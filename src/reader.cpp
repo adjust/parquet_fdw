@@ -875,6 +875,7 @@ public:
          * row_group cannot be less than zero at this point so it is safe to cast
          * it to unsigned int
          */
+        Assert(this->row_group >= 0);
         if ((uint) this->row_group >= this->rowgroups.size())
             return false;
 
@@ -1024,7 +1025,7 @@ public:
 
     void rescan(void)
     {
-        this->row_group = 0;
+        this->row_group = -1;
         this->row = 0;
         this->num_rows = 0;
     }
@@ -1111,6 +1112,7 @@ public:
          * row_group cannot be less than zero at this point so it is safe to cast
          * it to unsigned int
          */
+        Assert(this->row_group >= 0);
         if ((uint) this->row_group >= this->rowgroups.size())
             return false;
 
@@ -1376,7 +1378,7 @@ public:
 
     void rescan(void)
     {
-        this->row_group = 0;
+        this->row_group = -1;
         this->row = 0;
         this->num_rows = 0;
     }
