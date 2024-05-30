@@ -1792,7 +1792,7 @@ parquetAcquireSampleRowsFunc(Relation relation, int /* elevel */,
 
     delete festate;
 
-    return cnt - 1;
+    return cnt;
 }
 
 extern "C" bool
