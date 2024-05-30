@@ -172,6 +172,12 @@ EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY one;
 EXPLAIN (COSTS OFF) SELECT * FROM example1;
 SELECT SUM(one) FROM example1;
 
+-- test rescan
+SET enable_material = false;
+EXPLAIN (COSTS OFF)
+SELECT e1.one, e2.one FROM example1 e1, (SELECT * FROM example1) e2 WHERE e1.one < e2.one ORDER BY 1, 2;
+SELECT e1.one, e2.one FROM example1 e1, (SELECT * FROM example1) e2 WHERE e1.one < e2.one ORDER BY 1, 2;
+
 -- multiple sorting keys
 CREATE FOREIGN TABLE example_multisort (
     one     INT8,
