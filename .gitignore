@@ -8,3 +8,5 @@ test/expected/*.out
 regression.diffs
 regression.out
 results
+.cache
+compile_commands.json
