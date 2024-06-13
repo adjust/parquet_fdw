@@ -990,6 +990,8 @@ get_table_options(Oid relid, ParquetFdwPlanState *fdw_private)
     char         *funcname = NULL;
     char         *funcarg = NULL;
 
+    fdw_private->filenames = NIL;
+    fdw_private->attrs_sorted = NIL;
     fdw_private->use_mmap = false;
     fdw_private->use_threads = false;
     fdw_private->max_open_files = 0;
@@ -1702,6 +1704,7 @@ parquetAcquireSampleRowsFunc(Relation relation, int /* elevel */,
     ListCell       *lc;
     std::string     error;
 
+    MemSet(&fdw_private, 0, sizeof(fdw_private));
     get_table_options(RelationGetRelid(relation), &fdw_private);
 
     for (int i = 0; i < tupleDesc->natts; ++i)
