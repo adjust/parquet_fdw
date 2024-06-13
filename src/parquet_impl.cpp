@@ -1268,16 +1268,15 @@ parquetGetForeignPaths(PlannerInfo *root,
                                  NULL);
 
         /* Create PathKey for the attribute from "sorted" option */
-        // pg16- pdate
-        #if PG_VERSION_NUM > 160000
-            attr_pathkeys = build_expression_pathkey(root, (Expr *) var,
-                                                    sort_op, baserel->relids,
-                                                    true);
-        #else
-            attr_pathkeys = build_expression_pathkey(root, (Expr *) var, NULL,
-                                                    sort_op, baserel->relids,
-                                                    true);
-        #endif
+#if PG_VERSION_NUM >= 160000
+        attr_pathkeys = build_expression_pathkey(root, (Expr *) var,
+                                                sort_op, baserel->relids,
+                                                true);
+#else
+        attr_pathkeys = build_expression_pathkey(root, (Expr *) var, NULL,
+                                                sort_op, baserel->relids,
+                                                true);
+#endif
 
         if (attr_pathkeys != NIL)
         {
