@@ -2089,15 +2089,11 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
         }
         else if (strcmp(def->defname, "files_func") == 0)
         {
-            //pg16 update
-            #if PG_VERSION_NUM > 160000
-                Node* minimalContext = new Node();
-                List *funcname = stringToQualifiedNameList(defGetString(def), minimalContext);
-                delete minimalContext;
-            #else
-                List   *funcname = stringToQualifiedNameList(defGetString(def));
-            #endif
-
+#if PG_VERSION_NUM >= 160000
+            List       *funcname = stringToQualifiedNameList(defGetString(def), NULL);
+#else
+            List       *funcname = stringToQualifiedNameList(defGetString(def));
+#endif
             Oid     jsonboid = JSONBOID;
             Oid     funcoid;
             Oid     rettype;
