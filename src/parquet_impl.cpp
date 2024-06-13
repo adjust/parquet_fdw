@@ -331,11 +331,7 @@ convert_const(Const *c, Oid dst_oid)
                 getTypeOutputInfo(c->consttype, &output_fn, &isvarlena);
                 getTypeInputInfo(dst_oid, &input_fn, &input_param);
 
-                // pg_16 update
-                char* output = OidOutputFunctionCall(output_fn, c->constvalue);
-                Datum datumValue = PointerGetDatum(output);
-                str = DatumGetCString(datumValue);
-                // str = DatumGetCString(OidOutputFunctionCall(output_fn, c->constvalue));
+                str = OidOutputFunctionCall(output_fn, c->constvalue);
                 newc->constvalue = OidInputFunctionCall(input_fn, str,
                                                         input_param, 0);
 
