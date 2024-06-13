@@ -947,15 +947,11 @@ OidFunctionCall1NullableArg(Oid functionId, Datum arg, bool argisnull)
 static List *
 get_filenames_from_userfunc(const char *funcname, const char *funcarg)
 {
-//pg16 update
-#if PG_VERSION_NUM > 160000
-    Node* minimalContext = new Node();
-    List* f = stringToQualifiedNameList(funcname, minimalContext);
-    delete minimalContext;
+#if PG_VERSION_NUM >= 160000
+    List       *f = stringToQualifiedNameList(funcname, NULL);
 #else
-    List* f = stringToQualifiedNameList(funcname);
+    List       *f = stringToQualifiedNameList(funcname);
 #endif
-
     Jsonb      *j = NULL;
     Oid         funcid;
     Datum       filenames;
