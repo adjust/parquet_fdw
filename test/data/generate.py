@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 
 import pyarrow.parquet as pq
-import numpy as np
 import pandas as pd
 import pyarrow as pa
-import pyarrow.parquet as pq
 from datetime import datetime, date, timedelta
 
 # example1.parquet file
@@ -24,9 +22,9 @@ table1 = pa.Table.from_pandas(df1)
 df2 = pd.DataFrame({'one': [4, 5, 6],
                     'two': [[10, 11, 12], [13, 14, 15], [16, 17, 18]],
                     'three': ['uno', 'dos', 'tres'],
-                    'four': [datetime(2018, 1, 4) + timedelta(seconds=10),
-                             datetime(2018, 1, 5) + timedelta(milliseconds=10),
-                             datetime(2018, 1, 6) + timedelta(microseconds=10)],
+                    'four': [datetime(2018, 1, 4)+timedelta(seconds=10),
+                             datetime(2018, 1, 5)+timedelta(milliseconds=10),
+                             datetime(2018, 1, 6)+timedelta(microseconds=10)],
                     'five': [date(2018, 1, 4),
                              date(2018, 1, 5),
                              date(2018, 1, 6)],
@@ -69,7 +67,7 @@ mdt2 = pa.map_(pa.date32(), pa.int16())
 df = pd.DataFrame({
         'one': pd.Series([
             [(1, 'foo'), (2, 'bar'), (3, 'baz')],
-            [(4, 'test1'), (5,'test2')],
+            [(4, 'test1'), (5, 'test2')],
         ]),
         'two': pd.Series([
             [(date(2018, 1, 1), 10), (date(2018, 1, 2), 15)],
@@ -89,22 +87,28 @@ with pq.ParquetWriter('complex/example3.parquet', table.schema) as writer:
     writer.write_table(table)
 
 # Parquet files for partitions
-df_part1 = pd.DataFrame({'id': [1, 1, 2],
+df_part1 = pd.DataFrame({'id': [1, 1, 2, 3],
+                         'token': [1, 1, 2, 2],
                          'date': [datetime(2018, 1, 1),
                                   datetime(2018, 1, 2),
-                                  datetime(2018, 1, 3)],
-                         'num': [10, 23, 9]})
+                                  datetime(2018, 1, 3),
+                                  datetime(2018, 1, 4)],
+                         'num': [10, 23, 9, 38]})
 table_part1 = pa.Table.from_pandas(df_part1)
 
-with pq.ParquetWriter('partition/example_part1.parquet', table_part1.schema) as writer:
+with pq.ParquetWriter(
+        'partition/example_part1.parquet', table_part1.schema) as writer:
     writer.write_table(table_part1)
 
-df_part2 = pd.DataFrame({'id': [1, 2, 2],
+df_part2 = pd.DataFrame({'id': [1, 2, 2, 3],
+                         'token': [1, 2, 2, 2],
                          'date': [datetime(2018, 2, 1),
                                   datetime(2018, 2, 2),
-                                  datetime(2018, 2, 3)],
-                         'num': [59, 1, 32]})
+                                  datetime(2018, 2, 3),
+                                  datetime(2018, 2, 4)],
+                         'num': [59, 1, 32, 96]})
 table_part2 = pa.Table.from_pandas(df_part2)
 
-with pq.ParquetWriter('partition/example_part2.parquet', table_part2.schema) as writer:
+with pq.ParquetWriter(
+        'partition/example_part2.parquet', table_part2.schema) as writer:
     writer.write_table(table_part2)
