@@ -235,7 +235,7 @@ public:
             ExecStoreVirtualTuple(slot);
         }
 
-        return res;
+        return res == RS_SUCCESS;
     }
 
     void rescan(void)
