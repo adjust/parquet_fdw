@@ -8,3 +8,4 @@ test/expected/*.out
 regression.diffs
 regression.out
 results
+.deps

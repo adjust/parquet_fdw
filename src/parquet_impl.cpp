@@ -320,8 +320,7 @@ convert_const(Const *c, Oid dst_oid)
                 getTypeOutputInfo(c->consttype, &output_fn, &isvarlena);
                 getTypeInputInfo(dst_oid, &input_fn, &input_param);
 
-                str = DatumGetCString(OidOutputFunctionCall(output_fn,
-                                                            c->constvalue));
+                str = OidOutputFunctionCall(output_fn, c->constvalue);
                 newc->constvalue = OidInputFunctionCall(input_fn, str,
                                                         input_param, 0);
 
@@ -939,7 +938,11 @@ get_filenames_from_userfunc(const char *funcname, const char *funcarg)
 {
     Jsonb      *j = NULL;
     Oid         funcid;
+#if PG_VERSION_NUM < 160000
     List       *f = stringToQualifiedNameList(funcname);
+#else
+    List       *f = stringToQualifiedNameList(funcname, NULL);
+#endif
     Datum       filenames;
     Oid         jsonboid = JSONBOID;
     Datum      *values;
@@ -1256,7 +1259,11 @@ parquetGetForeignPaths(PlannerInfo *root,
                                  NULL);
 
         /* Create PathKey for the attribute from "sorted" option */
+#if PG_VERSION_NUM < 160000
         attr_pathkeys = build_expression_pathkey(root, (Expr *) var, NULL,
+#else
+        attr_pathkeys = build_expression_pathkey(root, (Expr *) var,
+#endif
                                                 sort_op, baserel->relids,
                                                 true);
 
@@ -2073,7 +2080,11 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
         else if (strcmp(def->defname, "files_func") == 0)
         {
             Oid     jsonboid = JSONBOID;
+#if PG_VERSION_NUM < 160000
             List   *funcname = stringToQualifiedNameList(defGetString(def));
+#else
+            List   *funcname = stringToQualifiedNameList(defGetString(def), NULL);
+#endif
             Oid     funcoid;
             Oid     rettype;
 
