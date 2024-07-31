@@ -324,8 +324,7 @@ convert_const(Const *c, Oid dst_oid)
                 getTypeOutputInfo(c->consttype, &output_fn, &isvarlena);
                 getTypeInputInfo(dst_oid, &input_fn, &input_param);
 
-                str = DatumGetCString(OidOutputFunctionCall(output_fn,
-                                                            c->constvalue));
+                str = OidOutputFunctionCall(output_fn, c->constvalue);
                 newc->constvalue = OidInputFunctionCall(input_fn, str,
                                                         input_param, 0);
 
@@ -941,9 +940,13 @@ OidFunctionCall1NullableArg(Oid functionId, Datum arg, bool argisnull)
 static List *
 get_filenames_from_userfunc(const char *funcname, const char *funcarg)
 {
+#if PG_VERSION_NUM >= 160000
+    List       *f = stringToQualifiedNameList(funcname, NULL);
+#else
+    List       *f = stringToQualifiedNameList(funcname);
+#endif
     Jsonb      *j = NULL;
     Oid         funcid;
-    List       *f = stringToQualifiedNameList(funcname);
     Datum       filenames;
     Oid         jsonboid = JSONBOID;
     Datum      *values;
@@ -1263,9 +1266,15 @@ parquetGetForeignPaths(PlannerInfo *root,
                                  NULL);
 
         /* Create PathKey for the attribute from "sorted" option */
+#if PG_VERSION_NUM >= 160000
+        attr_pathkeys = build_expression_pathkey(root, (Expr *) var,
+                                                sort_op, baserel->relids,
+                                                false);
+#else
         attr_pathkeys = build_expression_pathkey(root, (Expr *) var, NULL,
                                                 sort_op, baserel->relids,
                                                 false);
+#endif
 
         if (attr_pathkeys == NIL)
             break;
@@ -2097,8 +2106,12 @@ parquet_fdw_validator_impl(PG_FUNCTION_ARGS)
         }
         else if (strcmp(def->defname, "files_func") == 0)
         {
+#if PG_VERSION_NUM >= 160000
+            List       *funcname = stringToQualifiedNameList(defGetString(def), NULL);
+#else
+            List       *funcname = stringToQualifiedNameList(defGetString(def));
+#endif
             Oid     jsonboid = JSONBOID;
-            List   *funcname = stringToQualifiedNameList(defGetString(def));
             Oid     funcoid;
             Oid     rettype;
 
