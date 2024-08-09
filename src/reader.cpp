@@ -1003,10 +1003,21 @@ public:
                     }
                     case arrow::Type::MAP:
                     {
-                        arrow::MapArray* maparray = (arrow::MapArray*) array;
+                        arrow::MapArray *maparray = (arrow::MapArray*) array;
+                        Datum       jsonb = this->map_to_datum(maparray, chunkInfo.pos, typinfo);
 
-                        slot->tts_values[attr] =
-                            this->map_to_datum(maparray, chunkInfo.pos, typinfo);
+                        /*
+                         * Copy jsonb into memory block allocated by
+                         * FastAllocator to prevent its destruction though
+                         * to be able to recycle it once it fulfilled its
+                         * purpose.
+                         */
+                        void       *jsonb_val = allocator->fast_alloc(VARSIZE_ANY(jsonb));
+
+                        memcpy(jsonb_val, DatumGetPointer(jsonb), VARSIZE_ANY(jsonb));
+                        pfree(DatumGetPointer(jsonb));
+
+                        slot->tts_values[attr] = PointerGetDatum(jsonb_val);
                         break;
                     }
                     default:
@@ -1255,9 +1266,7 @@ public:
                     case arrow::Type::MAP:
                         {
                             arrow::MapArray* maparray = (arrow::MapArray*) array;
-
-                            Datum jsonb =
-                                this->map_to_datum(maparray, j, typinfo);
+                            Datum       jsonb = this->map_to_datum(maparray, j, typinfo);
 
                             /*
                              * Copy jsonb into memory block allocated by
@@ -1265,10 +1274,13 @@ public:
                              * to be able to recycle it once it fulfilled its
                              * purpose.
                              */
-                            void *res = allocator->fast_alloc(VARSIZE_ANY(jsonb));
-                            memcpy(res, (Jsonb *) jsonb, VARSIZE_ANY(jsonb));
-                            ((Datum *) data)[row] = (Datum) res;
-                            pfree((Jsonb *) jsonb);
+                            void       *jsonb_val = allocator->fast_alloc(VARSIZE_ANY(jsonb));
+
+                            memcpy(jsonb_val, DatumGetPointer(jsonb), VARSIZE_ANY(jsonb));
+                            pfree(DatumGetPointer(jsonb));
+
+                            ((Datum *) data)[row] = PointerGetDatum(jsonb_val);
+
                             break;
                         }
                     default:
