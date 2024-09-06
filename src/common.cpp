@@ -51,10 +51,14 @@ to_postgres_type(int arrow_type)
         case arrow::Type::BOOL:
             return BOOLOID;
         case arrow::Type::INT8:
+        case arrow::Type::UINT8:
         case arrow::Type::INT16:
             return INT2OID;
+        case arrow::Type::UINT16:
         case arrow::Type::INT32:
             return INT4OID;
+        case arrow::Type::UINT32:
+        case arrow::Type::UINT64:
         case arrow::Type::INT64:
             return INT8OID;
         case arrow::Type::FLOAT:
@@ -63,6 +67,7 @@ to_postgres_type(int arrow_type)
             return FLOAT8OID;
         case arrow::Type::STRING:
             return TEXTOID;
+        case arrow::Type::FIXED_SIZE_BINARY:
         case arrow::Type::BINARY:
             return BYTEAOID;
         case arrow::Type::TIMESTAMP:
@@ -88,18 +93,27 @@ bytes_to_postgres_type(const char *bytes, Size len, const arrow::DataType *arrow
             return BoolGetDatum(*(bool *) bytes);
         case arrow::Type::INT8:
             return Int16GetDatum(*(int8 *) bytes);
+	case arrow::Type::UINT8:
+	    return UInt8GetDatum(*(uint8 *) bytes);
         case arrow::Type::INT16:
             return Int16GetDatum(*(int16 *) bytes);
+        case arrow::Type::UINT16:
+            return UInt16GetDatum(*(uint16 *) bytes);
         case arrow::Type::INT32:
             return Int32GetDatum(*(int32 *) bytes);
+        case arrow::Type::UINT32:
+            return UInt32GetDatum(*(uint32 *) bytes);
         case arrow::Type::INT64:
             return Int64GetDatum(*(int64 *) bytes);
+        case arrow::Type::UINT64:
+            return UInt64GetDatum(*(uint64 *) bytes);
         case arrow::Type::FLOAT:
             return Float4GetDatum(*(float *) bytes);
         case arrow::Type::DOUBLE:
             return Float8GetDatum(*(double *) bytes);
         case arrow::Type::STRING:
             return CStringGetTextDatum(bytes);
+        case arrow::Type::FIXED_SIZE_BINARY:
         case arrow::Type::BINARY:
             return PointerGetDatum(cstring_to_text_with_len(bytes, len));
         case arrow::Type::TIMESTAMP:
