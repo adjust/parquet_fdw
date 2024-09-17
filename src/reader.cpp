@@ -462,6 +462,22 @@ Datum ParquetReader::read_primitive_type(arrow::Array *array,
             res = DateADTGetDatum(d + (UNIX_EPOCH_JDATE - POSTGRES_EPOCH_JDATE));
             break;
         }
+        case arrow::Type::DECIMAL128:
+        {
+            arrow::Decimal128Array *decarray = (arrow::Decimal128Array *) array;
+            std::string val = decarray->FormatValue(i);
+
+            res = NumericGetDatum(DirectFunctionCall1(numeric_in, CStringGetDatum(val.c_str())));
+            break;
+        }
+        case arrow::Type::DECIMAL256:
+        {
+            arrow::Decimal256Array *decarray = (arrow::Decimal256Array *) array;
+            std::string val = decarray->FormatValue(i);
+
+            res = NumericGetDatum(DirectFunctionCall1(numeric_in, CStringGetDatum(val.c_str())));
+            break;
+        }
         /* TODO: add other types */
         default:
             throw Error("parquet_fdw: unsupported column type: %s",
