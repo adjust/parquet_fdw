@@ -44,6 +44,8 @@ options (
 );
 ```
 
+You can use [globbing](https://en.wikipedia.org/wiki/Glob_(programming)) to list all the Parquet files, like `options (filename '/mnt/userdata*.parquet')` and it will import all matching files. This can be usefull when you have a Hive directory structure, for instance organized by `year/month/day` and you can consider all Parquet files with `/mnt/userdata/**/*.parquet`. You can also use name enumerations using braces like `/mnt/userdata/data_{1,3}.parquet` that will consider only files `data_1.parquet` and `data_3.parquet`.
+
 ## Advanced
 
 Currently `parquet_fdw` supports the following column [types](https://github.com/apache/arrow/blob/master/cpp/src/arrow/type.h):

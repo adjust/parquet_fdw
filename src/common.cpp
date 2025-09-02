@@ -10,11 +10,31 @@ extern "C"
 #include "utils/memutils.h"
 #include "utils/memdebug.h"
 #include "utils/timestamp.h"
+#include "utils/palloc.h"
 }
+
+#ifndef PG_VERSION_NUM
+#error "PG_VERSION_NUM is not defined"
+#endif
 
 #if PG_VERSION_NUM < 130000
 #define MAXINT8LEN 25
 #endif
+
+/* --- PG version guards for MemoryContext alloc APIs (PG14+ uses Extended with flags) --- */
+#ifndef PARQUET_FDW_MCXT_GUARD
+#define PARQUET_FDW_MCXT_GUARD
+
+#if PG_VERSION_NUM >= 140000
+  #define PF_MCTX_ALLOC(ctx, sz)        MemoryContextAllocExtended((ctx), (sz), 0)
+  #define PF_MCTX_REALLOC(ctx, p, sz)   MemoryContextReallocExtended((ctx), (p), (sz), 0)
+#else
+  #define PF_MCTX_ALLOC(ctx, sz)        MemoryContextAlloc((ctx), (sz))
+  /* repalloc does not require context in pre-14 */
+  #define PF_MCTX_REALLOC(ctx, p, sz)   repalloc((p), (sz))
+#endif
+
+#endif /* PARQUET_FDW_MCXT_GUARD */
 
 /*
  * exc_palloc
@@ -34,7 +54,7 @@ exc_palloc(std::size_t size)
 
 	context->isReset = false;
 
-	ret = context->methods->alloc(context, size);
+	ret = PF_MCTX_ALLOC(context, size);
 	if (unlikely(ret == NULL))
 		throw std::bad_alloc();
 
@@ -178,7 +198,7 @@ void datum_to_jsonb(Datum value, Oid typoid, bool isnull, FmgrInfo *outfunc,
                 jb.val.string.val = strval;
             }
             else {
-                Datum numeric;
+                Datum numeric = (Datum) 0;
 
                 switch (typoid)
                 {
