@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: [16, 15, 14, 13, 12, 11, 10]
+        pg: [18, 17, 16, 15, 14, 13, 12]
         ccflags: ['']
         include:
           - pg: 13

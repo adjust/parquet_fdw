@@ -4,6 +4,12 @@
 
 Read-only Apache Parquet foreign data wrapper for PostgreSQL.
 
+## Requirements
+
+- PostgreSQL 12-18 (versions 10-11 are end-of-life and no longer tested)
+- C++17 compiler
+- Apache Arrow 0.15+ (`libarrow` and `libparquet`)
+
 ## Installation
 
 `parquet_fdw` requires `libarrow` and `libparquet` installed in your system (requires version 0.15+, for previous versions use branch [arrow-0.14](https://github.com/adjust/parquet_fdw/tree/arrow-0.14)). Please refer to [libarrow installation page](https://arrow.apache.org/install/) or [building guide](https://github.com/apache/arrow/blob/master/docs/source/developers/cpp/building.rst).
@@ -44,24 +50,29 @@ options (
 );
 ```
 
+You can use [globbing](https://en.wikipedia.org/wiki/Glob_(programming)) to list all the Parquet files, like `options (filename '/mnt/userdata*.parquet')` and it will import all matching files. This can be usefull when you have a Hive directory structure, for instance organized by `year/month/day` and you can consider all Parquet files with `/mnt/userdata/*/*/*.parquet`. You can also use named enumerations using braces like `/mnt/userdata/data_{1,3}.parquet` that will consider only files `data_1.parquet` and `data_3.parquet`.
+
 ## Advanced
 
 Currently `parquet_fdw` supports the following column [types](https://github.com/apache/arrow/blob/master/cpp/src/arrow/type.h):
 
-|   Arrow type |  SQL type |
-|-------------:|----------:|
-|         INT8 |      INT2 |
-|        INT16 |      INT2 |
-|        INT32 |      INT4 |
-|        INT64 |      INT8 |
-|        FLOAT |    FLOAT4 |
-|       DOUBLE |    FLOAT8 |
-|    TIMESTAMP | TIMESTAMP |
-|       DATE32 |      DATE |
-|       STRING |      TEXT |
-|       BINARY |     BYTEA |
-|         LIST |     ARRAY |
-|          MAP |     JSONB |
+|         Arrow type |                         SQL type |
+|-------------------:|---------------------------------:|
+|               INT8 |                             INT2 |
+|              INT16 |                             INT2 |
+|              INT32 |                             INT4 |
+|              INT64 |                             INT8 |
+|              FLOAT |                           FLOAT4 |
+|             DOUBLE |                           FLOAT8 |
+|          TIMESTAMP |                        TIMESTAMP |
+|             DATE32 |                             DATE |
+|             STRING |                             TEXT |
+|             BINARY |                            BYTEA |
+|               LIST |                            ARRAY |
+|                MAP |                            JSONB |
+|               UUID |                             UUID |
+| FIXED_SIZED_BINARY | UUID when length 16, else BINARY |
+|             BINARY |                           BINARY |
 
 Currently `parquet_fdw` doesn't support structs and nested lists.
 
@@ -88,6 +99,46 @@ GUC variables:
 * **parquet_fdw.use_threads** - global switch that allow user to enable or disable threads (default `true`);
 * **parquet_fdw.enable_multifile** - enable Multifile reader (default `true`).
 * **parquet_fdw.enable_multifile_merge** - enable Multifile Merge reader (default `true`).
+* **parquet_fdw.allowed_directories** - comma-separated list of directories from which Parquet files can be read. See [Security](#security) section below.
+
+### Security
+
+By default, `parquet_fdw` allows **only superusers** to create foreign tables that read Parquet files. This is because the extension can read any file accessible to the PostgreSQL server process.
+
+To allow non-superuser access, a superuser must configure the `parquet_fdw.allowed_directories` GUC variable with a comma-separated list of directories:
+
+```sql
+-- Allow reading from specific directories (superuser only)
+ALTER SYSTEM SET parquet_fdw.allowed_directories = '/data/parquet, /home/analytics/data';
+SELECT pg_reload_conf();
+```
+
+**Security model:**
+
+| User Type | `allowed_directories` | Access |
+|-----------|----------------------|--------|
+| Superuser | Empty (default) | All files accessible to PostgreSQL |
+| Superuser | Set | All files accessible to PostgreSQL |
+| Non-superuser | Empty (default) | **Denied** |
+| Non-superuser | Set | Only files within listed directories |
+
+**Important notes:**
+
+1. Paths are validated using `realpath()` to prevent symlink-based bypasses
+2. The `allowed_directories` setting uses `PGC_SUSET` context, meaning only superusers can modify it
+3. Path traversal attempts (e.g., `../`) are blocked by canonicalizing paths before validation
+4. The `files_func` option is also subject to these restrictions - paths returned by user-defined functions are validated
+
+**Example setup for multi-tenant environments:**
+
+```sql
+-- Create a dedicated directory for each department
+-- (run as superuser)
+ALTER SYSTEM SET parquet_fdw.allowed_directories = '/data/sales, /data/marketing';
+SELECT pg_reload_conf();
+
+-- Now non-superuser roles can create foreign tables pointing to these directories
+```
 
 ### Parallel queries
 
@@ -104,6 +155,25 @@ into public;
 ```
 
 It is important that `remote_schema` here is a path to a local filesystem directory and is double quoted.
+
+#### Finding Parquet files from `tables_map` option
+
+Foreign schema import also support specifying a mapping between tables and filenames with the `tables_map` option. Its value is a space-separated list of `key=value` values with table names as keys and Parquet files paths as values. Like for `filename`, file globbing can be used, and like with Linux PATH variable, the colon `:` is used to separate multiple paths within a value.
+
+```sql
+import foreign schema "/path/to/directory"
+from server parquet_srv
+into public options (tables_map 'table1=/path/to/directory/2022/*/*.parquet:/path/to/directory/2023/*/*.parquet table2=/path/to/directory{2024,2025}/*/*.parquet')
+;
+```
+
+As a security, the extension checks that the paths in the `tables_map` are within the external schema path, preventing accessing files elsewhere on the server. Also, if foreign schema `limit to` or `except` clauses are used specifiying table names, only these names will be considered in the `tables_map`.
+
+Tables created through the `tables_map` options are identical as if they were created with a `create foreign table` command with a `filename` option. All other options from the `import foreign schema` are transmitted to the `create foreign table`.
+
+Each table must have at least one Parquet file when created, to query Parquet field and map them to colomun names. Of course, files globbing is evaluated at query-time, so one can add files to a directory and have them considered in the query results.
+
+#### Finding Parquet files from `import_parquet` function
 
 Another way to import parquet files into foreign tables is to use `import_parquet` or `import_parquet_explicit`:
 
@@ -154,4 +224,28 @@ select import_parquet_explicit(
     '{"sorted": "one"}'
 );
 ```
+
+## Packaging
+
+### Debian / Ubuntu
+
+After `sudo make install PG_CONFIG=/usr/lib/postgresql/17/bin/pg_config`
+
+```sh
+cd Debian
+# Copy the new extension binary
+sudo cp ../parquet_fdw.so postgresql-17-parquet-fdw/usr/lib/postgresql/17/lib/
+# Copy LLVM bytecode
+sudo cp ../src/*.bc postgresql-17-parquet-fdw/usr/lib/postgresql/17/lib/bitcode/parquet_fdw/src/
+# Copy extension bytecode index from installation
+sudo cp /usr/lib/postgresql/17/lib/bitcode/parquet_fdw.index.bc postgresql-17-parquet-fdw/usr/lib/postgresql/17/lib/bitcode/parquet_fdw.index.bc
+# Create package
+dpkg-deb --build --root-owner-group postgresql-17-parquet-fdw
+```
+
+After installation, dont't forget to restart the PostgreSQL server.
+
+## Miscelaneous
+
+* [Synthetic documentation for developers, from AI](https://deepwiki.com/adjust/parquet_fdw)
 

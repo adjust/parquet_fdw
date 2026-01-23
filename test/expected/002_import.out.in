@@ -13,12 +13,13 @@ FROM SERVER parquet_srv
 INTO public
 OPTIONS (sorted 'one');
 \d
-                    List of relations
- Schema |   Name   |     Type      |        Owner        
---------+----------+---------------+---------------------
- public | example1 | foreign table | regress_parquet_fdw
- public | example2 | foreign table | regress_parquet_fdw
-(2 rows)
+                      List of relations
+ Schema |     Name     |     Type      |        Owner        
+--------+--------------+---------------+---------------------
+ public | example1     | foreign table | regress_parquet_fdw
+ public | example2     | foreign table | regress_parquet_fdw
+ public | example_uuid | foreign table | regress_parquet_fdw
+(3 rows)
 
 SELECT * FROM example2;
  one |   two   | three |        four         |    five    | six 

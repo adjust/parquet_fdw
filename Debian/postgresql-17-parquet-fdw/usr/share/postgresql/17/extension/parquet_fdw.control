@@ -1,0 +1,5 @@
+# postgres_fdw extension
+comment = 'foreign-data wrapper for parquet'
+default_version = '0.2'
+module_pathname = '$libdir/parquet_fdw'
+relocatable = true

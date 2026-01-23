@@ -57,10 +57,12 @@ struct Error : std::exception
 
 
 void *exc_palloc(std::size_t size);
-Oid to_postgres_type(int arrow_type);
+bool is_extension_uuid(const arrow::DataType *arrow_type);
+bool is_fixed_size_uuid(const arrow::DataType *arrow_type);
+Oid to_postgres_type(const arrow::DataType *arrow_type);
 Datum bytes_to_postgres_type(const char *bytes, Size len, const arrow::DataType *arrow_type);
 char *tolowercase(const char *input, char *output);
-arrow::Type::type get_arrow_list_elem_type(arrow::DataType *type);
+arrow::DataType *get_arrow_list_elem_type(arrow::DataType *type);
 void datum_to_jsonb(Datum value, Oid typoid, bool isnull, FmgrInfo *outfunc,
                     JsonbParseState *result, bool iskey);
 int32 string_to_int32(const char *s);

@@ -15,6 +15,7 @@ extern "C"
 #include "parser/parse_coerce.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/uuid.h"
 #include "utils/date.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -269,8 +270,8 @@ void ParquetReader::create_column_mapping(TupleDesc tupleDesc, const std::set<in
                         Assert(strct.children.size() == 2);
                         auto &key = strct.children[0];
                         auto &item = strct.children[1];
-                        Oid pg_key_type = to_postgres_type(key.field->type()->id());
-                        Oid pg_item_type = to_postgres_type(item.field->type()->id());
+                        Oid pg_key_type = to_postgres_type(key.field->type().get());
+                        Oid pg_item_type = to_postgres_type(item.field->type().get());
 
                         typinfo.children.emplace_back(key.field->type(),
                                                       pg_key_type);
@@ -344,6 +345,7 @@ Datum ParquetReader::do_cast(Datum val, const TypeInfo &typinfo)
         FlushErrorState();
 
         strncpy(errstr, errdata->message, ERROR_STR_LEN - 1);
+        errstr[ERROR_STR_LEN - 1] = '\0';
         FreeErrorData(errdata);
     }
     PG_END_TRY();
@@ -455,16 +457,83 @@ Datum ParquetReader::read_primitive_type(arrow::Array *array,
             int32 d = tsarray->Value(i);
 
             /*
-             * Postgres date starts with 2000-01-01 while unix date (which
-             * Parquet is using) starts with 1970-01-01. So we need to do
-             * simple calculations here.
-             */
+            * Postgres date starts with 2000-01-01 while unix date (which
+            * Parquet is using) starts with 1970-01-01. So we need to do
+            * simple calculations here.
+            */
             res = DateADTGetDatum(d + (UNIX_EPOCH_JDATE - POSTGRES_EPOCH_JDATE));
             break;
         }
+        case arrow::Type::FIXED_SIZE_BINARY:
+        {
+            arrow::FixedSizeBinaryArray *binarray = dynamic_cast<arrow::FixedSizeBinaryArray*>(array);
+            if (!binarray)
+            {
+                elog(ERROR, "parquet_fdw: Expected FixedSizeBinaryArray but got %s", array->type()->ToString().c_str());
+            }
+
+            if (typinfo.is_uuid)
+            {
+                const uint8_t *value = binarray->GetValue(i);
+
+                elog(DEBUG1, "parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                    value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+                    value[8], value[9], value[10], value[11], value[12], value[13], value[14], value[15]
+                );
+                pg_uuid_t *uuid_val = (pg_uuid_t*) this->allocator->fast_alloc(sizeof(pg_uuid_t));
+                memcpy(uuid_val->data, value, UUID_LEN);
+                res = UUIDPGetDatum(uuid_val);  // convert pointer to Datum
+            }
+            else
+            {
+                elog(DEBUG1, "parquet_fdw: Reading actual FIXED_SIZE_BINARY");
+                const int32_t vallen = binarray->byte_width();
+                const uint8_t *value = binarray->GetValue(i);
+
+                /* Build bytea */
+                int64 bytea_len = vallen + VARHDRSZ;
+                bytea *b = (bytea *) this->allocator->fast_alloc(bytea_len);
+                SET_VARSIZE(b, bytea_len);
+                memcpy(VARDATA(b), value, vallen);
+
+                res = PointerGetDatum(b);
+            }
+            break;
+        }
+        case arrow::Type::EXTENSION:
+        {
+            arrow::BinaryArray *binarray = (arrow::BinaryArray *) array;
+
+            int32_t vallen = 0;
+            const char *value = reinterpret_cast<const char*>(binarray->GetValue(i, &vallen));
+
+            if (typinfo.is_uuid)
+            {
+                elog(DEBUG1, "parquet_fdw: Reading UUID from EXTENSION: %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                    value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+                    value[8], value[9], value[10], value[11], value[12], value[13], value[14], value[15]
+                );
+                pg_uuid_t *uuid_val = (pg_uuid_t*) this->allocator->fast_alloc(sizeof(pg_uuid_t));
+                memcpy(uuid_val->data, value, UUID_LEN);
+                res = UUIDPGetDatum(uuid_val);  // convert pointer to Datum
+            }
+            else
+            {
+                /* Build bytea */
+                int64 bytea_len = vallen + VARHDRSZ;
+                bytea *b = (bytea *) this->allocator->fast_alloc(bytea_len);
+                SET_VARSIZE(b, bytea_len);
+                memcpy(VARDATA(b), value, vallen);
+
+                res = PointerGetDatum(b);
+            }
+            break;
+        throw Error("unsupported user-extension column type: %s",
+                    typinfo.arrow.type_name.c_str());
+        }
         /* TODO: add other types */
         default:
-            throw Error("parquet_fdw: unsupported column type: %s",
+            throw Error("unsupported column type: %s",
                         typinfo.arrow.type_name.c_str());
     }
 
@@ -620,7 +689,7 @@ ParquetReader::map_to_datum(arrow::MapArray *maparray, int pos,
 void ParquetReader::initialize_cast(TypeInfo &typinfo, const char *attname)
 {
     MemoryContext ccxt = CurrentMemoryContext;
-    Oid         src_oid = to_postgres_type(typinfo.arrow.type_id);
+    Oid         src_oid = to_postgres_type(typinfo.arrow.type.get());
     Oid         dst_oid = typinfo.pg.oid;
     bool        error = false;
     char        errstr[ERROR_STR_LEN];
@@ -692,6 +761,7 @@ void ParquetReader::initialize_cast(TypeInfo &typinfo, const char *attname)
         FlushErrorState();
 
         strncpy(errstr, errdata->message, ERROR_STR_LEN - 1);
+        errstr[ERROR_STR_LEN - 1] = '\0';
         FreeErrorData(errdata);
         MemoryContextSwitchTo(ccxt);
     }
@@ -829,17 +899,13 @@ public:
 
     void open()
     {
-        arrow::Status   status;
-        std::unique_ptr<parquet::arrow::FileReader> reader;
-
-        status = parquet::arrow::FileReader::Make(
+        auto result = parquet::arrow::FileReader::Make(
                         arrow::default_memory_pool(),
-                        parquet::ParquetFileReader::OpenFile(filename, use_mmap),
-                        &reader);
-        if (!status.ok())
+                        parquet::ParquetFileReader::OpenFile(filename, use_mmap));
+        if (!result.ok())
             throw Error("failed to open Parquet file %s ('%s')",
-                        status.message().c_str(), filename.c_str());
-        this->reader = std::move(reader);
+                        result.status().message().c_str(), filename.c_str());
+        this->reader = std::move(result).ValueUnsafe();
 
         /* Enable parallel columns decoding/decompression if needed */
         this->reader->set_use_threads(this->use_threads && parquet_fdw_use_threads);
@@ -1069,17 +1135,13 @@ public:
 
     void open()
     {
-        arrow::Status   status;
-        std::unique_ptr<parquet::arrow::FileReader> reader;
-
-        status = parquet::arrow::FileReader::Make(
+        auto result = parquet::arrow::FileReader::Make(
                         arrow::default_memory_pool(),
-                        parquet::ParquetFileReader::OpenFile(filename, use_mmap),
-                        &reader);
-        if (!status.ok())
+                        parquet::ParquetFileReader::OpenFile(filename, use_mmap));
+        if (!result.ok())
             throw Error("failed to open Parquet file %s ('%s')",
-                        status.message().c_str(), filename.c_str());
-        this->reader = std::move(reader);
+                        result.status().message().c_str(), filename.c_str());
+        this->reader = std::move(result).ValueUnsafe();
 
         /* Enable parallel columns decoding/decompression if needed */
         this->reader->set_use_threads(this->use_threads && parquet_fdw_use_threads);

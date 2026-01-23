@@ -6,15 +6,36 @@ extern "C"
 #include "fmgr.h"
 #include "catalog/pg_type.h"
 #include "utils/builtins.h"
+#include "utils/uuid.h"
 #include "utils/date.h"
 #include "utils/memutils.h"
 #include "utils/memdebug.h"
 #include "utils/timestamp.h"
+#include "utils/palloc.h"
 }
+
+#ifndef PG_VERSION_NUM
+#error "PG_VERSION_NUM is not defined"
+#endif
 
 #if PG_VERSION_NUM < 130000
 #define MAXINT8LEN 25
 #endif
+
+/* --- PG version guards for MemoryContext alloc APIs (PG14+ uses Extended with flags) --- */
+#ifndef PARQUET_FDW_MCXT_GUARD
+#define PARQUET_FDW_MCXT_GUARD
+
+#if PG_VERSION_NUM >= 140000
+  #define PF_MCTX_ALLOC(ctx, sz)        MemoryContextAllocExtended((ctx), (sz), 0)
+  #define PF_MCTX_REALLOC(ctx, p, sz)   MemoryContextReallocExtended((ctx), (p), (sz), 0)
+#else
+  #define PF_MCTX_ALLOC(ctx, sz)        MemoryContextAlloc((ctx), (sz))
+  /* repalloc does not require context in pre-14 */
+  #define PF_MCTX_REALLOC(ctx, p, sz)   repalloc((p), (sz))
+#endif
+
+#endif /* PARQUET_FDW_MCXT_GUARD */
 
 /*
  * exc_palloc
@@ -34,7 +55,7 @@ exc_palloc(std::size_t size)
 
 	context->isReset = false;
 
-	ret = context->methods->alloc(context, size);
+	ret = PF_MCTX_ALLOC(context, size);
 	if (unlikely(ret == NULL))
 		throw std::bad_alloc();
 
@@ -43,10 +64,53 @@ exc_palloc(std::size_t size)
 	return ret;
 }
 
-Oid
-to_postgres_type(int arrow_type)
+
+/*
+ * Check if an Arrow user-extension type is of type UUID.
+ *
+ * CAUTION!
+ * ========
+ * UUID are not presently coded according to https://arrow.apache.org/docs/format/CanonicalExtensions.html#uuid.
+ * When it is the case, you can call this function after enabling user-extension
+ * into the reader.
+ */
+bool
+is_extension_uuid(const arrow::DataType *arrow_type)
 {
-    switch (arrow_type)
+    auto ext_type = dynamic_cast<arrow::ExtensionType *>(const_cast<arrow::DataType*>(arrow_type));
+
+    if (ext_type != NULL && ext_type->extension_name() == "arrow.uuid")
+    {
+        auto storage = ext_type->storage_type();
+
+        return storage->id() == arrow::Type::FIXED_SIZE_BINARY &&
+            static_cast<arrow::FixedSizeBinaryType*>(storage.get())->byte_width() == UUID_LEN;
+    }
+    return false;
+}
+
+/*
+ * Check if the UUID is coded as a fixed-size binary.
+ *
+ * CAUTION!
+ * ========
+ * This function is presently a work around as UUID should be coded
+ * as user-extension types, according to https://arrow.apache.org/docs/format/CanonicalExtensions.html#uuid.
+ * But this is not presently the case and we assume that 16-bytes binaries
+ * are UUID.
+ * See is_extension_uuid() to correctly identify UUID.
+ */
+bool
+is_fixed_size_uuid(const arrow::DataType *arrow_type)
+{
+    return (arrow_type != NULL && arrow_type->name() == "fixed_size_binary" && arrow_type->byte_width() == UUID_LEN);
+}
+
+
+Oid
+to_postgres_type(const arrow::DataType *arrow_type)
+{
+    switch (arrow_type->id())
     {
         case arrow::Type::BOOL:
             return BOOLOID;
@@ -69,6 +133,16 @@ to_postgres_type(int arrow_type)
             return TIMESTAMPOID;
         case arrow::Type::DATE32:
             return DATEOID;
+        // UUID should be user-extension types, but that's not the case presently...
+        // If the size is 16 bytes, we consider it is a UUID.
+        case arrow::Type::FIXED_SIZE_BINARY:
+            if (is_fixed_size_uuid(arrow_type))
+                return UUIDOID;
+            return BYTEAOID;
+        case arrow::Type::EXTENSION:
+            if (is_extension_uuid(arrow_type))
+                return UUIDOID;
+            return InvalidOid;
         default:
             return InvalidOid;
     }
@@ -114,6 +188,14 @@ bytes_to_postgres_type(const char *bytes, Size len, const arrow::DataType *arrow
         case arrow::Type::DATE32:
             return DateADTGetDatum(*(int32 *) bytes +
                                    (UNIX_EPOCH_JDATE - POSTGRES_EPOCH_JDATE));
+        case arrow::Type::FIXED_SIZE_BINARY:
+            if (is_fixed_size_uuid(arrow_type))
+            {
+                pg_uuid_t *uuid = (pg_uuid_t *) palloc(sizeof(pg_uuid_t));
+                memcpy(uuid->data, bytes, UUID_LEN);
+                return UUIDPGetDatum(uuid);
+            }
+            return PointerGetDatum(cstring_to_text_with_len(bytes, len));
         default:
             return PointerGetDatum(NULL);
     }
@@ -138,13 +220,13 @@ tolowercase(const char *input, char *output)
     return output;
 }
 
-arrow::Type::type
+arrow::DataType *
 get_arrow_list_elem_type(arrow::DataType *type)
 {
     auto children = type->fields();
 
     Assert(children.size() == 1);
-    return children[0]->type()->id();
+    return children[0]->type().get();
 }
 
 void datum_to_jsonb(Datum value, Oid typoid, bool isnull, FmgrInfo *outfunc,
@@ -178,7 +260,7 @@ void datum_to_jsonb(Datum value, Oid typoid, bool isnull, FmgrInfo *outfunc,
                 jb.val.string.val = strval;
             }
             else {
-                Datum numeric;
+                Datum numeric = (Datum) 0;
 
                 switch (typoid)
                 {

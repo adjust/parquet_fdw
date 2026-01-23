@@ -45,6 +45,7 @@ public:
     Size estimate_coord_size() 
     {
         Assert(false && "estimate_coord_size is not supported for TrivialExecutionState");
+        return 0;
     }
     void init_coord()
     {
@@ -479,7 +480,6 @@ public:
 
     void rescan(void)
     {
-        /* TODO: clean binheap */
         for (auto reader: readers)
             reader->rescan();
         slots.clear();
@@ -698,7 +698,6 @@ public:
 
     void rescan(void)
     {
-        /* TODO: clean binheap */
         for (auto reader: readers)
             reader->rescan();
         slots.clear();

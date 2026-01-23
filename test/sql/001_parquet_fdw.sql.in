@@ -207,6 +207,27 @@ SELECT * FROM example3 WHERE three = 3;
 -- analyze
 ANALYZE example_sorted;
 
+-- UUID support (stored as fixed-size binary of 16 bytes)
+SET client_min_messages = DEBUG1;
+CREATE FOREIGN TABLE example_uuid (
+    id        INT4,
+    uuid_col  UUID,
+    name      TEXT)
+SERVER parquet_srv
+OPTIONS (filename '@abs_srcdir@/data/simple/example_uuid.parquet');
+
+SELECT * FROM example_uuid;
+
+-- UUID filtering
+SELECT * FROM example_uuid WHERE uuid_col = '550e8400-e29b-41d4-a716-446655440000';
+SELECT * FROM example_uuid WHERE uuid_col = '00000000-0000-0000-0000-000000000000';
+
+-- UUID ordering
+SELECT * FROM example_uuid ORDER BY uuid_col;
+
+-- UUID with other conditions
+SELECT id, uuid_col FROM example_uuid WHERE name = 'first';
+
 SET client_min_messages = WARNING;
 
 DROP OWNED by regress_parquet_fdw;

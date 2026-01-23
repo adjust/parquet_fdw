@@ -69,6 +69,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM example1 ORDER BY three;
 -- filtering
 SET client_min_messages = DEBUG1;
 SELECT * FROM example1 WHERE one < 1;
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/simple/example1.parquet to list of files
 DEBUG:  parquet_fdw: skip rowgroup 1
 DEBUG:  parquet_fdw: skip rowgroup 2
  one | two | three | four | five | six | seven 
@@ -76,6 +77,7 @@ DEBUG:  parquet_fdw: skip rowgroup 2
 (0 rows)
 
 SELECT * FROM example1 WHERE one <= 1;
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/simple/example1.parquet to list of files
 DEBUG:  parquet_fdw: skip rowgroup 2
  one |   two   | three |        four         |    five    | six | seven 
 -----+---------+-------+---------------------+------------+-----+-------
@@ -83,6 +85,7 @@ DEBUG:  parquet_fdw: skip rowgroup 2
 (1 row)
 
 SELECT * FROM example1 WHERE one > 6;
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/simple/example1.parquet to list of files
 DEBUG:  parquet_fdw: skip rowgroup 1
 DEBUG:  parquet_fdw: skip rowgroup 2
  one | two | three | four | five | six | seven 
@@ -90,6 +93,7 @@ DEBUG:  parquet_fdw: skip rowgroup 2
 (0 rows)
 
 SELECT * FROM example1 WHERE one >= 6;
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/simple/example1.parquet to list of files
 DEBUG:  parquet_fdw: skip rowgroup 1
  one |    two     | three |           four            |    five    | six | seven 
 -----+------------+-------+---------------------------+------------+-----+-------
@@ -97,6 +101,7 @@ DEBUG:  parquet_fdw: skip rowgroup 1
 (1 row)
 
 SELECT * FROM example1 WHERE one = 2;
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/simple/example1.parquet to list of files
 DEBUG:  parquet_fdw: skip rowgroup 2
  one |    two     | three |        four         |    five    | six | seven 
 -----+------------+-------+---------------------+------------+-----+-------
@@ -104,6 +109,7 @@ DEBUG:  parquet_fdw: skip rowgroup 2
 (1 row)
 
 SELECT * FROM example1 WHERE one = 7;
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/simple/example1.parquet to list of files
 DEBUG:  parquet_fdw: skip rowgroup 1
 DEBUG:  parquet_fdw: skip rowgroup 2
  one | two | three | four | five | six | seven 
@@ -111,6 +117,7 @@ DEBUG:  parquet_fdw: skip rowgroup 2
 (0 rows)
 
 SELECT * FROM example1 WHERE six = true;
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/simple/example1.parquet to list of files
 DEBUG:  parquet_fdw: skip rowgroup 2
  one |   two   | three |        four         |    five    | six | seven 
 -----+---------+-------+---------------------+------------+-----+-------
@@ -119,6 +126,7 @@ DEBUG:  parquet_fdw: skip rowgroup 2
 (2 rows)
 
 SELECT * FROM example1 WHERE six = false;
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/simple/example1.parquet to list of files
  one |    two     | three |           four            |    five    | six | seven 
 -----+------------+-------+---------------------------+------------+-----+-------
    2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00       | 2018-01-02 | f   |      
@@ -128,6 +136,7 @@ SELECT * FROM example1 WHERE six = false;
 (4 rows)
 
 SELECT * FROM example1 WHERE seven < 1.5;
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/simple/example1.parquet to list of files
 DEBUG:  parquet_fdw: skip rowgroup 2
  one |   two   | three |        four         |    five    | six | seven 
 -----+---------+-------+---------------------+------------+-----+-------
@@ -136,6 +145,7 @@ DEBUG:  parquet_fdw: skip rowgroup 2
 (2 rows)
 
 SELECT * FROM example1 WHERE seven <= 1.5;
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/simple/example1.parquet to list of files
  one |    two     | three |        four         |    five    | six | seven 
 -----+------------+-------+---------------------+------------+-----+-------
    1 | {1,2,3}    | foo   | 2018-01-01 00:00:00 | 2018-01-01 | t   |   0.5
@@ -144,6 +154,7 @@ SELECT * FROM example1 WHERE seven <= 1.5;
 (3 rows)
 
 SELECT * FROM example1 WHERE seven = 1.5;
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/simple/example1.parquet to list of files
 DEBUG:  parquet_fdw: skip rowgroup 1
  one |    two     | three |        four         |    five    | six | seven 
 -----+------------+-------+---------------------+------------+-----+-------
@@ -151,6 +162,7 @@ DEBUG:  parquet_fdw: skip rowgroup 1
 (1 row)
 
 SELECT * FROM example1 WHERE seven > 1;
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/simple/example1.parquet to list of files
 DEBUG:  parquet_fdw: skip rowgroup 1
  one |    two     | three |           four            |    five    | six | seven 
 -----+------------+-------+---------------------------+------------+-----+-------
@@ -159,6 +171,7 @@ DEBUG:  parquet_fdw: skip rowgroup 1
 (2 rows)
 
 SELECT * FROM example1 WHERE seven >= 1;
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/simple/example1.parquet to list of files
  one |    two     | three |           four            |    five    | six | seven 
 -----+------------+-------+---------------------------+------------+-----+-------
    3 | {7,8,9}    | baz   | 2018-01-03 00:00:00       | 2018-01-03 | t   |     1
@@ -167,6 +180,7 @@ SELECT * FROM example1 WHERE seven >= 1;
 (3 rows)
 
 SELECT * FROM example1 WHERE seven IS NULL;
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/simple/example1.parquet to list of files
  one |    two     | three |          four          |    five    | six | seven 
 -----+------------+-------+------------------------+------------+-----+-------
    2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00    | 2018-01-02 | f   |      
@@ -176,6 +190,7 @@ SELECT * FROM example1 WHERE seven IS NULL;
 -- prepared statements
 prepare prep(date) as select * from example1 where five < $1;
 execute prep('2018-01-03');
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/simple/example1.parquet to list of files
 DEBUG:  parquet_fdw: skip rowgroup 2
  one |    two     | three |        four         |    five    | six | seven 
 -----+------------+-------+---------------------+------------+-----+-------
@@ -184,6 +199,7 @@ DEBUG:  parquet_fdw: skip rowgroup 2
 (2 rows)
 
 execute prep('2018-01-01');
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/simple/example1.parquet to list of files
 DEBUG:  parquet_fdw: skip rowgroup 1
 DEBUG:  parquet_fdw: skip rowgroup 2
  one | two | three | four | five | six | seven 
@@ -194,11 +210,11 @@ DEBUG:  parquet_fdw: skip rowgroup 2
 SET client_min_messages = WARNING;
 CREATE FOREIGN TABLE example_fail (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv;
-ERROR:  parquet_fdw: filename or function is required
+ERROR:  parquet_fdw: filename or files_func option is required
 CREATE FOREIGN TABLE example_fail (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv
 OPTIONS (filename 'nonexistent.parquet', some_option '123');
-ERROR:  parquet_fdw: No such file or directory ('nonexistent.parquet')
+ERROR:  parquet_fdw: filename: No such file or directory ('nonexistent.parquet')
 CREATE FOREIGN TABLE example_fail (one INT8, two INT8[], three TEXT)
 SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/simple/example1.parquet', some_option '123');
@@ -318,7 +334,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY one;
            QUERY PLAN           
 --------------------------------
  Foreign Scan on example_sorted
-   Reader: Multifile Merge
+   Reader: Multifile
    Row groups: 
      example1.parquet: 1, 2
      example2.parquet: 1
@@ -328,14 +344,14 @@ SELECT * FROM example_sorted ORDER BY one;
  one |    two     | three |           four            |    five    | six | seven 
 -----+------------+-------+---------------------------+------------+-----+-------
    1 | {1,2,3}    | foo   | 2018-01-01 00:00:00       | 2018-01-01 | t   |   0.5
-   1 | {19,20}    | eins  | 2018-01-01 00:00:00       | 2018-01-01 | t   |      
    2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00       | 2018-01-02 | f   |      
    3 | {7,8,9}    | baz   | 2018-01-03 00:00:00       | 2018-01-03 | t   |     1
-   3 | {21,22}    | zwei  | 2018-01-03 00:00:00       | 2018-01-03 | f   |      
    4 | {10,11,12} | uno   | 2018-01-04 00:00:10       | 2018-01-04 | f   |   1.5
    5 | {13,14,15} | dos   | 2018-01-05 00:00:00.01    | 2018-01-05 | f   |      
-   5 | {23,24}    | drei  | 2018-01-05 00:00:00       | 2018-01-05 | t   |      
    6 | {16,17,18} | tres  | 2018-01-06 00:00:00.00001 | 2018-01-06 | f   |     2
+   1 | {19,20}    | eins  | 2018-01-01 00:00:00       | 2018-01-01 | t   |      
+   3 | {21,22}    | zwei  | 2018-01-03 00:00:00       | 2018-01-03 | f   |      
+   5 | {23,24}    | drei  | 2018-01-05 00:00:00       | 2018-01-05 | t   |      
    7 | {25,26}    | vier  | 2018-01-07 00:00:00       | 2018-01-07 | f   |      
    9 | {27,28}    | fünf  | 2018-01-09 00:00:00       | 2018-01-09 | t   |      
 (11 rows)
@@ -355,7 +371,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM example_sorted_caching ORDER BY one;
                QUERY PLAN               
 ----------------------------------------
  Foreign Scan on example_sorted_caching
-   Reader: Caching Multifile Merge
+   Reader: Multifile
    Row groups: 
      example1.parquet: 1, 2
      example2.parquet: 1
@@ -365,14 +381,14 @@ SELECT * FROM example_sorted ORDER BY one;
  one |    two     | three |           four            |    five    | six | seven 
 -----+------------+-------+---------------------------+------------+-----+-------
    1 | {1,2,3}    | foo   | 2018-01-01 00:00:00       | 2018-01-01 | t   |   0.5
-   1 | {19,20}    | eins  | 2018-01-01 00:00:00       | 2018-01-01 | t   |      
    2 | {NULL,5,6} | bar   | 2018-01-02 00:00:00       | 2018-01-02 | f   |      
    3 | {7,8,9}    | baz   | 2018-01-03 00:00:00       | 2018-01-03 | t   |     1
-   3 | {21,22}    | zwei  | 2018-01-03 00:00:00       | 2018-01-03 | f   |      
    4 | {10,11,12} | uno   | 2018-01-04 00:00:10       | 2018-01-04 | f   |   1.5
    5 | {13,14,15} | dos   | 2018-01-05 00:00:00.01    | 2018-01-05 | f   |      
-   5 | {23,24}    | drei  | 2018-01-05 00:00:00       | 2018-01-05 | t   |      
    6 | {16,17,18} | tres  | 2018-01-06 00:00:00.00001 | 2018-01-06 | f   |     2
+   1 | {19,20}    | eins  | 2018-01-01 00:00:00       | 2018-01-01 | t   |      
+   3 | {21,22}    | zwei  | 2018-01-03 00:00:00       | 2018-01-03 | f   |      
+   5 | {23,24}    | drei  | 2018-01-05 00:00:00       | 2018-01-05 | t   |      
    7 | {25,26}    | vier  | 2018-01-07 00:00:00       | 2018-01-07 | f   |      
    9 | {27,28}    | fünf  | 2018-01-09 00:00:00       | 2018-01-09 | t   |      
 (11 rows)
@@ -384,7 +400,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM example_seq;
                  QUERY PLAN                 
 --------------------------------------------
  Gather
-   Workers Planned: 2
+   Workers Planned: 11
    ->  Parallel Foreign Scan on example_seq
          Reader: Multifile
          Row groups: 
@@ -395,10 +411,10 @@ EXPLAIN (COSTS OFF) SELECT * FROM example_seq;
 EXPLAIN (COSTS OFF) SELECT * FROM example_seq ORDER BY one;
                     QUERY PLAN                    
 --------------------------------------------------
- Gather Merge
-   Workers Planned: 2
-   ->  Sort
-         Sort Key: one
+ Sort
+   Sort Key: one
+   ->  Gather
+         Workers Planned: 11
          ->  Parallel Foreign Scan on example_seq
                Reader: Multifile
                Row groups: 
@@ -409,10 +425,10 @@ EXPLAIN (COSTS OFF) SELECT * FROM example_seq ORDER BY one;
 EXPLAIN (COSTS OFF) SELECT * FROM example_seq ORDER BY two;
                     QUERY PLAN                    
 --------------------------------------------------
- Gather Merge
-   Workers Planned: 2
-   ->  Sort
-         Sort Key: two
+ Sort
+   Sort Key: two
+   ->  Gather
+         Workers Planned: 11
          ->  Parallel Foreign Scan on example_seq
                Reader: Multifile
                Row groups: 
@@ -424,7 +440,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM example_sorted;
                   QUERY PLAN                   
 -----------------------------------------------
  Gather
-   Workers Planned: 2
+   Workers Planned: 11
    ->  Parallel Foreign Scan on example_sorted
          Reader: Multifile
          Row groups: 
@@ -433,26 +449,22 @@ EXPLAIN (COSTS OFF) SELECT * FROM example_sorted;
 (7 rows)
 
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY one;
-                     QUERY PLAN                      
------------------------------------------------------
- Gather Merge
-   Workers Planned: 2
-   ->  Sort
-         Sort Key: one
-         ->  Parallel Foreign Scan on example_sorted
-               Reader: Multifile
-               Row groups: 
-                 example1.parquet: 1, 2
-                 example2.parquet: 1
-(9 rows)
+           QUERY PLAN           
+--------------------------------
+ Foreign Scan on example_sorted
+   Reader: Multifile
+   Row groups: 
+     example1.parquet: 1, 2
+     example2.parquet: 1
+(5 rows)
 
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY two;
                      QUERY PLAN                      
 -----------------------------------------------------
- Gather Merge
-   Workers Planned: 2
-   ->  Sort
-         Sort Key: two
+ Sort
+   Sort Key: two
+   ->  Gather
+         Workers Planned: 11
          ->  Parallel Foreign Scan on example_sorted
                Reader: Multifile
                Row groups: 
@@ -462,22 +474,20 @@ EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY two;
 
 ALTER FOREIGN TABLE example_sorted OPTIONS (ADD files_in_order 'true');
 EXPLAIN (COSTS OFF) SELECT * FROM example_sorted ORDER BY one;
-                  QUERY PLAN                   
------------------------------------------------
- Gather Merge
-   Workers Planned: 2
-   ->  Parallel Foreign Scan on example_sorted
-         Reader: Multifile
-         Row groups: 
-           example1.parquet: 1, 2
-           example2.parquet: 1
-(7 rows)
+           QUERY PLAN           
+--------------------------------
+ Foreign Scan on example_sorted
+   Reader: Multifile
+   Row groups: 
+     example1.parquet: 1, 2
+     example2.parquet: 1
+(5 rows)
 
 EXPLAIN (COSTS OFF) SELECT * FROM example1;
                QUERY PLAN                
 -----------------------------------------
  Gather
-   Workers Planned: 2
+   Workers Planned: 11
    ->  Parallel Foreign Scan on example1
          Reader: Single File
          Row groups: 1, 2
@@ -500,12 +510,12 @@ SELECT e1.one, e2.one FROM example1 e1, (SELECT * FROM example1) e2 WHERE e1.one
    ->  Nested Loop
          Join Filter: (e1.one < example1.one)
          ->  Gather
-               Workers Planned: 2
+               Workers Planned: 11
                ->  Parallel Foreign Scan on example1 e1
                      Reader: Single File
                      Row groups: 1, 2
          ->  Gather
-               Workers Planned: 2
+               Workers Planned: 11
                ->  Parallel Foreign Scan on example1
                      Reader: Single File
                      Row groups: 1, 2
@@ -568,7 +578,9 @@ CREATE FOREIGN TABLE example3 (
     three   INT2)
 SERVER parquet_srv
 OPTIONS (filename '@abs_srcdir@/data/complex/example3.parquet', sorted 'one');
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/complex/example3.parquet to list of files
 SELECT * FROM example3;
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/complex/example3.parquet to list of files
                  one                  |                 two                  | three 
 --------------------------------------+--------------------------------------+-------
  {"1": "foo", "2": "bar", "3": "baz"} | {"2018-01-01": 10, "2018-01-02": 15} |     1
@@ -576,6 +588,7 @@ SELECT * FROM example3;
 (2 rows)
 
 SELECT * FROM example3 WHERE three = 3;
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/complex/example3.parquet to list of files
 DEBUG:  parquet_fdw: skip rowgroup 1
  one | two | three 
 -----+-----+-------
@@ -583,6 +596,89 @@ DEBUG:  parquet_fdw: skip rowgroup 1
 
 -- analyze
 ANALYZE example_sorted;
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/simple/example1.parquet to list of files
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/simple/example2.parquet to list of files
+-- UUID support (stored as fixed-size binary of 16 bytes)
+SET client_min_messages = DEBUG1;
+CREATE FOREIGN TABLE example_uuid (
+    id        INT4,
+    uuid_col  UUID,
+    name      TEXT)
+SERVER parquet_srv
+OPTIONS (filename '@abs_srcdir@/data/simple/example_uuid.parquet');
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/simple/example_uuid.parquet to list of files
+SELECT * FROM example_uuid;
+DEBUG:  rehashing catalog cache id 33 for pg_foreign_table; 9 tups, 4 buckets
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/simple/example_uuid.parquet to list of files
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: 550e8400-e29b-41d4-a716-446655440000
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: 6ba7b810-9dad-11d1-80b4-00c04fd430c8
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: 6ba7b811-9dad-11d1-80b4-00c04fd430c8
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: 00000000-0000-0000-0000-000000000000
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: ffffffff-ffff-ffff-ffff-ffffffffffff
+ id |               uuid_col               |  name  
+----+--------------------------------------+--------
+  1 | 550e8400-e29b-41d4-a716-446655440000 | first
+  2 | 6ba7b810-9dad-11d1-80b4-00c04fd430c8 | second
+  3 | 6ba7b811-9dad-11d1-80b4-00c04fd430c8 | third
+  4 | 00000000-0000-0000-0000-000000000000 | nil
+  5 | ffffffff-ffff-ffff-ffff-ffffffffffff | max
+(5 rows)
+
+-- UUID filtering
+SELECT * FROM example_uuid WHERE uuid_col = '550e8400-e29b-41d4-a716-446655440000';
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/simple/example_uuid.parquet to list of files
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: 550e8400-e29b-41d4-a716-446655440000
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: 6ba7b810-9dad-11d1-80b4-00c04fd430c8
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: 6ba7b811-9dad-11d1-80b4-00c04fd430c8
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: 00000000-0000-0000-0000-000000000000
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: ffffffff-ffff-ffff-ffff-ffffffffffff
+ id |               uuid_col               | name  
+----+--------------------------------------+-------
+  1 | 550e8400-e29b-41d4-a716-446655440000 | first
+(1 row)
+
+SELECT * FROM example_uuid WHERE uuid_col = '00000000-0000-0000-0000-000000000000';
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/simple/example_uuid.parquet to list of files
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: 550e8400-e29b-41d4-a716-446655440000
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: 6ba7b810-9dad-11d1-80b4-00c04fd430c8
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: 6ba7b811-9dad-11d1-80b4-00c04fd430c8
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: 00000000-0000-0000-0000-000000000000
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: ffffffff-ffff-ffff-ffff-ffffffffffff
+ id |               uuid_col               | name 
+----+--------------------------------------+------
+  4 | 00000000-0000-0000-0000-000000000000 | nil
+(1 row)
+
+-- UUID ordering
+SELECT * FROM example_uuid ORDER BY uuid_col;
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/simple/example_uuid.parquet to list of files
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: 550e8400-e29b-41d4-a716-446655440000
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: 6ba7b810-9dad-11d1-80b4-00c04fd430c8
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: 6ba7b811-9dad-11d1-80b4-00c04fd430c8
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: 00000000-0000-0000-0000-000000000000
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: ffffffff-ffff-ffff-ffff-ffffffffffff
+ id |               uuid_col               |  name  
+----+--------------------------------------+--------
+  4 | 00000000-0000-0000-0000-000000000000 | nil
+  1 | 550e8400-e29b-41d4-a716-446655440000 | first
+  2 | 6ba7b810-9dad-11d1-80b4-00c04fd430c8 | second
+  3 | 6ba7b811-9dad-11d1-80b4-00c04fd430c8 | third
+  5 | ffffffff-ffff-ffff-ffff-ffffffffffff | max
+(5 rows)
+
+-- UUID with other conditions
+SELECT id, uuid_col FROM example_uuid WHERE name = 'first';
+DEBUG:  parquet_fdw: adding globbed filename @abs_srcdir@/data/simple/example_uuid.parquet to list of files
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: 550e8400-e29b-41d4-a716-446655440000
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: 6ba7b810-9dad-11d1-80b4-00c04fd430c8
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: 6ba7b811-9dad-11d1-80b4-00c04fd430c8
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: 00000000-0000-0000-0000-000000000000
+DEBUG:  parquet_fdw: Reading UUID from FIXED_SIZE_BINARY: ffffffff-ffff-ffff-ffff-ffffffffffff
+ id |               uuid_col               
+----+--------------------------------------
+  1 | 550e8400-e29b-41d4-a716-446655440000
+(1 row)
+
 SET client_min_messages = WARNING;
 DROP OWNED by regress_parquet_fdw;
 DROP EXTENSION parquet_fdw CASCADE;

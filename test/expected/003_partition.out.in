@@ -273,11 +273,12 @@ FROM (
 ) t
 GROUP BY token
 ORDER BY token;
-                                QUERY PLAN                                
---------------------------------------------------------------------------
+                                                                    QUERY PLAN                                                                    
+--------------------------------------------------------------------------------------------------------------------------------------------------
  GroupAggregate
    Group Key: example_parent1.token
    ->  WindowAgg
+         Window: w AS (PARTITION BY example_parent1.token ORDER BY example_parent1.date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
          ->  Merge Append
                Sort Key: example_parent1.token, example_parent1.date
                ->  Foreign Scan on example_child1_1 example_parent1_1
@@ -288,7 +289,7 @@ ORDER BY token;
                      Filter: ((token >= 1) AND (token <= 2) AND (id = 1))
                      Reader: Single File
                      Row groups: 1
-(13 rows)
+(14 rows)
 
 -- Postgres won't sort by "token, date" since query pathkeys match "sorted" option
 -- and "id" is a redundant key
@@ -302,16 +303,17 @@ FROM (
 ) t
 GROUP BY token
 ORDER BY token;
-                             QUERY PLAN                             
---------------------------------------------------------------------
+                                                                     QUERY PLAN                                                                     
+----------------------------------------------------------------------------------------------------------------------------------------------------
  GroupAggregate
    Group Key: example_child1_1.token
    ->  WindowAgg
+         Window: w AS (PARTITION BY example_child1_1.token ORDER BY example_child1_1.date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
          ->  Foreign Scan on example_child1_1
                Filter: ((token >= 1) AND (token <= 2) AND (id = 1))
                Reader: Single File
                Row groups: 1
-(7 rows)
+(8 rows)
 
 -- Postgres won't sort by "token" since query pathkeys match "sorted" option
 -- and "id" is a redundant key
@@ -325,16 +327,17 @@ FROM (
 ) t
 GROUP BY token
 ORDER BY token;
-                             QUERY PLAN                             
---------------------------------------------------------------------
+                                                     QUERY PLAN                                                      
+---------------------------------------------------------------------------------------------------------------------
  GroupAggregate
    Group Key: example_child1_1.token
    ->  WindowAgg
+         Window: w AS (PARTITION BY example_child1_1.token ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
          ->  Foreign Scan on example_child1_1
                Filter: ((token >= 1) AND (token <= 2) AND (id = 1))
                Reader: Single File
                Row groups: 1
-(7 rows)
+(8 rows)
 
 -- Postgres will sort by "date" since query pathkeys don't match "sorted" option
 EXPLAIN (COSTS OFF)
@@ -347,21 +350,22 @@ FROM (
 ) t
 GROUP BY token
 ORDER BY token;
-                                      QUERY PLAN                                      
---------------------------------------------------------------------------------------
+                                                           QUERY PLAN                                                           
+--------------------------------------------------------------------------------------------------------------------------------
  GroupAggregate
    Group Key: t.token
    ->  Sort
          Sort Key: t.token
          ->  Subquery Scan on t
                ->  WindowAgg
+                     Window: w AS (PARTITION BY example_child1_1.date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
                      ->  Sort
                            Sort Key: example_child1_1.date
                            ->  Foreign Scan on example_child1_1
                                  Filter: ((token >= 1) AND (token <= 2) AND (id = 1))
                                  Reader: Single File
                                  Row groups: 1
-(12 rows)
+(13 rows)
 
 -- Postgres will sort by "token, date" since query pathkeys don't match "sorted" option
 EXPLAIN (COSTS OFF)
@@ -374,18 +378,19 @@ FROM (
 ) t
 GROUP BY token
 ORDER BY token;
-                              QUERY PLAN                               
------------------------------------------------------------------------
+                                                                     QUERY PLAN                                                                     
+----------------------------------------------------------------------------------------------------------------------------------------------------
  GroupAggregate
    Group Key: example_child1_1.token
    ->  WindowAgg
+         Window: w AS (PARTITION BY example_child1_1.token ORDER BY example_child1_1.date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
          ->  Sort
                Sort Key: example_child1_1.token, example_child1_1.date
                ->  Foreign Scan on example_child1_1
                      Filter: ((token >= 1) AND (token <= 2))
                      Reader: Single File
                      Row groups: 1
-(9 rows)
+(10 rows)
 
 -- Postgres will sort by "token, date" because example_parent2 is partitioned
 -- by "date".
@@ -399,11 +404,12 @@ FROM (
 ) t
 GROUP BY token
 ORDER BY token;
-                                   QUERY PLAN                                   
---------------------------------------------------------------------------------
+                                                                    QUERY PLAN                                                                    
+--------------------------------------------------------------------------------------------------------------------------------------------------
  GroupAggregate
    Group Key: example_parent2.token
    ->  WindowAgg
+         Window: w AS (PARTITION BY example_parent2.token ORDER BY example_parent2.date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
          ->  Sort
                Sort Key: example_parent2.token, example_parent2.date
                ->  Append
@@ -415,7 +421,7 @@ ORDER BY token;
                            Filter: ((token >= 1) AND (token <= 2) AND (id = 1))
                            Reader: Single File
                            Row groups: 1
-(14 rows)
+(15 rows)
 
 -- Postgres will sort by "token, date" since query pathkeys don't match
 -- "sorted" option
@@ -429,18 +435,19 @@ FROM (
 ) t
 GROUP BY token
 ORDER BY token;
-                                QUERY PLAN                                
---------------------------------------------------------------------------
+                                                                     QUERY PLAN                                                                     
+----------------------------------------------------------------------------------------------------------------------------------------------------
  GroupAggregate
    Group Key: example_child2_1.token
    ->  WindowAgg
+         Window: w AS (PARTITION BY example_child2_1.token ORDER BY example_child2_1.date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
          ->  Sort
                Sort Key: example_child2_1.token, example_child2_1.date
                ->  Foreign Scan on example_child2_1
                      Filter: ((token >= 1) AND (token <= 2) AND (id = 1))
                      Reader: Single File
                      Row groups: 1
-(9 rows)
+(10 rows)
 
 -- Postgres will sort by "token" since query pathkeys don't match "sorted" option
 EXPLAIN (COSTS OFF)
@@ -453,18 +460,19 @@ FROM (
 ) t
 GROUP BY token
 ORDER BY token;
-                                QUERY PLAN                                
---------------------------------------------------------------------------
+                                                     QUERY PLAN                                                      
+---------------------------------------------------------------------------------------------------------------------
  GroupAggregate
    Group Key: example_child2_1.token
    ->  WindowAgg
+         Window: w AS (PARTITION BY example_child2_1.token ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
          ->  Sort
                Sort Key: example_child2_1.token
                ->  Foreign Scan on example_child2_1
                      Filter: ((token >= 1) AND (token <= 2) AND (id = 1))
                      Reader: Single File
                      Row groups: 1
-(9 rows)
+(10 rows)
 
 -- Postgres will sort by "token" since query pathkeys don't match "sorted" option
 EXPLAIN (COSTS OFF)
@@ -477,19 +485,20 @@ FROM (
 ) t
 GROUP BY token
 ORDER BY token;
-                                   QUERY PLAN                                   
---------------------------------------------------------------------------------
+                                                           QUERY PLAN                                                           
+--------------------------------------------------------------------------------------------------------------------------------
  GroupAggregate
    Group Key: t.token
    ->  Sort
          Sort Key: t.token
          ->  Subquery Scan on t
                ->  WindowAgg
+                     Window: w AS (PARTITION BY example_child2_1.date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
                      ->  Foreign Scan on example_child2_1
                            Filter: ((token >= 1) AND (token <= 2) AND (id = 1))
                            Reader: Single File
                            Row groups: 1
-(10 rows)
+(11 rows)
 
 -- Postgres will sort by "token, date" since query pathkeys don't match
 -- "sorted" option
@@ -503,16 +512,17 @@ FROM (
 ) t
 GROUP BY token
 ORDER BY token;
-                              QUERY PLAN                               
------------------------------------------------------------------------
+                                                                     QUERY PLAN                                                                     
+----------------------------------------------------------------------------------------------------------------------------------------------------
  GroupAggregate
    Group Key: example_child2_1.token
    ->  WindowAgg
+         Window: w AS (PARTITION BY example_child2_1.token ORDER BY example_child2_1.date ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
          ->  Sort
                Sort Key: example_child2_1.token, example_child2_1.date
                ->  Foreign Scan on example_child2_1
                      Filter: ((token >= 1) AND (token <= 2))
                      Reader: Single File
                      Row groups: 1
-(9 rows)
+(10 rows)
 
